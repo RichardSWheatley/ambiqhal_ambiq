@@ -2,60 +2,26 @@
 //
 //! @file am_util_stdio.c
 //!
-//! @brief Standard Input/Output Utility Functions
+//! @brief A few printf-style functions for use with Ambiq products
 //!
-//! @addtogroup stdio_utils STDIO Utility Functions
-//! @ingroup utils
-//! @{
+//! Functions for performing printf-style operations without dynamic memory
+//! allocation.
 //!
-//! Purpose: This module provides standard input/output utilities for
-//!          Ambiq Micro devices. It enables printf-style output, character
-//!          handling, and string formatting for embedded applications
-//!          requiring console or debug output capabilities. The utilities
-//!          support multiple output channels and formatting options.
+//! For further information about this module concerning its history, uses,
+//! and limitations, please see the Ambiq Micro KB article "Q&A: What does
+//! the AmbiqSuite SDK am_util_stdio_printf() function do?" at:
 //!
 //! https://support.ambiqmicro.com/hc/en-us/articles/360040441631
 //!
-//! @section stdio_features Key Features
-//!
-//! 1. @b Printf @b Functions: Complete printf-style formatting capabilities.
-//! 2. @b String @b Conversion: Number-to-string conversion for various formats.
-//! 3. @b 64-bit @b Support: Full 64-bit integer handling and formatting.
-//! 4. @b Floating @b Point: Float-to-string conversion with precision control.
-//! 5. @b Buffer @b Management: Static buffer allocation for memory efficiency.
-//! 6. @b Text @b Translation: Newline translation and text mode support.
-//!
-//! @section stdio_functionality Functionality
-//!
-//! - Provide printf, sprintf, snprintf formatting functions
-//! - Support 32-bit and 64-bit integer formatting
-//! - Handle floating-point number conversion
-//! - Perform hexadecimal and decimal string conversion
-//! - Manage text mode translation (CR/LF handling)
-//! - Support variable argument list processing
-//! - Enable character output redirection
-//! - Provide buffer overflow protection
-//!
-//! @section stdio_usage Usage
-//!
-//! 1. Initialize stdio with am_util_stdio_printf_init()
-//! 2. Set text translation mode if needed
-//! 3. Use printf functions for formatted output
-//! 4. Configure character output redirection
-//! 5. Handle buffer management for large strings
-//!
-//! @section stdio_configuration Configuration
-//!
-//! - @b Printf @b Buffer: Configurable buffer size for formatted output
-//! - @b Text @b Mode: Optional CR/LF translation for terminal output
-//! - @b Character @b Output: Function pointer for output redirection
-//! - @b Memory @b Alignment: 4KB alignment for Apollo5 devices
-//! - @b Format @b Support: Decimal, hexadecimal, and floating-point formats
+//! @addtogroup stdio STDIO - Ambiq's Implementation
+//! @ingroup utils
+//! @{
+//
 //*****************************************************************************
 
 //*****************************************************************************
 //
-// Copyright (c) 2025, Ambiq Micro, Inc.
+// Copyright (c) 2024, Ambiq Micro, Inc.
 // All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without
@@ -72,6 +38,9 @@
 // contributors may be used to endorse or promote products derived from this
 // software without specific prior written permission.
 //
+// Third party software included in this distribution is subject to the
+// additional license terms as defined in the /docs/licenses directory.
+//
 // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
 // AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
 // IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
@@ -84,7 +53,7 @@
 // ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 // POSSIBILITY OF SUCH DAMAGE.
 //
-// This is part of revision release_sdk5p1p0-366b80e084 of the AmbiqSuite Development Package.
+// This is part of revision release_sdk_4_4_0-3c5977e664 of the AmbiqSuite Development Package.
 //
 //*****************************************************************************
 

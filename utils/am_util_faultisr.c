@@ -2,19 +2,11 @@
 //
 //! @file am_util_faultisr.c
 //!
-//! @brief Fault Interrupt Service Routine Utility Functions
+//! @brief An extended hard-fault handler.
 //!
-//! @addtogroup faultisr_utils Fault ISR Utility Functions
-//! @ingroup utils
-//! @{
-//!
-//! Purpose: This module provides fault handling and analysis utilities
-//!          for Ambiq Micro devices. It enables fault detection, logging,
-//!          and recovery mechanisms for handling system faults and exceptions.
-//!          The utilities support detailed fault analysis and debugging
-//!          capabilities for robust system operation.
-//!
-//! @section utils_faultisr_details Details
+//! This module is portable to all Ambiq Apollo products with minimal HAL or BSP
+//! dependencies (SWO output).  It collects the fault information into the sHalFaultData
+//! structure, which it then prints to stdout (typically SWO).
 //!
 //! By default this handler, when included in the build, overrides the weak binding of
 //! the default hardfault handler.  It allocates 512 bytes of global variable space for
@@ -40,41 +32,15 @@
 //! It is compiler/platform independent enabling it to be used with GCC, Keil,
 //! IAR and easily ported to other tools chains
 //!
-//! @section utils_faultisr_features Key Features
-//!
-//! 1. @b Fault @b Detection: Comprehensive fault monitoring.
-//! 2. @b Error @b Logging: Detailed fault information capture.
-//! 3. @b Recovery @b Handlers: Fault recovery mechanisms.
-//! 4. @b Debug @b Support: Fault analysis capabilities.
-//! 5. @b System @b Protection: Critical system preservation.
-//!
-//! @section utils_faultisr_functionality Functionality
-//!
-//! - Initialize fault handlers
-//! - Process fault interrupts
-//! - Log fault information
-//! - Support system recovery
-//! - Enable fault analysis
-//!
-//! @section utils_faultisr_usage Usage
-//!
-//! 1. Initialize fault handling with am_util_faultisr_init()
-//! 2. Configure fault responses
-//! 3. Process faults as they occur
-//! 4. Analyze fault data
-//!
-//! @section utils_faultisr_configuration Configuration
-//!
-//! - Set up fault handler options
-//! - Configure logging parameters
-//! - Define recovery actions
-//! - Set debug information level
+//! @addtogroup faultisr FaultISR - Extended Hard Fault ISR
+//! @ingroup utils
+//! @{
 //
 //*****************************************************************************
 
 //*****************************************************************************
 //
-// Copyright (c) 2025, Ambiq Micro, Inc.
+// Copyright (c) 2024, Ambiq Micro, Inc.
 // All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without
@@ -91,6 +57,9 @@
 // contributors may be used to endorse or promote products derived from this
 // software without specific prior written permission.
 //
+// Third party software included in this distribution is subject to the
+// additional license terms as defined in the /docs/licenses directory.
+//
 // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
 // AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
 // IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
@@ -103,7 +72,7 @@
 // ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 // POSSIBILITY OF SUCH DAMAGE.
 //
-// This is part of revision release_sdk5p1p0-366b80e084 of the AmbiqSuite Development Package.
+// This is part of revision stable-c1f95ddf60 of the AmbiqSuite Development Package.
 //
 //*****************************************************************************
 
@@ -138,7 +107,10 @@
   #define AM_SP_HIGH   (ITCM_BASEADDR + ITCM_MAX_SIZE)
   #define AM_SP_LOW2   DTCM_BASEADDR
   #define AM_SP_HIGH2  (DTCM_BASEADDR + DTCM_MAX_SIZE + SSRAM_MAX_SIZE)
-#elif defined(AM_PART_APOLLO4B) || defined(AM_PART_APOLLO4P) || defined(AM_PART_APOLLO4L)
+#elif defined(AM_PART_APOLLO510L)
+  #define AM_SP_LOW    DTCM_BASEADDR
+  #define AM_SP_HIGH   (DTCM_BASEADDR + DTCM_MAX_SIZE + SSRAM_MAX_SIZE)
+#elif defined(AM_PART_APOLLO4_API)
   #define AM_SP_LOW    SRAM_BASEADDR
   #define AM_SP_HIGH   (SRAM_BASEADDR + RAM_TOTAL_SIZE)
 #elif defined(AM_PART_APOLLO3P)
@@ -247,8 +219,8 @@ HardFault_Handler(void)
           "    mrsne  r0, psp\n");                       // e: bit2=1 indicating PSP stack
 #if !defined(AM_HF_NO_LOCAL_STACK)
     __asm("    ldr    r1, =gFaultStack\n");              // get address of the base of the temp_stack
-#if defined(AM_PART_APOLLO510)
-    __asm("    MSR msplim, r1\n");                       // for Apollo5 (M55) set MSP stack limit register
+#if defined(AM_PART_APOLLO510) || defined(AM_PART_APOLLO510L)
+    __asm("    MSR msplim, r1\n");                       // for Apollo510 (M55) set MSP stack limit register
 #endif
     __asm("    add    r1, r1, #512\n"                    // address of the top of the stack.
           "    bic    r1, #3\n"                          // make sure the new stack is 8-byte aligned
@@ -501,8 +473,7 @@ am_util_faultisr_collect_data(uint32_t *u32IsrSP)
         u32Mask >>= 1;
     }
 
-#if !defined(AM_PART_APOLLO510)
-    // No CPU register block in Apollo5
+#if !defined(AM_PART_APOLLO510) && !defined(AM_PART_APOLLO510L) // No CPU register block in Apollo510
     //
     // Print out any Apollo* Internal fault information - if any
     //
@@ -522,7 +493,7 @@ am_util_faultisr_collect_data(uint32_t *u32IsrSP)
     {
         am_util_stdio_printf("    SYS Fault Address: 0x%08X\n", sHalFaultData.ui32SYS);
     }
-#endif
+#endif  // !defined(AM_PART_APOLLO510) || defined(AM_PART_APOLLO510L)
 
     am_util_stdio_printf("\n\nDone with output. Entering infinite loop.\n\n");
 

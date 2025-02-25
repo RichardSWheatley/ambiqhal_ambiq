@@ -2,9 +2,9 @@
 //
 //! @file am_util_pmu.h
 //!
-//! @brief Power Management Unit Utility Functions
+//! @brief A few useful performance monitoring functions.
 //!
-//! @addtogroup pmu_utils PMU Utility Functions
+//! @addtogroup pmu PMU Functionality
 //! @ingroup utils
 //! @{
 //
@@ -12,7 +12,7 @@
 
 //*****************************************************************************
 //
-// Copyright (c) 2025, Ambiq Micro, Inc.
+// Copyright (c) 2024, Ambiq Micro, Inc.
 // All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without
@@ -29,6 +29,9 @@
 // contributors may be used to endorse or promote products derived from this
 // software without specific prior written permission.
 //
+// Third party software included in this distribution is subject to the
+// additional license terms as defined in the /docs/licenses directory.
+//
 // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
 // AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
 // IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
@@ -41,7 +44,7 @@
 // ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 // POSSIBILITY OF SUCH DAMAGE.
 //
-// This is part of revision release_sdk5p1p0-366b80e084 of the AmbiqSuite Development Package.
+// This is part of revision release_sdk5p1-3021d0c7ea of the AmbiqSuite Development Package.
 //
 //*****************************************************************************
 
