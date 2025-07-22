@@ -87,4 +87,8 @@ if(CONFIG_AMBIQ_HAL_USE_HWINFO)
     zephyr_library_sources(hal/mcu/am_hal_reset.c)
 endif()
 
+if(CONFIG_AMBIQ_HAL_USE_MRAM)
+    zephyr_library_sources(hal/mcu/am_hal_mram.c)
+endif()
+
 zephyr_library_compile_options(-w)
