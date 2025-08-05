@@ -75,6 +75,10 @@ if(CONFIG_AMBIQ_HAL_USE_I2S)
     zephyr_library_sources(hal/am_hal_i2s.c)
 endif()
 
+if(CONFIG_AMBIQ_HAL_USE_AUDADC)
+    zephyr_library_sources(hal/am_hal_audadc.c)
+endif()
+
 if(CONFIG_AMBIQ_HAL_USE_USB)
     zephyr_library_sources(hal/am_hal_usb.c)
 endif()
