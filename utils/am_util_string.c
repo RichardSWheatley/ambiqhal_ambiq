@@ -2,20 +2,53 @@
 //
 //! @file am_util_string.c
 //!
-//! @brief A subset of the functions provided in the C standard string library.
+//! @brief String Manipulation Utility Functions
 //!
-//! The functions here are reimplementation of some of the standard "string"
-//! functions.
-//!
-//! @addtogroup string String - Ambiq subset of C String Library
+//! @addtogroup string_utils String Utility Functions
 //! @ingroup utils
 //! @{
+//!
+//! Purpose: This module provides string manipulation utilities for
+//!          Ambiq Micro devices. It enables efficient string handling,
+//!          formatting, and comparison operations for embedded applications
+//!          requiring text processing capabilities. The utilities support
+//!          various string operations optimized for embedded systems.
+//!
+//! @section utils_string_features Key Features
+//!
+//! 1. @b String @b Operations: Common string manipulations.
+//! 2. @b Memory @b Efficient: Optimized for embedded use.
+//! 3. @b Format @b Support: String formatting capabilities.
+//! 4. @b Safety @b Checks: Buffer overflow protection.
+//! 5. @b Performance: Optimized implementations.
+//!
+//! @section utils_string_functionality Functionality
+//!
+//! - Perform string operations
+//! - Handle string formatting
+//! - Compare string contents
+//! - Manage buffer safety
+//! - Process text data
+//!
+//! @section utils_string_usage Usage
+//!
+//! 1. Use string functions as needed
+//! 2. Handle string formatting
+//! 3. Perform comparisons
+//! 4. Ensure buffer safety
+//!
+//! @section utils_string_configuration Configuration
+//!
+//! - Set buffer parameters
+//! - Configure safety checks
+//! - Define formatting options
+//! - Set operation limits
 //
 //*****************************************************************************
 
 //*****************************************************************************
 //
-// Copyright (c) 2024, Ambiq Micro, Inc.
+// Copyright (c) 2025, Ambiq Micro, Inc.
 // All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without
@@ -32,9 +65,6 @@
 // contributors may be used to endorse or promote products derived from this
 // software without specific prior written permission.
 //
-// Third party software included in this distribution is subject to the
-// additional license terms as defined in the /docs/licenses directory.
-//
 // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
 // AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
 // IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
@@ -47,7 +77,7 @@
 // ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 // POSSIBILITY OF SUCH DAMAGE.
 //
-// This is part of revision release_sdk_4_4_0-3c5977e664 of the AmbiqSuite Development Package.
+// This is part of revision release_sdk5p1p0-366b80e084 of the AmbiqSuite Development Package.
 //
 //*****************************************************************************
 
