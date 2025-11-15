@@ -25,7 +25,11 @@ zephyr_library_sources(hal/mcu/am_hal_mcuctrl.c)
 zephyr_library_sources(hal/mcu/am_hal_sysctrl.c)
 zephyr_library_sources(hal/mcu/am_hal_syspll.c)
 zephyr_library_sources(hal/mcu/am_hal_itm.c)
-zephyr_library_sources(hal/am_hal_adc.c)
+zephyr_library_sources(hal/mcu/am_hal_puf.c)
+
+if(CONFIG_AMBIQ_HAL_USE_ADC)
+    zephyr_library_sources(hal/am_hal_adc.c)
+endif()
 
 if(CONFIG_AMBIQ_HAL_USE_SDIO)
 zephyr_library_sources(hal/mcu/am_hal_card.c)
