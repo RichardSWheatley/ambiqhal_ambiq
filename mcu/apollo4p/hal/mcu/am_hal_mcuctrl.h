@@ -504,3 +504,4 @@ extern uint32_t am_hal_mcuctrl_info_get(am_hal_mcuctrl_infoget_e eInfoGet,
 //! @}
 //
 //*****************************************************************************
+
