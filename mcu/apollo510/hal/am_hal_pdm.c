@@ -1088,7 +1088,9 @@ am_hal_pdm_interrupt_enable(void *pHandle, uint32_t ui32IntMask)
     am_hal_pdm_state_t *pState = (am_hal_pdm_state_t *) pHandle;
     uint32_t ui32Module = pState->ui32Module;
 
+    AM_CRITICAL_BEGIN
     PDMn(ui32Module)->INTEN |= ui32IntMask;
+    AM_CRITICAL_END
 
     return AM_HAL_STATUS_SUCCESS;
 }
@@ -1109,7 +1111,9 @@ am_hal_pdm_interrupt_disable(void *pHandle, uint32_t ui32IntMask)
     am_hal_pdm_state_t *pState = (am_hal_pdm_state_t *) pHandle;
     uint32_t ui32Module = pState->ui32Module;
 
+    AM_CRITICAL_BEGIN
     PDMn(ui32Module)->INTEN &= ~ui32IntMask;
+    AM_CRITICAL_END
 
     return AM_HAL_STATUS_SUCCESS;
 }
