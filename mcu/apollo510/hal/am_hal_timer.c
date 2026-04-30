@@ -671,7 +671,9 @@ am_hal_timer_compare1_set(uint32_t ui32TimerNumber,
 uint32_t
 am_hal_timer_interrupt_enable(uint32_t ui32InterruptMask)
 {
+    AM_CRITICAL_BEGIN
     TIMER->INTEN |= ui32InterruptMask;
+    AM_CRITICAL_END
 
     return AM_HAL_STATUS_SUCCESS;
 }
@@ -682,7 +684,9 @@ am_hal_timer_interrupt_enable(uint32_t ui32InterruptMask)
 uint32_t
 am_hal_timer_interrupt_disable(uint32_t ui32InterruptMask)
 {
+    AM_CRITICAL_BEGIN
     TIMER->INTEN &= ~(ui32InterruptMask);
+    AM_CRITICAL_END
 
     return AM_HAL_STATUS_SUCCESS;
 }
@@ -704,9 +708,9 @@ am_hal_timer_interrupt_status_get(bool bEnabledOnly, uint32_t *pui32IntStatus)
         *pui32IntStatus = TIMER->INTSTAT;
     }
 
-    return AM_HAL_STATUS_SUCCESS;
-
     DIAG_DEFAULT_VOLATILE_ORDER()
+
+    return AM_HAL_STATUS_SUCCESS;
 }
 
 //
