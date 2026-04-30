@@ -842,9 +842,11 @@ extern uint32_t am_hal_audadc_configure_dma(void *pHandle,
 //!
 //! @param pHandle - handle for the module instance.
 //!
-//! This function to get DMA Buffer.
+//! This function returns the address of the DMA buffer that the most recent
+//! transfer was filling, suitable for the application to consume.
 //!
-//! @return status - generic or interface specific status.
+//! @return The address of the most recently filled DMA buffer, or 0 if
+//!         pHandle is NULL.
 //
 //*****************************************************************************
 extern uint32_t am_hal_audadc_dma_get_buffer(void *pHandle);

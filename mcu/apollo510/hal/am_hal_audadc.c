@@ -1290,6 +1290,11 @@ am_hal_audadc_dma_get_buffer(void *pHandle)
     uint32_t ui32BufferPtr;
     am_hal_audadc_state_t *pState = (am_hal_audadc_state_t *) pHandle;
 
+    if (pState == NULL)
+    {
+        return 0;
+    }
+
     if (pState->ui32BufferPong == 0xFFFFFFFF)
     {
         ui32BufferPtr = pState->ui32BufferPing;
@@ -1690,7 +1695,9 @@ am_hal_audadc_interrupt_enable(void *pHandle, uint32_t ui32IntMask)
     //
     // Enable the interrupts.
     //
+    AM_CRITICAL_BEGIN
     AUDADCn(ui32Module)->INTEN |= ui32IntMask;
+    AM_CRITICAL_END
 
     //
     // Return the status.
@@ -1728,7 +1735,9 @@ am_hal_audadc_interrupt_disable(void *pHandle, uint32_t ui32IntMask)
     //
     // Disable the interrupts.
     //
+    AM_CRITICAL_BEGIN
     AUDADCn(ui32Module)->INTEN &= ~ui32IntMask;
+    AM_CRITICAL_END
 
     //
     // Return the status.
@@ -1853,48 +1862,63 @@ am_hal_audadc_interrupt_service(void *pHandle, uint32_t ui32IntMask)
 #endif
     }
 
-    if ((ui32IntMask & AUDADC_INTSTAT_DCMP_Msk) && (pAUDADCState->ui32BufferPong != 0xFFFFFFFF))
+    if (ui32IntMask & AUDADC_INTSTAT_DCMP_Msk)
     {
-#ifdef USE_AUDADC_TWO_STAGE_DMA
-#ifdef CLEAR_DMACPL_SAFELY
-        // assert(AUDADCn(ui32Module)->DMASTAT_b.DMACPL == 1);
-        if (AUDADCn(ui32Module)->DMASTAT_b.DMATIP == 1)
+        if (pAUDADCState->ui32BufferPong == 0xFFFFFFFF)
         {
-            // If DMATIP is 1, it's safe to clear DMACPL.
+            //
+            // Single-buffer mode: just clear DMACPL so subsequent
+            // transfers can complete. No buffer swap, no two-stage
+            // reload.
+            //
             AUDADCn(ui32Module)->DMASTAT_b.DMACPL = 0;
         }
         else
         {
+#ifdef USE_AUDADC_TWO_STAGE_DMA
             //
-            // Otherwise, clear THR status and enable THR interrupt.
-            // Clear DMACPL in the next THR ISR.
+            // Verify the next descriptor is free before touching
+            // DMACPL. If we cleared (or scheduled to clear) DMACPL
+            // first and then bailed out, the completion signal would
+            // be gone and the DMA would be stalled with no recovery.
             //
-            AUDADCn(ui32Module)->INTCLR_b.FIFOOVR1 = 1;
-            am_hal_audadc_interrupt_enable(pHandle, AM_HAL_AUDADC_INT_FIFOOVR1);
-            pAUDADCState->bNeedtoClearDmacpl = true;
-            am_hal_sysctrl_sysbus_write_flush();
-        }
+            if (AUDADCn(ui32Module)->DMAENNEXTCTRL != 0)
+            {
+                return AM_HAL_STATUS_HW_ERR;
+            }
+
+#ifdef CLEAR_DMACPL_SAFELY
+            // assert(AUDADCn(ui32Module)->DMASTAT_b.DMACPL == 1);
+            if (AUDADCn(ui32Module)->DMASTAT_b.DMATIP == 1)
+            {
+                // If DMATIP is 1, it's safe to clear DMACPL.
+                AUDADCn(ui32Module)->DMASTAT_b.DMACPL = 0;
+            }
+            else
+            {
+                //
+                // Otherwise, clear THR status and enable THR interrupt.
+                // Clear DMACPL in the next THR ISR.
+                //
+                AUDADCn(ui32Module)->INTCLR = AUDADC_INTCLR_FIFOOVR1_Msk;
+                am_hal_audadc_interrupt_enable(pHandle, AM_HAL_AUDADC_INT_FIFOOVR1);
+                pAUDADCState->bNeedtoClearDmacpl = true;
+                am_hal_sysctrl_sysbus_write_flush();
+            }
 #else // !CLEAR_DMACPL_SAFELY
-        AUDADCn(ui32Module)->DMASTAT_b.DMACPL = 0;
+            AUDADCn(ui32Module)->DMASTAT_b.DMACPL = 0;
 #endif // !CLEAR_DMACPL_SAFELY
 
-        if (AUDADCn(ui32Module)->DMAENNEXTCTRL == 0)
-        {
             pAUDADCState->ui32BufferPtr = (pAUDADCState->ui32BufferPtr == pAUDADCState->ui32BufferPong) ? pAUDADCState->ui32BufferPing : pAUDADCState->ui32BufferPong;
             AUDADCn(ui32Module)->DMATARGADDRNEXT = pAUDADCState->ui32BufferPtr;
             AUDADCn(ui32Module)->DMATOTCOUNTNEXT = pAUDADCState->ui32BufferSizeBytes;
             AUDADCn(ui32Module)->DMAENNEXTCTRL = 1;
-        }
-        else
-        {
-            return AM_HAL_STATUS_HW_ERR;
-        }
-
 #else
-        pAUDADCState->ui32BufferPtr = (pAUDADCState->ui32BufferPtr == pAUDADCState->ui32BufferPong) ? pAUDADCState->ui32BufferPing : pAUDADCState->ui32BufferPong;
-        AUDADCn(ui32Module)->DMATARGADDR = pAUDADCState->ui32BufferPtr;
-        AUDADCn(ui32Module)->DMATOTCOUNT = pAUDADCState->ui32BufferSizeBytes;
+            pAUDADCState->ui32BufferPtr = (pAUDADCState->ui32BufferPtr == pAUDADCState->ui32BufferPong) ? pAUDADCState->ui32BufferPing : pAUDADCState->ui32BufferPong;
+            AUDADCn(ui32Module)->DMATARGADDR = pAUDADCState->ui32BufferPtr;
+            AUDADCn(ui32Module)->DMATOTCOUNT = pAUDADCState->ui32BufferSizeBytes;
 #endif
+        }
     }
 
     //
