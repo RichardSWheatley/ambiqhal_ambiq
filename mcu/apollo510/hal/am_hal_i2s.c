@@ -1030,7 +1030,7 @@ am_hal_i2s_dma_transfer_continue(void *pHandle, am_hal_i2s_config_t* psConfig, a
             I2Sn(ui32Module)->TXDMATOTCNTNEXT = pState->ui32TxBufferSizeBytes >> 2;
             I2Sn(ui32Module)->RXDMAADDRNEXT   = pState->ui32RxBufferPtr = pTransferCfg->ui32RxTargetAddr;
             I2Sn(ui32Module)->RXDMATOTCNTNEXT = pState->ui32RxBufferSizeBytes >> 2;
-            I2Sn(ui32Module)->DMAENNEXTCTRL   = I2S0_DMAENNEXTCTRL_TXDMAENNEXT_Msk | I2S0_DMAENNEXTCTRL_TXDMAENNEXT_Msk;
+            I2Sn(ui32Module)->DMAENNEXTCTRL   = I2S0_DMAENNEXTCTRL_RXDMAENNEXT_Msk | I2S0_DMAENNEXTCTRL_TXDMAENNEXT_Msk;
 #else
             I2Sn(ui32Module)->TXDMAADDR   = pState->ui32TxBufferPtr = pTransferCfg->ui32TxTargetAddr;
             I2Sn(ui32Module)->TXDMATOTCNT = pTransferCfg->ui32TxTotalCount;
@@ -1206,6 +1206,7 @@ am_hal_i2s_interrupt_enable(void *pHandle, uint32_t ui32IntMask)
     //
     AM_HAL_I2S_CHK_HANDLE(pHandle);
 
+    AM_CRITICAL_BEGIN
     if ((ui32IntMask & AM_HAL_I2S_INT_RXDMACPL) == AM_HAL_I2S_INT_RXDMACPL)
     {
         I2Sn(ui32Module)->IPBIRPT |= I2S0_IPBIRPT_RXDMAM_Msk;
@@ -1235,6 +1236,7 @@ am_hal_i2s_interrupt_enable(void *pHandle, uint32_t ui32IntMask)
         I2Sn(ui32Module)->IPBIRPT |= I2S0_IPBIRPT_TXEM_Msk;
         I2Sn(ui32Module)->INTEN   |= I2S0_INTSTAT_IPB_Msk;
     }
+    AM_CRITICAL_END
 
     return AM_HAL_STATUS_SUCCESS;
 }
@@ -1255,6 +1257,7 @@ am_hal_i2s_interrupt_disable(void *pHandle, uint32_t ui32IntMask)
     //
     AM_HAL_I2S_CHK_HANDLE(pHandle);
 
+    AM_CRITICAL_BEGIN
     if ((ui32IntMask & AM_HAL_I2S_INT_RXDMACPL) == AM_HAL_I2S_INT_RXDMACPL)
     {
         I2Sn(ui32Module)->IPBIRPT &= ~I2S0_IPBIRPT_RXDMAM_Msk;
@@ -1284,6 +1287,7 @@ am_hal_i2s_interrupt_disable(void *pHandle, uint32_t ui32IntMask)
         I2Sn(ui32Module)->IPBIRPT &= ~I2S0_IPBIRPT_TXEM_Msk;
         I2Sn(ui32Module)->INTEN   &= ~I2S0_INTSTAT_IPB_Msk;
     }
+    AM_CRITICAL_END
 
     return AM_HAL_STATUS_SUCCESS;
 }
