@@ -292,8 +292,19 @@ am_hal_stimer_reset_config(void)
     STIMER->SNVR0       = 0;
     STIMER->SNVR1       = 0;
     STIMER->STMINTEN    = 0;
-    STIMER->STMINTSTAT   = 0;
-    STIMER->STMINTCLR    = 0xFFF;
+    STIMER->STMINTCLR   = STIMER_STMINTSTAT_COMPAREA_Msk |
+                          STIMER_STMINTSTAT_COMPAREB_Msk |
+                          STIMER_STMINTSTAT_COMPAREC_Msk |
+                          STIMER_STMINTSTAT_COMPARED_Msk |
+                          STIMER_STMINTSTAT_COMPAREE_Msk |
+                          STIMER_STMINTSTAT_COMPAREF_Msk |
+                          STIMER_STMINTSTAT_COMPAREG_Msk |
+                          STIMER_STMINTSTAT_COMPAREH_Msk |
+                          STIMER_STMINTSTAT_OVERFLOW_Msk |
+                          STIMER_STMINTSTAT_CAPTUREA_Msk |
+                          STIMER_STMINTSTAT_CAPTUREB_Msk |
+                          STIMER_STMINTSTAT_CAPTUREC_Msk |
+                          STIMER_STMINTSTAT_CAPTURED_Msk;
 
     if ( bClkRelease )
     {
@@ -380,7 +391,7 @@ am_hal_stimer_check_compare_delta_set(uint32_t ui32CmprInstance)
 #ifndef AM_HAL_DISABLE_API_VALIDATION
     if ( ui32CmprInstance > 7 )
     {
-        return AM_HAL_STATUS_OUT_OF_RANGE;
+        return false;
     }
 #endif
     uint32_t curTimer;
@@ -552,29 +563,35 @@ am_hal_stimer_capture_start(uint32_t ui32CaptureNum,
 #endif
 
     //
-    // Set the polarity and pin selection in the GPIO block.
+    // Set the polarity, pin selection, and enable bit in a single 32-bit
+    // write so an interrupt cannot observe a partially-configured capture
+    // channel between bit-field updates.
     //
     switch (ui32CaptureNum)
     {
          case 0:
-            STIMER->SCAPCTRL0_b.STPOL0 = bPolarity;
-            STIMER->SCAPCTRL0_b.STSEL0 = ui32GPIONumber;
-            STIMER->SCAPCTRL0_b.CAPTURE0 = STIMER_SCAPCTRL0_CAPTURE0_ENABLE;
+            STIMER->SCAPCTRL0 =
+                _VAL2FLD(STIMER_SCAPCTRL0_STSEL0,   ui32GPIONumber) |
+                _VAL2FLD(STIMER_SCAPCTRL0_STPOL0,   bPolarity)      |
+                _VAL2FLD(STIMER_SCAPCTRL0_CAPTURE0, STIMER_SCAPCTRL0_CAPTURE0_ENABLE);
             break;
          case 1:
-            STIMER->SCAPCTRL1_b.STPOL1 = bPolarity;
-            STIMER->SCAPCTRL1_b.STSEL1 = ui32GPIONumber;
-            STIMER->SCAPCTRL1_b.CAPTURE1 = STIMER_SCAPCTRL1_CAPTURE1_ENABLE;
+            STIMER->SCAPCTRL1 =
+                _VAL2FLD(STIMER_SCAPCTRL1_STSEL1,   ui32GPIONumber) |
+                _VAL2FLD(STIMER_SCAPCTRL1_STPOL1,   bPolarity)      |
+                _VAL2FLD(STIMER_SCAPCTRL1_CAPTURE1, STIMER_SCAPCTRL1_CAPTURE1_ENABLE);
             break;
          case 2:
-            STIMER->SCAPCTRL2_b.STPOL2 = bPolarity;
-            STIMER->SCAPCTRL2_b.STSEL2 = ui32GPIONumber;
-            STIMER->SCAPCTRL2_b.CAPTURE2 = STIMER_SCAPCTRL2_CAPTURE2_ENABLE;
+            STIMER->SCAPCTRL2 =
+                _VAL2FLD(STIMER_SCAPCTRL2_STSEL2,   ui32GPIONumber) |
+                _VAL2FLD(STIMER_SCAPCTRL2_STPOL2,   bPolarity)      |
+                _VAL2FLD(STIMER_SCAPCTRL2_CAPTURE2, STIMER_SCAPCTRL2_CAPTURE2_ENABLE);
             break;
          case 3:
-            STIMER->SCAPCTRL3_b.STPOL3 = bPolarity;
-            STIMER->SCAPCTRL3_b.STSEL3 = ui32GPIONumber;
-            STIMER->SCAPCTRL3_b.CAPTURE3 = STIMER_SCAPCTRL3_CAPTURE3_ENABLE;
+            STIMER->SCAPCTRL3 =
+                _VAL2FLD(STIMER_SCAPCTRL3_STSEL3,   ui32GPIONumber) |
+                _VAL2FLD(STIMER_SCAPCTRL3_STPOL3,   bPolarity)      |
+                _VAL2FLD(STIMER_SCAPCTRL3_CAPTURE3, STIMER_SCAPCTRL3_CAPTURE3_ENABLE);
             break;
          default:
             return;
