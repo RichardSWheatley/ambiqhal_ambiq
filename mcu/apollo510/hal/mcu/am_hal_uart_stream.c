@@ -1773,6 +1773,11 @@ am_hal_uart_stream_get_num_rx_bytes_in_buffer(void *pUartHandle, bool bUnloadRxF
     am_hal_uart_stream_state_t *psState = (am_hal_uart_stream_state_t *)pUartHandle;
 
     am_hal_stream_queue_t *psRxQueue = &psState->sRx_params.sRxQueue;
+    if (psRxQueue->pui8Data == NULL)
+    {
+        return 0;
+    }
+
     if ( bUnloadRxFifo )
     {
         volatile UART0_Type *pUart = UARTn(psState->ui32Module);
@@ -1809,6 +1814,10 @@ am_hal_uart_stream_get_rx_data(void *pUartHandle,
     if ( ui32MaxBytesToRead )
     {
         am_hal_stream_queue_t *psRxQueue = &psState->sRx_params.sRxQueue;
+        if (psRxQueue->pui8Data == NULL)
+        {
+            return 0;
+        }
         if ( bUnloadRxFifo )
         {
             volatile UART0_Type *pUart = UARTn(psState->ui32Module);
@@ -1949,7 +1958,6 @@ am_hal_uart_stream_configure_tx(void *pUartHandle,
             return AM_HAL_UART_DMA_CFG_ERROR;
         }
 
-        txParams->bDmaQueueInited = true;
         psDmaCfg->eActiveQueueType = eAM_HAL_UART_TX_ACTIVE_DMA;
         if (eStreamingDmaMode == AM_HAL_UART_DMA_TX_SINGLE_BUFFER)
         {
@@ -2261,9 +2269,12 @@ am_hal_uart_stream_data_configure(void *pUartHandle,
     psState->eStreamingDmaMode = psDataCfg->eStreamingDmaMode;
 
     am_hal_uart_errors_t eRxCfgErr = am_hal_uart_stream_configure_rx(psState, &psDataCfg->sRxStreamConfig);
-    eRxCfgErr |= am_hal_uart_stream_configure_tx(psState, &psDataCfg->sTxStreamConfig);
+    if (eRxCfgErr != AM_HAL_UART_STATUS_SUCCESS)
+    {
+        return eRxCfgErr;
+    }
 
-    return eRxCfgErr;
+    return am_hal_uart_stream_configure_tx(psState, &psDataCfg->sTxStreamConfig);
 }
 
 //*****************************************************************************
@@ -2654,14 +2665,19 @@ am_hal_uart_stream_initialize(uint32_t ui32Module, void **ppUartHandle)
     {
         return AM_HAL_STATUS_INVALID_OPERATION;
     }
-    psState->psActiveState      = true;
 
+    memset(&psState->sDmaQueue,  0, sizeof(psState->sDmaQueue));
+    memset(&psState->sTx_params, 0, sizeof(psState->sTx_params));
+    memset(&psState->sRx_params, 0, sizeof(psState->sRx_params));
+
+    psState->psActiveState      = true;
     psState->prefix.s.bInit     = true;
     psState->prefix.s.magic     = AM_HAL_MAGIC_UART_STREAM;
     psState->ui32Module         = ui32Module;
     psState->sRegState.bValid   = false;
-    psState->sTx_params.bEnableTxQueue     = false;
-    psState->sRx_params.bEnableRxQueue     = false;
+    psState->bBusyWaitEnabled   = false;
+    psState->eStreamingDmaMode  = AM_HAL_UART_DMA_NONE;
+    psState->eTxCompleteNotificationEnabled = eAM_HAL_TX_COMPL_NO_NOTIFICATION;
 
     return AM_HAL_STATUS_SUCCESS;
 }
