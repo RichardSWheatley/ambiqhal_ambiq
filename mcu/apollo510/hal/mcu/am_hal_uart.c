@@ -121,10 +121,12 @@
     }
 
 #define RETURN_ON_ERROR(x)                                                    \
-    if ((x) != AM_HAL_STATUS_SUCCESS)                                         \
-    {                                                                         \
-        return (x);                                                           \
-    };
+    do {                                                                      \
+        if ((x) != AM_HAL_STATUS_SUCCESS)                                     \
+        {                                                                     \
+            return (x);                                                       \
+        }                                                                     \
+    } while (0)
 //*****************************************************************************
 //
 //! Structure for handling UART register state information for power up/down
@@ -359,19 +361,17 @@ am_hal_uart_initialize(uint32_t ui32Module, void **ppHandle)
     }
 #endif
     //
-    // Initialize the handle.
+    // Initialize the handle. Zero the whole state struct first so that
+    // re-initialization of a module cannot inherit stale callbacks,
+    // queue pointers, transaction structs, or the bDMABusy flag from a
+    // previous use.
     //
+    memset(&g_am_hal_uart_states[ui32Module], 0,
+           sizeof(g_am_hal_uart_states[ui32Module]));
+
     g_am_hal_uart_states[ui32Module].prefix.s.bInit = true;
     g_am_hal_uart_states[ui32Module].prefix.s.magic = AM_HAL_MAGIC_UART;
     g_am_hal_uart_states[ui32Module].ui32Module = ui32Module;
-    g_am_hal_uart_states[ui32Module].sRegState.bValid = false;
-    g_am_hal_uart_states[ui32Module].ui32BaudRate = 0;
-    g_am_hal_uart_states[ui32Module].bCurrentlyReading = 0;
-    g_am_hal_uart_states[ui32Module].bCurrentlyWriting = 0;
-    g_am_hal_uart_states[ui32Module].bEnableTxQueue = 0;
-    g_am_hal_uart_states[ui32Module].bEnableRxQueue = 0;
-    g_am_hal_uart_states[ui32Module].ui32BytesWritten = 0;
-    g_am_hal_uart_states[ui32Module].ui32BytesRead = 0;
     g_am_hal_uart_states[ui32Module].bLastTxComplete = true;
 
     //
@@ -714,9 +714,13 @@ am_hal_uart_dma_transfer(void *pHandle,
 
     am_hal_uart_dma_configure(pHandle, psTransaction);
 
-    am_hal_uart_dma_transfer_start(pHandle, psTransaction);
-
+    //
+    // Mark the engine busy before starting DMA so the completion ISR
+    // cannot run with bDMABusy still false in the start->set window.
+    //
     pUARTState->bDMABusy = true;
+
+    am_hal_uart_dma_transfer_start(pHandle, psTransaction);
 
     return AM_HAL_STATUS_SUCCESS;
 }
@@ -2402,7 +2406,7 @@ am_hal_uart_interrupt_service(void *pHandle, uint32_t ui32Status)
         }
     }
 
-    return AM_HAL_STATUS_FAIL;
+    return AM_HAL_STATUS_SUCCESS;
 }
 
 

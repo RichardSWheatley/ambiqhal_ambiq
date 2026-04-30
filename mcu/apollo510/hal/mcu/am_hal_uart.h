@@ -61,7 +61,7 @@ extern "C"
 //! Global definitions
 //
 //*****************************************************************************
-#define UARTn(n)    ((UART0_Type*)(UART0_BASE + (n * (UART1_BASE - UART0_BASE))))
+#define UARTn(n)    ((UART0_Type*)(UART0_BASE + ((n) * (UART1_BASE - UART0_BASE))))
 
 //*****************************************************************************
 //
@@ -377,7 +377,7 @@ am_hal_uart_transfer_t;
     .pfnCallback = 0,                                                         \
     .pvContext = 0,                                                           \
     .ui32ErrorStatus = 0,                                                     \
-};
+}
 
 //
 //! UART Blocking Read Defaults.
@@ -449,7 +449,7 @@ am_hal_uart_transfer_t;
 //! @return HAL status code.
 //
 //*****************************************************************************
-#define am_hal_uart_power_enable(phandle) am_hal_uart_power_control(phandle, AM_HAL_SYSCTRL_WAKE, false);
+#define am_hal_uart_power_enable(phandle) am_hal_uart_power_control(phandle, AM_HAL_SYSCTRL_WAKE, false)
 
 //*****************************************************************************
 //
@@ -461,7 +461,7 @@ am_hal_uart_transfer_t;
 //! @return HAL status code.
 //
 //*****************************************************************************
-#define am_hal_uart_power_disable(phandle) am_hal_uart_power_control(phandle, AM_HAL_SYSCTRL_DEEPSLEEP, false);
+#define am_hal_uart_power_disable(phandle) am_hal_uart_power_control(phandle, AM_HAL_SYSCTRL_DEEPSLEEP, false)
 
 //*****************************************************************************
 //
