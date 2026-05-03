@@ -155,7 +155,38 @@ void weaver_set_buffer_fill_q16(struct weaver_thread_data *wd, uint32_t fill_q16
 	if (fill_q16 > WEAVER_Q16_ONE) {
 		fill_q16 = WEAVER_Q16_ONE;
 	}
+	wd->last_fill_q16 = wd->buffer_fill_q16;
 	wd->buffer_fill_q16 = fill_q16;
+}
+
+void weaver_set_buffer_fill_predictive_q16(struct weaver_thread_data *wd,
+					   uint32_t fill_q16)
+{
+	if (wd == NULL) {
+		return;
+	}
+	if (fill_q16 > WEAVER_Q16_ONE) {
+		fill_q16 = WEAVER_Q16_ONE;
+	}
+
+	uint32_t prev = wd->buffer_fill_q16;
+	wd->last_fill_q16 = prev;
+
+	/* One-step linear extrapolation: fill_next ~= fill + (fill - prev). */
+	uint32_t projected;
+	if (fill_q16 >= prev) {
+		uint32_t delta = fill_q16 - prev;
+		projected = (fill_q16 + delta < fill_q16) ? WEAVER_Q16_ONE
+							  : fill_q16 + delta;
+		if (projected > WEAVER_Q16_ONE) {
+			projected = WEAVER_Q16_ONE;
+		}
+	} else {
+		uint32_t delta = prev - fill_q16;
+		projected = (fill_q16 > delta) ? fill_q16 - delta : 0;
+	}
+
+	wd->buffer_fill_q16 = projected;
 }
 
 void weaver_set_warp_deadline(struct weaver_thread_data *wd, uint32_t period_ticks)

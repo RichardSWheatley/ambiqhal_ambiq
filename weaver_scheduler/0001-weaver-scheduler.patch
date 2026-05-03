@@ -1,9 +1,9 @@
 diff --git a/include/zephyr/kernel/weaver_sched.h b/include/zephyr/kernel/weaver_sched.h
 new file mode 100644
-index 00000000000..b3c87752f96
+index 00000000000..d8f78ccd49c
 --- /dev/null
 +++ b/include/zephyr/kernel/weaver_sched.h
-@@ -0,0 +1,213 @@
+@@ -0,0 +1,229 @@
 +/*
 + * Copyright (c) 2026 Ambiq Micro, Inc.
 + *
@@ -66,6 +66,7 @@ index 00000000000..b3c87752f96
 +	struct k_thread *thread;       /**< Zephyr thread handle. */
 +	uint32_t priority_q16;         /**< Static "Warp priority" (Q16.16). */
 +	uint32_t buffer_fill_q16;      /**< Buffer fill ratio: 0..ONE. */
++	uint32_t last_fill_q16;        /**< Previous fill (for predictive delta). */
 +	uint32_t wait_ticks;           /**< Aging counter (incremented per tick). */
 +	uint32_t period_ticks;         /**< Warp period (0 if Weft or aperiodic). */
 +	uint32_t next_deadline_ticks;  /**< Ticks remaining to next Warp run. */
@@ -145,6 +146,21 @@ index 00000000000..b3c87752f96
 + * @param fill_q16 Fill ratio in Q16.16 (0 = empty, WEAVER_Q16_ONE = full).
 + */
 +void weaver_set_buffer_fill_q16(struct weaver_thread_data *wd, uint32_t fill_q16);
++
++/**
++ * @brief Update buffer fill with one-step predictive extrapolation.
++ *
++ * Equivalent to weaver_set_buffer_fill_q16(wd, fill_q16) but stores
++ * (fill_q16 + (fill_q16 - last_fill_q16)) so the scheduler reacts to
++ * where the FIFO will be next tick rather than where it is now. This
++ * is the "Predictive" half of "Predictive and Pressure-Aware" without
++ * any non-deterministic ML in the hot path: 2 subtractions, 1 add,
++ * 1 saturation, ~6 cycles on Cortex-M55.
++ *
++ * Producers (sensor drivers, GATT TX) call this on every FIFO update.
++ */
++void weaver_set_buffer_fill_predictive_q16(struct weaver_thread_data *wd,
++					   uint32_t fill_q16);
 +
 +/**
 + * @brief One Weaver scheduling pass.
@@ -338,10 +354,10 @@ index 00000000000..add49231904
 +endif # WEAVER_SCHED
 diff --git a/kernel/weaver_sched.c b/kernel/weaver_sched.c
 new file mode 100644
-index 00000000000..38fb56b1201
+index 00000000000..e3c0b896e31
 --- /dev/null
 +++ b/kernel/weaver_sched.c
-@@ -0,0 +1,322 @@
+@@ -0,0 +1,353 @@
 +/*
 + * Copyright (c) 2026 Ambiq Micro, Inc.
 + *
@@ -499,7 +515,38 @@ index 00000000000..38fb56b1201
 +	if (fill_q16 > WEAVER_Q16_ONE) {
 +		fill_q16 = WEAVER_Q16_ONE;
 +	}
++	wd->last_fill_q16 = wd->buffer_fill_q16;
 +	wd->buffer_fill_q16 = fill_q16;
++}
++
++void weaver_set_buffer_fill_predictive_q16(struct weaver_thread_data *wd,
++					   uint32_t fill_q16)
++{
++	if (wd == NULL) {
++		return;
++	}
++	if (fill_q16 > WEAVER_Q16_ONE) {
++		fill_q16 = WEAVER_Q16_ONE;
++	}
++
++	uint32_t prev = wd->buffer_fill_q16;
++	wd->last_fill_q16 = prev;
++
++	/* One-step linear extrapolation: fill_next ~= fill + (fill - prev). */
++	uint32_t projected;
++	if (fill_q16 >= prev) {
++		uint32_t delta = fill_q16 - prev;
++		projected = (fill_q16 + delta < fill_q16) ? WEAVER_Q16_ONE
++							  : fill_q16 + delta;
++		if (projected > WEAVER_Q16_ONE) {
++			projected = WEAVER_Q16_ONE;
++		}
++	} else {
++		uint32_t delta = prev - fill_q16;
++		projected = (fill_q16 > delta) ? fill_q16 - delta : 0;
++	}
++
++	wd->buffer_fill_q16 = projected;
 +}
 +
 +void weaver_set_warp_deadline(struct weaver_thread_data *wd, uint32_t period_ticks)

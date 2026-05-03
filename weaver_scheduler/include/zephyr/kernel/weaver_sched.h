@@ -60,6 +60,7 @@ struct weaver_thread_data {
 	struct k_thread *thread;       /**< Zephyr thread handle. */
 	uint32_t priority_q16;         /**< Static "Warp priority" (Q16.16). */
 	uint32_t buffer_fill_q16;      /**< Buffer fill ratio: 0..ONE. */
+	uint32_t last_fill_q16;        /**< Previous fill (for predictive delta). */
 	uint32_t wait_ticks;           /**< Aging counter (incremented per tick). */
 	uint32_t period_ticks;         /**< Warp period (0 if Weft or aperiodic). */
 	uint32_t next_deadline_ticks;  /**< Ticks remaining to next Warp run. */
@@ -139,6 +140,21 @@ void weaver_set_boost_levels(struct weaver_thread_data *wd, uint8_t levels);
  * @param fill_q16 Fill ratio in Q16.16 (0 = empty, WEAVER_Q16_ONE = full).
  */
 void weaver_set_buffer_fill_q16(struct weaver_thread_data *wd, uint32_t fill_q16);
+
+/**
+ * @brief Update buffer fill with one-step predictive extrapolation.
+ *
+ * Equivalent to weaver_set_buffer_fill_q16(wd, fill_q16) but stores
+ * (fill_q16 + (fill_q16 - last_fill_q16)) so the scheduler reacts to
+ * where the FIFO will be next tick rather than where it is now. This
+ * is the "Predictive" half of "Predictive and Pressure-Aware" without
+ * any non-deterministic ML in the hot path: 2 subtractions, 1 add,
+ * 1 saturation, ~6 cycles on Cortex-M55.
+ *
+ * Producers (sensor drivers, GATT TX) call this on every FIFO update.
+ */
+void weaver_set_buffer_fill_predictive_q16(struct weaver_thread_data *wd,
+					   uint32_t fill_q16);
 
 /**
  * @brief One Weaver scheduling pass.
