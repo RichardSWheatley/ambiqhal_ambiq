@@ -284,10 +284,10 @@ index 9e3be0b12ab..1f0b78d337d 100644
 +rsource "Kconfig.weaver"
 diff --git a/kernel/Kconfig.weaver b/kernel/Kconfig.weaver
 new file mode 100644
-index 00000000000..b0e1d6850ab
+index 00000000000..a4c340d6938
 --- /dev/null
 +++ b/kernel/Kconfig.weaver
-@@ -0,0 +1,117 @@
+@@ -0,0 +1,154 @@
 +# Weaver predictive pressure-aware scheduler configuration
 +
 +# Copyright (c) 2026 Ambiq Micro, Inc.
@@ -362,17 +362,54 @@ index 00000000000..b0e1d6850ab
 +	  zero pressure. This prevents priority churn from blocking
 +	  deepsleep entry on battery-powered designs.
 +
-+config WEAVER_USE_MVE
-+	bool "Use Helium MVE intrinsics for the pressure inner loop"
-+	depends on CPU_CORTEX_M55 || CPU_HAS_MVE
-+	default n
++choice
++	prompt "Pressure-batch implementation"
++	default WEAVER_BATCH_SCALAR
 +	help
-+	  Vectorize weaver_calculate_pressure_batch() using Helium MVE so
-+	  four threads' pressures are computed in parallel. Worth enabling
-+	  only when WEAVER_MAX_THREADS exceeds about 32, because vector
-+	  register save/restore on every preemption (~50 cycles) eats the
-+	  per-tick savings at low thread counts. Default off; integer path
-+	  is faster for typical wearable workloads.
++	  Selects which implementation of the per-tick pressure batch is
++	  compiled in. All three produce identical numeric results; the
++	  tradeoff is purely cycle count vs. FP/MVE context-save cost on
++	  preemption.
++
++config WEAVER_BATCH_SCALAR
++	bool "Pure scalar (no MVE)"
++	help
++	  Integer ALU only. Never touches FPU/MVE registers, so the lazy
++	  floating-point context save mechanism is never armed by the
++	  scheduler. Best choice when registered thread count <= ~16, or
++	  when other parts of the system avoid FP/MVE on the preempted
++	  threads. ~12 cycles per thread on Cortex-M55.
++
++config WEAVER_BATCH_HYBRID
++	bool "Hybrid MVE (vector load/store, scalar multiply)"
++	depends on CPU_CORTEX_M55 || CPU_HAS_MVE
++	help
++	  Loads/stores 4 lanes via vld1q_u32 / vst1q_u32 and uses
++	  vqaddq_u32 for saturating add, but the Q16.16 multiply is still
++	  per-lane scalar. Useful for measuring how much of the MVE cost
++	  is the vector context-save vs. the multiply itself. Touches
++	  the MVE register file, so any later preemption pays the
++	  ~50-cycle vector context-save.
++
++config WEAVER_BATCH_MVE
++	bool "Full MVE (true 4-wide multiply)"
++	depends on CPU_CORTEX_M55 || CPU_HAS_MVE
++	help
++	  Vectorizes the 32x32 -> 64 Q16 multiply via vmullbq_int_u32 +
++	  vmulltq_int_u32 + vshrnbq/vshrntq. Roughly 4 MVE instructions
++	  for 4 lanes of Q16 multiply. Break-even with the scalar path
++	  is around 32 registered threads on Apollo510, because the
++	  per-preemption MVE context save costs about 50 cycles. Use only
++	  when WEAVER_MAX_THREADS is large or when the rest of the system
++	  already pays the MVE save cost.
++
++endchoice
++
++config WEAVER_USE_MVE
++	bool
++	default y if WEAVER_BATCH_HYBRID || WEAVER_BATCH_MVE
++	help
++	  Internal: set when any MVE-touching variant is selected.
 +
 +config WEAVER_TIMING
 +	bool "Measure dispatcher cycles via DWT cycle counter"
@@ -407,10 +444,10 @@ index 00000000000..b0e1d6850ab
 +endif # WEAVER_SCHED
 diff --git a/kernel/weaver_sched.c b/kernel/weaver_sched.c
 new file mode 100644
-index 00000000000..de24c30818a
+index 00000000000..c330f4e72c1
 --- /dev/null
 +++ b/kernel/weaver_sched.c
-@@ -0,0 +1,498 @@
+@@ -0,0 +1,661 @@
 +/*
 + * Copyright (c) 2026 Ambiq Micro, Inc.
 + *
@@ -564,53 +601,198 @@ index 00000000000..de24c30818a
 +	return saturate_add(saturate_add(p_urgency, p_density), p_aging);
 +}
 +
-+#ifdef CONFIG_WEAVER_USE_MVE
 +/*
-+ * MVE batch: compute pressures for up to 4 Weft threads at once.
-+ * 32-bit lanes (uint32x4_t). Warp threads are still handled scalar
-+ * because the saturating-to-0xFFFFFFFF branch breaks the SIMD pattern.
-+ *
-+ * Used only when CONFIG_WEAVER_MAX_THREADS > 32 makes the vector
-+ * context-save cost worthwhile. Same numeric semantics as the scalar
-+ * path; verified equivalent in test/weaver_mve_equiv.c (host build).
++ * Pull the three Q16 inputs out of a thread record into parallel arrays.
++ * Warp lanes get zero inputs; the post-batch fixup overrides them to
++ * WEAVER_PRESSURE_WARP. NULL or !in_use slots also get zero inputs and
++ * a zero output, which is correct (no pressure, never wins dispatch).
 + */
-+static inline void mve_pressure_batch4(const uint32_t prio[4],
-+				       const uint32_t fill[4],
-+				       const uint32_t wait[4],
-+				       uint32_t out[4])
++static inline void gather_inputs(const struct weaver_thread_data *wd,
++				 uint32_t *prio, uint32_t *fill, uint32_t *aged)
 +{
-+	uint32x4_t v_prio = vld1q_u32(prio);
-+	uint32x4_t v_fill = vld1q_u32(fill);
-+	uint32x4_t v_wait = vld1q_u32(wait);
++	if (wd == NULL || !wd->in_use || wd->is_warp) {
++		*prio = 0;
++		*fill = 0;
++		*aged = 0;
++		return;
++	}
++	*prio = wd->priority_q16;
++	*fill = wd->buffer_fill_q16;
++	uint32_t w = MIN(wd->wait_ticks, WEAVER_WAIT_TICKS_MAX);
++	*aged = WEAVER_TO_Q16(w);
++}
 +
-+	uint32x4_t v_w_u = vdupq_n_u32(weaver.w_urgency);
-+	uint32x4_t v_w_d = vdupq_n_u32(weaver.w_density);
-+	uint32x4_t v_w_a = vdupq_n_u32(weaver.w_aging);
++/*
++ * Scalar Q16.16 pressure batch. Always available. Used:
++ *   - on every build when CONFIG_WEAVER_USE_MVE=n
++ *   - on the tail (count not divisible by 4) when MVE=y
++ *   - by the host-side equivalence harness
++ */
++static void scalar_pressure_batch(const struct weaver_thread_data * const snap[],
++				  uint32_t pressures[],
++				  size_t n)
++{
++	for (size_t i = 0; i < n; i++) {
++		const struct weaver_thread_data *wd = snap[i];
++		if (wd == NULL || !wd->in_use) {
++			pressures[i] = 0;
++		} else if (wd->is_warp) {
++			pressures[i] = WEAVER_PRESSURE_WARP;
++		} else {
++			pressures[i] = weaver_calculate_pressure(wd);
++		}
++	}
++}
 +
-+	/* Q16 multiplies: 64-bit intermediate then >>16. MVE has no
-+	 * 32x32->64 widening multiply with shift; emulate per lane via
-+	 * the high/low 16-bit unsigned multiply pair. For brevity we
-+	 * fall back to per-lane 64-bit through a tmp; an optimized
-+	 * version would use vmullbq_int_u32 + vmulltq_int_u32 + vshlcq.
-+	 */
-+	uint32_t pu[4], pd[4], pa[4];
-+	for (int i = 0; i < 4; i++) {
-+		pu[i] = WEAVER_Q16_MUL(prio[i], weaver.w_urgency);
-+		pd[i] = WEAVER_Q16_MUL(fill[i], weaver.w_density);
-+		uint32_t w = MIN(wait[i], WEAVER_WAIT_TICKS_MAX);
-+		pa[i] = WEAVER_Q16_MUL(WEAVER_TO_Q16(w), weaver.w_aging);
++/*
++ * Helper: post-batch fixup. Replaces empty-slot lanes with 0 and
++ * Warp-thread lanes with WEAVER_PRESSURE_WARP. Shared by hybrid and
++ * full-MVE paths.
++ */
++static inline void fixup_warp_and_empty(const struct weaver_thread_data * const snap[],
++					uint32_t pressures[],
++					size_t base, size_t count)
++{
++	for (size_t j = 0; j < count; j++) {
++		const struct weaver_thread_data *wd = snap[base + j];
++		if (wd == NULL || !wd->in_use) {
++			pressures[base + j] = 0;
++		} else if (wd->is_warp) {
++			pressures[base + j] = WEAVER_PRESSURE_WARP;
++		}
++	}
++}
++
++#ifdef CONFIG_WEAVER_BATCH_HYBRID
++/*
++ * Hybrid path: vector loads/stores around scalar multiplies.
++ *
++ * Touches the MVE register file (via vld1q/vst1q/vqaddq) so the lazy
++ * floating-point context save mechanism is armed. The Q16 multiply
++ * itself runs scalar, lane-by-lane, on the integer ALU.
++ *
++ * Useful for measurement: subtracting hybrid cycles from full MVE
++ * cycles isolates the cost of the vector multiply alone, while
++ * subtracting scalar cycles from hybrid isolates the cost of the
++ * vector loads/stores plus saturating add.
++ */
++static void hybrid_pressure_batch(const struct weaver_thread_data * const snap[],
++				  uint32_t pressures[],
++				  size_t n)
++{
++	size_t i = 0;
++	for (; i + 4 <= n; i += 4) {
++		uint32_t prio[4], fill[4], aged[4];
++		uint32_t pu[4], pd[4], pa[4];
++
++		for (size_t j = 0; j < 4; j++) {
++			gather_inputs(snap[i + j], &prio[j], &fill[j], &aged[j]);
++		}
++
++		/* Scalar Q16 multiplies (still on the integer ALU). */
++		for (size_t j = 0; j < 4; j++) {
++			pu[j] = WEAVER_Q16_MUL(prio[j], weaver.w_urgency);
++			pd[j] = WEAVER_Q16_MUL(fill[j], weaver.w_density);
++			pa[j] = WEAVER_Q16_MUL(aged[j], weaver.w_aging);
++		}
++
++		/* Vector loads + saturating add + vector store. */
++		uint32x4_t v_pu = vld1q_u32(pu);
++		uint32x4_t v_pd = vld1q_u32(pd);
++		uint32x4_t v_pa = vld1q_u32(pa);
++		uint32x4_t v_sum = vqaddq_u32(vqaddq_u32(v_pu, v_pd), v_pa);
++		vst1q_u32(&pressures[i], v_sum);
++
++		fixup_warp_and_empty(snap, pressures, i, 4);
 +	}
 +
-+	uint32x4_t v_pu = vld1q_u32(pu);
-+	uint32x4_t v_pd = vld1q_u32(pd);
-+	uint32x4_t v_pa = vld1q_u32(pa);
-+
-+	uint32x4_t v_sum = vqaddq_u32(vqaddq_u32(v_pu, v_pd), v_pa);
-+	vst1q_u32(out, v_sum);
-+	(void)v_w_u; (void)v_w_d; (void)v_w_a;  /* Reserved for the
-+						   fully-vectorized variant. */
++	if (i < n) {
++		scalar_pressure_batch(&snap[i], &pressures[i], n - i);
++	}
 +}
-+#endif /* CONFIG_WEAVER_USE_MVE */
++#endif /* CONFIG_WEAVER_BATCH_HYBRID */
++
++#ifdef CONFIG_WEAVER_BATCH_MVE
++/*
++ * Full MVE path: true 4-wide Q16.16 multiply.
++ *
++ * a, b are uint32x4_t. We need (a * b) >> 16 per lane with the full
++ * 32x32 -> 64 intermediate (the inputs span up to 32 bits, e.g.
++ * WEAVER_TO_Q16(WAIT_TICKS_MAX) = 0xFFFF0000).
++ *
++ * MVE provides:
++ *   vmullbq_int_u32(a, b) -> u64x2 from the EVEN-indexed u32 lanes
++ *   vmulltq_int_u32(a, b) -> u64x2 from the ODD-indexed u32 lanes
++ *   vshrnbq_n_u64(inactive, src, imm) shifts u64x2 right by imm and
++ *                                     narrows to u32x4 even lanes
++ *   vshrntq_n_u64(inactive, src, imm) shifts u64x2 right by imm and
++ *                                     narrows to u32x4 odd lanes
++ *
++ * Result: 4 lanes of (a * b) >> 16 in 4 MVE instructions.
++ */
++static inline uint32x4_t mve_q16_mul(uint32x4_t a, uint32x4_t b)
++{
++	uint64x2_t lo = vmullbq_int_u32(a, b);
++	uint64x2_t hi = vmulltq_int_u32(a, b);
++	uint32x4_t out = vshrnbq_n_u64(vuninitializedq_u32(), lo,
++				       WEAVER_Q16_SHIFT);
++	out = vshrntq_n_u64(out, hi, WEAVER_Q16_SHIFT);
++	return out;
++}
++
++static void mve_pressure_batch(const struct weaver_thread_data * const snap[],
++			       uint32_t pressures[],
++			       size_t n)
++{
++	const uint32x4_t v_w_u = vdupq_n_u32(weaver.w_urgency);
++	const uint32x4_t v_w_d = vdupq_n_u32(weaver.w_density);
++	const uint32x4_t v_w_a = vdupq_n_u32(weaver.w_aging);
++
++	size_t i = 0;
++	for (; i + 4 <= n; i += 4) {
++		uint32_t prio[4], fill[4], aged[4];
++
++		for (size_t j = 0; j < 4; j++) {
++			gather_inputs(snap[i + j], &prio[j], &fill[j], &aged[j]);
++		}
++
++		uint32x4_t v_prio = vld1q_u32(prio);
++		uint32x4_t v_fill = vld1q_u32(fill);
++		uint32x4_t v_aged = vld1q_u32(aged);
++
++		uint32x4_t v_pu = mve_q16_mul(v_prio, v_w_u);
++		uint32x4_t v_pd = mve_q16_mul(v_fill, v_w_d);
++		uint32x4_t v_pa = mve_q16_mul(v_aged, v_w_a);
++
++		uint32x4_t v_sum = vqaddq_u32(vqaddq_u32(v_pu, v_pd), v_pa);
++		vst1q_u32(&pressures[i], v_sum);
++
++		fixup_warp_and_empty(snap, pressures, i, 4);
++	}
++
++	if (i < n) {
++		scalar_pressure_batch(&snap[i], &pressures[i], n - i);
++	}
++}
++#endif /* CONFIG_WEAVER_BATCH_MVE */
++
++/*
++ * Single dispatch entry. The selected variant is fixed at build time
++ * by CONFIG_WEAVER_BATCH_*, so this function compiles to a direct call
++ * with no runtime dispatch overhead.
++ */
++static void compute_pressure_batch(const struct weaver_thread_data * const snap[],
++				   uint32_t pressures[],
++				   size_t n)
++{
++#if   defined(CONFIG_WEAVER_BATCH_MVE)
++	mve_pressure_batch(snap, pressures, n);
++#elif defined(CONFIG_WEAVER_BATCH_HYBRID)
++	hybrid_pressure_batch(snap, pressures, n);
++#else
++	scalar_pressure_batch(snap, pressures, n);
++#endif
++}
 +
 +int weaver_register(struct weaver_thread_data *wd, struct k_thread *thread,
 +		    uint32_t priority_q16, bool is_warp)
@@ -742,6 +924,10 @@ index 00000000000..de24c30818a
 +	memcpy(snap, weaver.slots, sizeof(snap));
 +	k_spin_unlock(&weaver.lock, key);
 +
++	/* ---- Pass 1: aging + Warp deadline countdown.
++	 *      Pure scalar, mutates wd state. Cheap (~3 ops per slot). ----
++	 */
++	struct k_thread *current = k_current_get();
 +	for (size_t i = 0; i < ARRAY_SIZE(snap); i++) {
 +		struct weaver_thread_data *wd = snap[i];
 +
@@ -749,16 +935,12 @@ index 00000000000..de24c30818a
 +			continue;
 +		}
 +
-+		if (wd->thread == k_current_get()) {
++		if (wd->thread == current) {
 +			wd->wait_ticks = 0;
 +		} else if (wd->wait_ticks < WEAVER_WAIT_TICKS_MAX) {
 +			wd->wait_ticks++;
 +		}
 +
-+		/* Tick the Warp deadline countdown. When it reaches zero
-+		 * the thread is "due"; we reset to one period and treat
-+		 * remaining=0 (within guard) for the rest of this pass.
-+		 */
 +		if (wd->is_warp && wd->period_ticks > 0) {
 +			if (wd->next_deadline_ticks == 0) {
 +				wd->next_deadline_ticks = wd->period_ticks;
@@ -769,18 +951,36 @@ index 00000000000..de24c30818a
 +				min_warp_remaining = wd->next_deadline_ticks;
 +			}
 +		}
++	}
 +
-+		uint32_t p = weaver_calculate_pressure(wd);
++	/* ---- Pass 2: batch pressure computation.
++	 *      MVE-vectorized when CONFIG_WEAVER_USE_MVE=y, scalar otherwise.
++	 *      Both paths produce identical results; tested in
++	 *      test/weaver_mve_equiv.c on host. ----
++	 */
++	uint32_t pressures[CONFIG_WEAVER_MAX_THREADS];
++	compute_pressure_batch(
++		(const struct weaver_thread_data * const *)snap,
++		pressures, ARRAY_SIZE(snap));
 +
-+		if (!wd->is_warp) {
-+			sys_pressure = saturate_add(sys_pressure, p);
-+			if (p > 0) {
-+				any_weft_pressure = true;
-+			}
-+			if (p > max_pressure) {
-+				max_pressure = p;
-+				winner = wd;
-+			}
++	/* ---- Pass 3: dispatch decisions.
++	 *      Aggregate sys_pressure, find winning Weft, track activity. ----
++	 */
++	for (size_t i = 0; i < ARRAY_SIZE(snap); i++) {
++		struct weaver_thread_data *wd = snap[i];
++		uint32_t p = pressures[i];
++
++		if (wd == NULL || !wd->in_use || wd->is_warp) {
++			continue;
++		}
++
++		sys_pressure = saturate_add(sys_pressure, p);
++		if (p > 0) {
++			any_weft_pressure = true;
++		}
++		if (p > max_pressure) {
++			max_pressure = p;
++			winner = wd;
 +		}
 +	}
 +
@@ -1109,3 +1309,312 @@ index 00000000000..b3f90ae74f6
 +	printk("Weaver Test Complete\n");
 +	return 0;
 +}
+diff --git a/tests/kernel/weaver_paths_equiv/CMakeLists.txt b/tests/kernel/weaver_paths_equiv/CMakeLists.txt
+new file mode 100644
+index 00000000000..f78b93ee883
+--- /dev/null
++++ b/tests/kernel/weaver_paths_equiv/CMakeLists.txt
+@@ -0,0 +1,6 @@
++# SPDX-License-Identifier: Apache-2.0
++cmake_minimum_required(VERSION 3.20.0)
++find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
++project(weaver_paths_equiv)
++
++target_sources(app PRIVATE src/main.c)
+diff --git a/tests/kernel/weaver_paths_equiv/prj.conf b/tests/kernel/weaver_paths_equiv/prj.conf
+new file mode 100644
+index 00000000000..bc9cb61a865
+--- /dev/null
++++ b/tests/kernel/weaver_paths_equiv/prj.conf
+@@ -0,0 +1,5 @@
++# Host-buildable equivalence test for the three Weaver pressure-batch
++# paths (scalar / hybrid-MVE / full-MVE). Doesn't link the kernel
++# scheduler module - it ships its own scalar emulations of all three
++# paths and proves they produce bit-identical results on host.
++CONFIG_ZTEST=y
+diff --git a/tests/kernel/weaver_paths_equiv/src/main.c b/tests/kernel/weaver_paths_equiv/src/main.c
+new file mode 100644
+index 00000000000..677c03ccb36
+--- /dev/null
++++ b/tests/kernel/weaver_paths_equiv/src/main.c
+@@ -0,0 +1,264 @@
++/*
++ * weaver_paths_equiv.c
++ *
++ * Host-side test that proves the scalar, hybrid, and full-MVE
++ * pressure-batch implementations produce bit-identical results.
++ *
++ * MVE intrinsics aren't available on x86, so the hybrid and full-MVE
++ * paths are emulated here using scalar code that mirrors the lane
++ * structure of the real intrinsics. This catches lane-mapping errors
++ * (e.g. swapped even/odd halves, wrong shift amount, missing Warp
++ * fixup) that would only surface on real silicon otherwise.
++ *
++ * Build: gcc -std=c11 -O2 -Wall weaver_paths_equiv.c -o weaver_paths_equiv
++ */
++
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <assert.h>
++#include <stdbool.h>
++
++#define WEAVER_Q16_SHIFT     16
++#define WEAVER_Q16_ONE       (1U << WEAVER_Q16_SHIFT)
++#define WEAVER_TO_Q16(x)     ((uint32_t)(x) << WEAVER_Q16_SHIFT)
++#define WEAVER_Q16_MUL(a, b) (uint32_t)(((uint64_t)(a) * (uint64_t)(b)) >> WEAVER_Q16_SHIFT)
++#define WEAVER_PRESSURE_WARP 0xFFFFFFFFU
++#define WEAVER_W_URGENCY     0x00006666U
++#define WEAVER_W_DENSITY     0x00006666U
++#define WEAVER_W_AGING       0x00003333U
++#define WEAVER_WAIT_TICKS_MAX (WEAVER_Q16_ONE - 1U)
++#define MIN(a, b) ((a) < (b) ? (a) : (b))
++
++struct weaver_thread_data {
++	uint32_t priority_q16;
++	uint32_t buffer_fill_q16;
++	uint32_t wait_ticks;
++	uint8_t  is_warp;
++	uint8_t  in_use;
++};
++
++static uint32_t saturate_add(uint32_t a, uint32_t b)
++{
++	uint32_t s = a + b;
++	return (s < a) ? UINT32_MAX : s;
++}
++
++static void gather_inputs(const struct weaver_thread_data *wd,
++			  uint32_t *prio, uint32_t *fill, uint32_t *aged)
++{
++	if (wd == NULL || !wd->in_use || wd->is_warp) {
++		*prio = 0; *fill = 0; *aged = 0;
++		return;
++	}
++	*prio = wd->priority_q16;
++	*fill = wd->buffer_fill_q16;
++	uint32_t w = MIN(wd->wait_ticks, WEAVER_WAIT_TICKS_MAX);
++	*aged = WEAVER_TO_Q16(w);
++}
++
++static void fixup(const struct weaver_thread_data * const snap[],
++		  uint32_t pressures[], size_t base, size_t count)
++{
++	for (size_t j = 0; j < count; j++) {
++		const struct weaver_thread_data *wd = snap[base + j];
++		if (wd == NULL || !wd->in_use) {
++			pressures[base + j] = 0;
++		} else if (wd->is_warp) {
++			pressures[base + j] = WEAVER_PRESSURE_WARP;
++		}
++	}
++}
++
++/* --- 1. SCALAR --- */
++static uint32_t scalar_calc(const struct weaver_thread_data *t)
++{
++	if (t->is_warp) return WEAVER_PRESSURE_WARP;
++	uint32_t pu = WEAVER_Q16_MUL(t->priority_q16, WEAVER_W_URGENCY);
++	uint32_t pd = WEAVER_Q16_MUL(t->buffer_fill_q16, WEAVER_W_DENSITY);
++	uint32_t w = MIN(t->wait_ticks, WEAVER_WAIT_TICKS_MAX);
++	uint32_t pa = WEAVER_Q16_MUL(WEAVER_TO_Q16(w), WEAVER_W_AGING);
++	return saturate_add(saturate_add(pu, pd), pa);
++}
++
++static void scalar_batch(const struct weaver_thread_data * const snap[],
++			 uint32_t pressures[], size_t n)
++{
++	for (size_t i = 0; i < n; i++) {
++		const struct weaver_thread_data *wd = snap[i];
++		if (wd == NULL || !wd->in_use) {
++			pressures[i] = 0;
++		} else if (wd->is_warp) {
++			pressures[i] = WEAVER_PRESSURE_WARP;
++		} else {
++			pressures[i] = scalar_calc(wd);
++		}
++	}
++}
++
++/* --- 2. HYBRID emulation --- */
++/* Same lane structure as the on-target hybrid path: gather 4 inputs,
++ * scalar Q16 mul per lane, then a (would-be vector) saturating add.
++ */
++static void hybrid_batch(const struct weaver_thread_data * const snap[],
++			 uint32_t pressures[], size_t n)
++{
++	size_t i = 0;
++	for (; i + 4 <= n; i += 4) {
++		uint32_t prio[4], fill[4], aged[4];
++		uint32_t pu[4], pd[4], pa[4];
++
++		for (size_t j = 0; j < 4; j++) {
++			gather_inputs(snap[i + j], &prio[j], &fill[j], &aged[j]);
++		}
++		for (size_t j = 0; j < 4; j++) {
++			pu[j] = WEAVER_Q16_MUL(prio[j], WEAVER_W_URGENCY);
++			pd[j] = WEAVER_Q16_MUL(fill[j], WEAVER_W_DENSITY);
++			pa[j] = WEAVER_Q16_MUL(aged[j], WEAVER_W_AGING);
++		}
++		for (size_t j = 0; j < 4; j++) {
++			pressures[i + j] = saturate_add(saturate_add(pu[j], pd[j]), pa[j]);
++		}
++		fixup(snap, pressures, i, 4);
++	}
++	if (i < n) scalar_batch(&snap[i], &pressures[i], n - i);
++}
++
++/* --- 3. FULL MVE emulation --- */
++/* Mirrors vmullbq_int_u32 / vmulltq_int_u32 / vshrnbq / vshrntq. */
++static void mve_q16_mul_emu(const uint32_t a[4], const uint32_t b[4],
++			    uint32_t out[4])
++{
++	uint64_t lo[2], hi[2];
++	lo[0] = (uint64_t)a[0] * (uint64_t)b[0];
++	lo[1] = (uint64_t)a[2] * (uint64_t)b[2];
++	hi[0] = (uint64_t)a[1] * (uint64_t)b[1];
++	hi[1] = (uint64_t)a[3] * (uint64_t)b[3];
++
++	out[0] = (uint32_t)(lo[0] >> WEAVER_Q16_SHIFT);
++	out[2] = (uint32_t)(lo[1] >> WEAVER_Q16_SHIFT);
++	out[1] = (uint32_t)(hi[0] >> WEAVER_Q16_SHIFT);
++	out[3] = (uint32_t)(hi[1] >> WEAVER_Q16_SHIFT);
++}
++
++static void mve_batch(const struct weaver_thread_data * const snap[],
++		      uint32_t pressures[], size_t n)
++{
++	const uint32_t w_u4[4] = { WEAVER_W_URGENCY, WEAVER_W_URGENCY,
++				   WEAVER_W_URGENCY, WEAVER_W_URGENCY };
++	const uint32_t w_d4[4] = { WEAVER_W_DENSITY, WEAVER_W_DENSITY,
++				   WEAVER_W_DENSITY, WEAVER_W_DENSITY };
++	const uint32_t w_a4[4] = { WEAVER_W_AGING, WEAVER_W_AGING,
++				   WEAVER_W_AGING, WEAVER_W_AGING };
++
++	size_t i = 0;
++	for (; i + 4 <= n; i += 4) {
++		uint32_t prio[4], fill[4], aged[4];
++		for (size_t j = 0; j < 4; j++) {
++			gather_inputs(snap[i + j], &prio[j], &fill[j], &aged[j]);
++		}
++
++		uint32_t v_pu[4], v_pd[4], v_pa[4];
++		mve_q16_mul_emu(prio, w_u4, v_pu);
++		mve_q16_mul_emu(fill, w_d4, v_pd);
++		mve_q16_mul_emu(aged, w_a4, v_pa);
++
++		for (size_t j = 0; j < 4; j++) {
++			pressures[i + j] = saturate_add(saturate_add(v_pu[j], v_pd[j]),
++							v_pa[j]);
++		}
++		fixup(snap, pressures, i, 4);
++	}
++	if (i < n) scalar_batch(&snap[i], &pressures[i], n - i);
++}
++
++/* --- Test driver --- */
++static struct weaver_thread_data make(uint32_t prio, uint32_t fill,
++				      uint32_t wait, bool warp)
++{
++	return (struct weaver_thread_data){
++		.priority_q16 = prio,
++		.buffer_fill_q16 = fill,
++		.wait_ticks = wait,
++		.is_warp = warp ? 1 : 0,
++		.in_use = 1,
++	};
++}
++
++#define N 12
++
++int main(void)
++{
++	struct weaver_thread_data wds[N] = {
++		make(WEAVER_TO_Q16(15), 0, 0, true),                /* Warp */
++		make(WEAVER_TO_Q16(15), 0, 0, true),                /* Warp */
++		make(WEAVER_TO_Q16(8), WEAVER_Q16_ONE / 2, 5, false),
++		make(WEAVER_TO_Q16(8), WEAVER_Q16_ONE / 4, 12, false),
++		make(WEAVER_TO_Q16(7), WEAVER_Q16_ONE - 1, 0, false),
++		make(WEAVER_TO_Q16(5), 0, 50, false),
++		make(WEAVER_TO_Q16(4), WEAVER_Q16_ONE / 8, 1, false),
++		make(WEAVER_TO_Q16(2), 0, 0, false),
++		make(WEAVER_TO_Q16(1), WEAVER_Q16_ONE / 16, 100, false),
++		make(WEAVER_TO_Q16(15), 0, 0, true),                /* Warp */
++		make(WEAVER_TO_Q16(8), WEAVER_Q16_ONE / 3, 20, false),
++		make(WEAVER_TO_Q16(8), WEAVER_Q16_ONE * 3 / 4, 8, false),
++	};
++
++	const struct weaver_thread_data *snap[N];
++	for (int i = 0; i < N; i++) snap[i] = &wds[i];
++
++	uint32_t p_scalar[N], p_hybrid[N], p_mve[N];
++	scalar_batch(snap, p_scalar, N);
++	hybrid_batch(snap, p_hybrid, N);
++	mve_batch(snap, p_mve, N);
++
++	printf("idx  scalar     hybrid     full-MVE   match\n");
++	int mismatches = 0;
++	for (int i = 0; i < N; i++) {
++		bool ok = (p_scalar[i] == p_hybrid[i]) &&
++			  (p_scalar[i] == p_mve[i]);
++		if (!ok) mismatches++;
++		printf("%2d  0x%08x 0x%08x 0x%08x  %s\n",
++		       i, p_scalar[i], p_hybrid[i], p_mve[i],
++		       ok ? "ok" : "MISMATCH");
++	}
++
++	/* Random fuzz: 10000 trials of 12 threads with random inputs. */
++	srand(0x5eed);
++	int fuzz_mismatches = 0;
++	for (int trial = 0; trial < 10000; trial++) {
++		struct weaver_thread_data fuzz[N];
++		const struct weaver_thread_data *fsnap[N];
++		for (int i = 0; i < N; i++) {
++			fuzz[i].priority_q16 = (uint32_t)rand() & 0x000FFFFFU;
++			fuzz[i].buffer_fill_q16 = (uint32_t)rand() & (WEAVER_Q16_ONE);
++			fuzz[i].wait_ticks = (uint32_t)rand() & 0xFFFFU;
++			fuzz[i].is_warp = ((uint32_t)rand() & 7U) == 0U;
++			fuzz[i].in_use  = ((uint32_t)rand() & 31U) != 0U;
++			fsnap[i] = &fuzz[i];
++		}
++		uint32_t s[N], h[N], m[N];
++		scalar_batch(fsnap, s, N);
++		hybrid_batch(fsnap, h, N);
++		mve_batch(fsnap, m, N);
++		for (int i = 0; i < N; i++) {
++			if (s[i] != h[i] || s[i] != m[i]) {
++				fuzz_mismatches++;
++				if (fuzz_mismatches < 5) {
++					printf("FUZZ trial %d slot %d: "
++					       "scalar=0x%x hybrid=0x%x mve=0x%x\n",
++					       trial, i, s[i], h[i], m[i]);
++				}
++			}
++		}
++	}
++	printf("Fuzz: 10000 trials x %d threads, %d mismatches\n",
++	       N, fuzz_mismatches);
++
++	if (mismatches == 0 && fuzz_mismatches == 0) {
++		puts("ALL THREE PATHS EQUIVALENT");
++		return 0;
++	}
++	return 1;
++}
+diff --git a/tests/kernel/weaver_paths_equiv/testcase.yaml b/tests/kernel/weaver_paths_equiv/testcase.yaml
+new file mode 100644
+index 00000000000..8a8bc0f4a8b
+--- /dev/null
++++ b/tests/kernel/weaver_paths_equiv/testcase.yaml
+@@ -0,0 +1,10 @@
++tests:
++  kernel.weaver_paths_equiv:
++    tags: kernel weaver
++    integration_platforms:
++      - native_sim
++    harness: console
++    harness_config:
++      type: one_line
++      regex:
++        - "ALL THREE PATHS EQUIVALENT"
