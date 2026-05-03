@@ -1,0 +1,20 @@
+sample:
+  description: Weaver pressure-aware scheduler tuned for Apollo510 LP at 96 MHz
+    with a wearable sensor pipeline (BLE LL + IMU + PPG + fusion).
+  name: Weaver Wearable (Apollo510)
+common:
+  tags:
+    - kernel
+    - weaver
+    - wearable
+  harness: console
+  harness_config:
+    type: one_line
+    regex:
+      - "Weaver Wearable Demo Complete"
+tests:
+  sample.kernel.weaver_wearable.apollo510:
+    platform_allow:
+      - apollo510_evb
+    integration_platforms:
+      - apollo510_evb
