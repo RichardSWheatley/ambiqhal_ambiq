@@ -1,0 +1,44 @@
+# Weaver predictive pressure-aware scheduler configuration
+
+# Copyright (c) 2026 Ambiq Micro, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
+menuconfig WEAVER_SCHED
+	bool "Weaver predictive pressure-aware scheduler layer"
+	depends on MULTITHREADING
+	help
+	  Enables the Weaver scheduling layer: a fixed-point (Q16.16),
+	  pressure-aware dispatcher that classifies threads as Warp (hard
+	  real-time) or Weft (opportunistic) and boosts the highest-pressure
+	  Weft thread each tick. Integer-only math; no FPU dependency.
+
+if WEAVER_SCHED
+
+config WEAVER_MAX_THREADS
+	int "Maximum number of Weaver-managed threads"
+	default 8
+	range 1 64
+	help
+	  Bounds the per-tick scheduler evaluation cost. The dispatcher
+	  iterates a fixed-size array, so latency is deterministic at
+	  approximately 10-15 CPU cycles per registered thread.
+
+config WEAVER_THROTTLE_THRESHOLD
+	hex "System pressure throttle threshold (Q16.16 sum)"
+	default 0x00040000
+	help
+	  When the sum of all Weft thread pressures crosses this Q16.16
+	  threshold, weaver_should_throttle() returns true so non-essential
+	  producers can slow down. Default 0x40000 corresponds to roughly
+	  4.0 in Q16.16 (e.g. four threads each at full pressure).
+
+config WEAVER_SCHED_LOG_LEVEL
+	int "Weaver scheduler log level"
+	depends on LOG
+	default 2
+	range 0 4
+	help
+	  Log level for the Weaver scheduling layer.
+	    0 = off, 1 = error, 2 = warning, 3 = info, 4 = debug.
+
+endif # WEAVER_SCHED
