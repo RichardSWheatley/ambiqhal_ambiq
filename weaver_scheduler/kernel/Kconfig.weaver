@@ -31,12 +31,16 @@ config WEAVER_THROTTLE_THRESHOLD
 	default 0x00030000 if WEAVER_WEARABLE_PRESET
 	default 0x00040000
 	help
-	  When the sum of all Weft thread pressures crosses this Q16.16
-	  threshold, weaver_should_throttle() returns true so non-essential
-	  producers can slow down. Default 0x40000 corresponds to roughly
-	  4.0 in Q16.16 (e.g. four threads each at full pressure). The
-	  wearable preset uses a tighter 3.0 since FIFO overruns lose
-	  irreplaceable user biometric data.
+	  Center of the fuzzy throttle controller's MID region (in Q16.16).
+	  The TSK rules are:
+	    LOW  (level=0):    pressure <= T/2
+	    MID  (level=ramp): pressure in (T/2, 3T/2) - centered on T
+	    HIGH (level=255):  pressure >= 3T/2
+	  pressure == T yields level == 128, the binary throttle boundary.
+	  Output is EMA-smoothed across 4 ticks so weaver_should_throttle()
+	  does not flap when pressure dances around T. Default 0x40000 ~=
+	  4.0 in Q16.16. Wearable preset uses 3.0 because FIFO overruns
+	  lose irreplaceable biometric data.
 
 config WEAVER_DEFAULT_BOOST_LEVELS
 	int "Default Weft promotion magnitude (priority levels)"

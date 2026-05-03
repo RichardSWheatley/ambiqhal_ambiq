@@ -78,3 +78,5 @@ true, signaling non-essential producers to slow down.
 | `samples/boards/apollo510b_evb/weaver_wearable/` | Apollo510 Blue EVB demo with REAL sensors via mikroBUS: 6DOF IMU 14 Click (BMI270) + Heart Rate 4 Click (MAX30101), uses on-board BLE and ap510_disp shield |
 | `0001-weaver-scheduler.patch` | Patch to apply on top of `ambiq-stable` in `ambiqzephyr` |
 | `DECISIONS.md` | All assumptions and tuning rationale for the wearable target |
+| `FUZZY_THROTTLE.md` | TSK fuzzy + EMA throttle controller: design, math, why it's strictly an improvement |
+| `ML_AND_FUZZY_LOGIC.md` | Why we kept the dispatcher hot path linear and where heavier ML belongs |

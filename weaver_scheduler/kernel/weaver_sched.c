@@ -54,6 +54,8 @@ static struct {
 	uint32_t w_urgency;
 	uint32_t w_density;
 	uint32_t w_aging;
+	uint8_t  throttle_level_raw;     /**< Latest fuzzy output (un-smoothed). */
+	uint8_t  throttle_level_smooth;  /**< 4-tap EMA of the raw output. */
 	struct weaver_stats stats;
 	struct k_spinlock lock;
 } weaver = {
@@ -61,6 +63,39 @@ static struct {
 	.w_density = WEAVER_W_DENSITY,
 	.w_aging   = WEAVER_W_AGING,
 };
+
+/*
+ * 0-order TSK fuzzy throttle controller.
+ *
+ * Three rules with triangular/trapezoidal membership; MID is centered
+ * symmetrically on the configured threshold T so that pressure == T
+ * yields level == 128 (the binary "throttle on" boundary):
+ *
+ *   LOW:  p <= T/2          -> level = 0
+ *   MID:  p in (T/2, 3T/2)  -> level = linear interp 0..255 (ramp width T)
+ *   HIGH: p >= 3T/2         -> level = 255
+ *
+ * Closed-form defuzzification (the linear ramp is the centroid of the
+ * three rules under linear membership). One uint64 multiply + one
+ * uint32 division by a positive non-zero divisor. Bounded WCET.
+ */
+static inline uint8_t fuzzy_throttle_level(uint32_t pressure)
+{
+	const uint32_t T      = (uint32_t)CONFIG_WEAVER_THROTTLE_THRESHOLD;
+	const uint32_t T_low  = T >> 1;              /* T/2  */
+	const uint32_t T_high = T + (T >> 1);        /* 3T/2 */
+
+	if (pressure <= T_low) {
+		return 0;
+	}
+	if (pressure >= T_high) {
+		return 255;
+	}
+
+	/* range = T_high - T_low = T; non-zero by construction. */
+	uint64_t num = (uint64_t)(pressure - T_low) * 255U;
+	return (uint8_t)(num / T);
+}
 
 static inline uint32_t saturate_add(uint32_t a, uint32_t b)
 {
@@ -267,8 +302,24 @@ void weaver_tick(void)
 	weaver.ticks_to_next_warp = min_warp_remaining;
 	weaver.stats.total_ticks++;
 
-	if (sys_pressure >= (uint32_t)CONFIG_WEAVER_THROTTLE_THRESHOLD) {
-		weaver.stats.throttle_events++;
+	/* Fuzzy throttle: compute graded level, then 4-tap EMA smooth.
+	 * Smoothed value drives weaver_should_throttle() for hysteresis.
+	 */
+	uint8_t level = fuzzy_throttle_level(sys_pressure);
+	weaver.throttle_level_raw = level;
+	weaver.throttle_level_smooth =
+		(uint8_t)((3U * (uint32_t)weaver.throttle_level_smooth + level) >> 2);
+
+	/* Count entry edges into throttle (smoothed-value rising past 128).
+	 * EMA hysteresis means brief pressure spikes do not inflate this.
+	 */
+	{
+		static uint8_t prev_above;
+		uint8_t now_above = (weaver.throttle_level_smooth >= 128U) ? 1U : 0U;
+		if (now_above && !prev_above) {
+			weaver.stats.throttle_events++;
+		}
+		prev_above = now_above;
 	}
 
 #ifdef CONFIG_WEAVER_POWER_AWARE
@@ -318,7 +369,15 @@ uint32_t weaver_system_pressure(void)
 
 bool weaver_should_throttle(void)
 {
-	return weaver.system_pressure >= (uint32_t)CONFIG_WEAVER_THROTTLE_THRESHOLD;
+	/* Backed by the smoothed fuzzy level so single-tick spikes do not
+	 * flap throttle on/off near the threshold.
+	 */
+	return weaver.throttle_level_smooth >= 128U;
+}
+
+uint8_t weaver_throttle_level(void)
+{
+	return weaver.throttle_level_smooth;
 }
 
 uint32_t weaver_ticks_to_next_warp(void)

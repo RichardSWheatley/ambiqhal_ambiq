@@ -180,8 +180,27 @@ uint32_t weaver_system_pressure(void);
  *
  * When true, non-essential producers should slow down (e.g. drop sensor
  * polling rate) until the data fabric stabilizes.
+ *
+ * Backed by the smoothed fuzzy throttle level: stable across single-tick
+ * pressure spikes near the threshold (no flap).
  */
 bool weaver_should_throttle(void);
+
+/**
+ * @brief Graded throttle level (0..255) from a TSK fuzzy controller.
+ *
+ * Three rules, linear membership, EMA-smoothed across ticks:
+ *   p <= T/2  -> 0     (no throttle)
+ *   p ~  T    -> 128   (entering throttle region)
+ *   p >= 2T   -> 255   (full throttle)
+ *
+ * where T is CONFIG_WEAVER_THROTTLE_THRESHOLD. Producers that can do
+ * graceful degradation (drop sensor rate by N%) should consume this
+ * value directly instead of the binary weaver_should_throttle().
+ *
+ * Recomputed once per weaver_tick(); reading is a single byte load.
+ */
+uint8_t weaver_throttle_level(void);
 
 /**
  * @brief Ticks remaining until the next Warp deadline across the registry.
