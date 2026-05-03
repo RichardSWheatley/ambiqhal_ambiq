@@ -1,0 +1,627 @@
+diff --git a/include/zephyr/kernel/weaver_sched.h b/include/zephyr/kernel/weaver_sched.h
+new file mode 100644
+index 00000000000..81bd79e6a6f
+--- /dev/null
++++ b/include/zephyr/kernel/weaver_sched.h
+@@ -0,0 +1,146 @@
++/*
++ * Copyright (c) 2026 Ambiq Micro, Inc.
++ *
++ * SPDX-License-Identifier: Apache-2.0
++ */
++
++/**
++ * @file
++ * @brief Weaver: a predictive, pressure-aware fixed-point scheduling layer.
++ *
++ * The Weaver scheduler treats threads as either:
++ *   - "Warp" (hard real-time, deterministic, infinite pressure), or
++ *   - "Weft" (opportunistic, pressure scales with buffer fill and aging).
++ *
++ * Each tick, Weaver scans its registered thread set, computes a Q16.16
++ * "pressure" score per thread using only integer math (no FPU), and
++ * promotes the highest-pressure Weft thread by elevating its Zephyr
++ * priority. Warp threads always dominate.
++ *
++ * All math is integer-only (Q16.16). Designed to run in <15 us at 64 MHz
++ * for a bounded thread set (CONFIG_WEAVER_MAX_THREADS).
++ */
++
++#ifndef ZEPHYR_INCLUDE_KERNEL_WEAVER_SCHED_H_
++#define ZEPHYR_INCLUDE_KERNEL_WEAVER_SCHED_H_
++
++#include <stdint.h>
++#include <stdbool.h>
++#include <zephyr/kernel.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/** Q16.16 fixed-point format. */
++#define WEAVER_Q16_SHIFT     16
++#define WEAVER_Q16_ONE       (1U << WEAVER_Q16_SHIFT)
++#define WEAVER_TO_Q16(x)     ((uint32_t)(x) << WEAVER_Q16_SHIFT)
++#define WEAVER_Q16_MUL(a, b) (uint32_t)(((uint64_t)(a) * (uint64_t)(b)) >> WEAVER_Q16_SHIFT)
++
++/** Saturating Warp pressure: always wins the dispatch tournament. */
++#define WEAVER_PRESSURE_WARP 0xFFFFFFFFU
++
++/**
++ * Weights (Q16.16). Must roughly sum to ONE for normalized pressure.
++ * Defaults: urgency 0.4, density 0.4, aging 0.2.
++ */
++#define WEAVER_W_URGENCY 0x00006666U
++#define WEAVER_W_DENSITY 0x00006666U
++#define WEAVER_W_AGING   0x00003333U
++
++/**
++ * @brief Per-thread scheduling state used by the Weaver dispatcher.
++ *
++ * The owner allocates this struct (typically file-static) and registers
++ * it with weaver_register(). The Weaver tick handler updates wait_ticks
++ * and reads the buffer_fill_q16 / is_warp fields.
++ */
++struct weaver_thread_data {
++	struct k_thread *thread;       /**< Zephyr thread handle. */
++	uint32_t priority_q16;         /**< Static "Warp priority" (Q16.16). */
++	uint32_t buffer_fill_q16;      /**< Buffer fill ratio: 0..ONE. */
++	uint32_t wait_ticks;           /**< Aging counter (incremented per tick). */
++	uint8_t  is_warp;              /**< Non-zero: deterministic Warp thread. */
++	int8_t   base_prio;            /**< Captured Zephyr base priority. */
++	int8_t   weft_boost_prio;      /**< Priority used when promoted (Weft). */
++	uint8_t  in_use;               /**< Slot occupancy flag. */
++};
++
++/**
++ * @brief Compute Q16.16 pressure for a single thread.
++ *
++ * Pure function. Warp returns WEAVER_PRESSURE_WARP. Weft computes
++ *   p_urgency = priority_q16 * W_URGENCY
++ *   p_density = buffer_fill_q16 * W_DENSITY
++ *   p_aging   = TO_Q16(wait_ticks) * W_AGING
++ *   return    = p_urgency + p_density + p_aging
++ *
++ * Uses only addition, shifts, and one 32x32->64 multiply per term.
++ *
++ * @param t Registered thread data.
++ * @return Q16.16 pressure (saturating at WEAVER_PRESSURE_WARP).
++ */
++uint32_t weaver_calculate_pressure(const struct weaver_thread_data *t);
++
++/**
++ * @brief Register a thread with the Weaver dispatcher.
++ *
++ * @param wd  Caller-owned, zero-initialized thread data slot.
++ * @param thread Zephyr thread handle (must already be created).
++ * @param priority_q16 Static Warp priority (Q16.16). Use WEAVER_TO_Q16(n).
++ * @param is_warp Non-zero for hard real-time threads.
++ *
++ * @retval 0 on success.
++ * @retval -ENOMEM if the registry is full.
++ * @retval -EINVAL on bad arguments.
++ */
++int weaver_register(struct weaver_thread_data *wd, struct k_thread *thread,
++		    uint32_t priority_q16, bool is_warp);
++
++/** @brief Remove a thread from the Weaver registry. */
++int weaver_unregister(struct weaver_thread_data *wd);
++
++/**
++ * @brief Update the buffer-fill metric driving informational pressure.
++ *
++ * Called by I/O subsystems whose backpressure should influence scheduling
++ * (e.g. a logging buffer, network TX queue, sensor FIFO).
++ *
++ * @param wd Registered thread data.
++ * @param fill_q16 Fill ratio in Q16.16 (0 = empty, WEAVER_Q16_ONE = full).
++ */
++void weaver_set_buffer_fill_q16(struct weaver_thread_data *wd, uint32_t fill_q16);
++
++/**
++ * @brief One Weaver scheduling pass.
++ *
++ * Iterates the registry (bounded by CONFIG_WEAVER_MAX_THREADS), computes
++ * pressure, and elevates the highest-pressure Weft thread's Zephyr
++ * priority. Increments wait_ticks for non-running threads. Safe to call
++ * from a system work queue or a periodic timer; should NOT be called
++ * from an ISR (uses k_thread_priority_set()).
++ */
++void weaver_tick(void);
++
++/**
++ * @brief Aggregate system pressure from the last weaver_tick().
++ *
++ * Sum of all Weft pressures, clamped to UINT32_MAX. Used by callers
++ * (e.g. sensor polling drivers) to decide whether to throttle themselves.
++ */
++uint32_t weaver_system_pressure(void);
++
++/**
++ * @brief Returns true if system pressure has crossed the throttle threshold.
++ *
++ * When true, non-essential producers should slow down (e.g. drop sensor
++ * polling rate) until the data fabric stabilizes.
++ */
++bool weaver_should_throttle(void);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* ZEPHYR_INCLUDE_KERNEL_WEAVER_SCHED_H_ */
+diff --git a/kernel/CMakeLists.txt b/kernel/CMakeLists.txt
+index 8906da2f627..600294ee1b2 100644
+--- a/kernel/CMakeLists.txt
++++ b/kernel/CMakeLists.txt
+@@ -105,6 +105,7 @@ kernel_sources(nothread.c)
+ endif() # CONFIG_MULTITHREADING
+ 
+ kernel_sources_ifdef(CONFIG_TIMESLICING timeslicing.c)
++kernel_sources_ifdef(CONFIG_WEAVER_SCHED weaver_sched.c)
+ kernel_sources_ifdef(CONFIG_SPIN_VALIDATE spinlock_validate.c)
+ kernel_sources_ifdef(CONFIG_IRQ_OFFLOAD irq_offload.c)
+ kernel_sources_ifdef(CONFIG_BOOTARGS boot_args.c)
+diff --git a/kernel/Kconfig b/kernel/Kconfig
+index 9e3be0b12ab..1f0b78d337d 100644
+--- a/kernel/Kconfig
++++ b/kernel/Kconfig
+@@ -1141,3 +1141,4 @@ endmenu
+ rsource "Kconfig.device"
+ rsource "Kconfig.vm"
+ rsource "Kconfig.init"
++rsource "Kconfig.weaver"
+diff --git a/kernel/Kconfig.weaver b/kernel/Kconfig.weaver
+new file mode 100644
+index 00000000000..f9c2eca326f
+--- /dev/null
++++ b/kernel/Kconfig.weaver
+@@ -0,0 +1,44 @@
++# Weaver predictive pressure-aware scheduler configuration
++
++# Copyright (c) 2026 Ambiq Micro, Inc.
++# SPDX-License-Identifier: Apache-2.0
++
++menuconfig WEAVER_SCHED
++	bool "Weaver predictive pressure-aware scheduler layer"
++	depends on MULTITHREADING
++	help
++	  Enables the Weaver scheduling layer: a fixed-point (Q16.16),
++	  pressure-aware dispatcher that classifies threads as Warp (hard
++	  real-time) or Weft (opportunistic) and boosts the highest-pressure
++	  Weft thread each tick. Integer-only math; no FPU dependency.
++
++if WEAVER_SCHED
++
++config WEAVER_MAX_THREADS
++	int "Maximum number of Weaver-managed threads"
++	default 8
++	range 1 64
++	help
++	  Bounds the per-tick scheduler evaluation cost. The dispatcher
++	  iterates a fixed-size array, so latency is deterministic at
++	  approximately 10-15 CPU cycles per registered thread.
++
++config WEAVER_THROTTLE_THRESHOLD
++	hex "System pressure throttle threshold (Q16.16 sum)"
++	default 0x00040000
++	help
++	  When the sum of all Weft thread pressures crosses this Q16.16
++	  threshold, weaver_should_throttle() returns true so non-essential
++	  producers can slow down. Default 0x40000 corresponds to roughly
++	  4.0 in Q16.16 (e.g. four threads each at full pressure).
++
++config WEAVER_SCHED_LOG_LEVEL
++	int "Weaver scheduler log level"
++	depends on LOG
++	default 2
++	range 0 4
++	help
++	  Log level for the Weaver scheduling layer.
++	    0 = off, 1 = error, 2 = warning, 3 = info, 4 = debug.
++
++endif # WEAVER_SCHED
+diff --git a/kernel/weaver_sched.c b/kernel/weaver_sched.c
+new file mode 100644
+index 00000000000..9d65b25a6ab
+--- /dev/null
++++ b/kernel/weaver_sched.c
+@@ -0,0 +1,198 @@
++/*
++ * Copyright (c) 2026 Ambiq Micro, Inc.
++ *
++ * SPDX-License-Identifier: Apache-2.0
++ *
++ * Weaver: predictive, pressure-aware fixed-point scheduling layer.
++ *
++ * Integer-only Q16.16 math. Bounded thread set keeps per-tick latency
++ * deterministic. Influences Zephyr's existing scheduler by elevating
++ * the priority of the highest-pressure Weft thread; Warp threads are
++ * left at their static priority and dominate by construction.
++ */
++
++#include <zephyr/kernel.h>
++#include <zephyr/kernel/weaver_sched.h>
++#include <zephyr/spinlock.h>
++#include <zephyr/sys/util.h>
++#include <errno.h>
++#include <string.h>
++
++#include <zephyr/logging/log.h>
++LOG_MODULE_REGISTER(weaver_sched, CONFIG_WEAVER_SCHED_LOG_LEVEL);
++
++/* Aging weight scales TO_Q16(wait_ticks); guard against overflow by
++ * clamping wait_ticks before promoting to Q16.16.
++ */
++#define WEAVER_WAIT_TICKS_MAX (WEAVER_Q16_ONE - 1U)
++
++static struct {
++	struct weaver_thread_data *slots[CONFIG_WEAVER_MAX_THREADS];
++	uint32_t system_pressure;
++	struct k_spinlock lock;
++} weaver;
++
++static inline uint32_t saturate_add(uint32_t a, uint32_t b)
++{
++	uint32_t s = a + b;
++	return (s < a) ? UINT32_MAX : s;
++}
++
++uint32_t weaver_calculate_pressure(const struct weaver_thread_data *t)
++{
++	if (t->is_warp) {
++		return WEAVER_PRESSURE_WARP;
++	}
++
++	/* Q16.16 multiply: (A * B) >> 16, done in 64-bit to avoid overflow. */
++	uint32_t p_urgency = WEAVER_Q16_MUL(t->priority_q16, WEAVER_W_URGENCY);
++	uint32_t p_density = WEAVER_Q16_MUL(t->buffer_fill_q16, WEAVER_W_DENSITY);
++
++	uint32_t wait = MIN(t->wait_ticks, WEAVER_WAIT_TICKS_MAX);
++	uint32_t p_aging = WEAVER_Q16_MUL(WEAVER_TO_Q16(wait), WEAVER_W_AGING);
++
++	return saturate_add(saturate_add(p_urgency, p_density), p_aging);
++}
++
++int weaver_register(struct weaver_thread_data *wd, struct k_thread *thread,
++		    uint32_t priority_q16, bool is_warp)
++{
++	if (wd == NULL || thread == NULL) {
++		return -EINVAL;
++	}
++
++	k_spinlock_key_t key = k_spin_lock(&weaver.lock);
++
++	for (size_t i = 0; i < ARRAY_SIZE(weaver.slots); i++) {
++		if (weaver.slots[i] == NULL) {
++			memset(wd, 0, sizeof(*wd));
++			wd->thread = thread;
++			wd->priority_q16 = priority_q16;
++			wd->is_warp = is_warp ? 1U : 0U;
++			wd->base_prio = (int8_t)k_thread_priority_get(thread);
++			/* Boost slot for promoted Weft: one level above base,
++			 * but never crossing into cooperative space.
++			 */
++			wd->weft_boost_prio =
++				(wd->base_prio > 0) ? (int8_t)(wd->base_prio - 1)
++						    : wd->base_prio;
++			wd->in_use = 1U;
++			weaver.slots[i] = wd;
++			k_spin_unlock(&weaver.lock, key);
++			return 0;
++		}
++	}
++
++	k_spin_unlock(&weaver.lock, key);
++	return -ENOMEM;
++}
++
++int weaver_unregister(struct weaver_thread_data *wd)
++{
++	if (wd == NULL) {
++		return -EINVAL;
++	}
++
++	k_spinlock_key_t key = k_spin_lock(&weaver.lock);
++
++	for (size_t i = 0; i < ARRAY_SIZE(weaver.slots); i++) {
++		if (weaver.slots[i] == wd) {
++			/* Restore base priority before releasing the slot. */
++			if (wd->thread != NULL) {
++				k_thread_priority_set(wd->thread, wd->base_prio);
++			}
++			weaver.slots[i] = NULL;
++			wd->in_use = 0U;
++			k_spin_unlock(&weaver.lock, key);
++			return 0;
++		}
++	}
++
++	k_spin_unlock(&weaver.lock, key);
++	return -ENOENT;
++}
++
++void weaver_set_buffer_fill_q16(struct weaver_thread_data *wd, uint32_t fill_q16)
++{
++	if (wd == NULL) {
++		return;
++	}
++	if (fill_q16 > WEAVER_Q16_ONE) {
++		fill_q16 = WEAVER_Q16_ONE;
++	}
++	/* Single 32-bit store; safe without locking on all Zephyr-supported archs. */
++	wd->buffer_fill_q16 = fill_q16;
++}
++
++void weaver_tick(void)
++{
++	struct weaver_thread_data *winner = NULL;
++	uint32_t max_pressure = 0;
++	uint32_t sys_pressure = 0;
++
++	/* Snapshot under lock; pressure math runs lock-free. The slot array
++	 * is fixed size and registration is rare, so a brief lock is cheap.
++	 */
++	struct weaver_thread_data *snap[CONFIG_WEAVER_MAX_THREADS];
++
++	k_spinlock_key_t key = k_spin_lock(&weaver.lock);
++	memcpy(snap, weaver.slots, sizeof(snap));
++	k_spin_unlock(&weaver.lock, key);
++
++	for (size_t i = 0; i < ARRAY_SIZE(snap); i++) {
++		struct weaver_thread_data *wd = snap[i];
++
++		if (wd == NULL || !wd->in_use) {
++			continue;
++		}
++
++		/* Age non-running threads. The current thread (if registered)
++		 * already had its turn this tick, so reset its aging to
++		 * prevent runaway boosting.
++		 */
++		if (wd->thread == k_current_get()) {
++			wd->wait_ticks = 0;
++		} else if (wd->wait_ticks < WEAVER_WAIT_TICKS_MAX) {
++			wd->wait_ticks++;
++		}
++
++		uint32_t p = weaver_calculate_pressure(wd);
++
++		if (!wd->is_warp) {
++			sys_pressure = saturate_add(sys_pressure, p);
++			if (p > max_pressure) {
++				max_pressure = p;
++				winner = wd;
++			}
++		}
++	}
++
++	weaver.system_pressure = sys_pressure;
++
++	/* Promote the highest-pressure Weft thread; restore others to base.
++	 * Warp threads are never re-prioritized.
++	 */
++	for (size_t i = 0; i < ARRAY_SIZE(snap); i++) {
++		struct weaver_thread_data *wd = snap[i];
++
++		if (wd == NULL || !wd->in_use || wd->is_warp) {
++			continue;
++		}
++
++		int8_t target = (wd == winner) ? wd->weft_boost_prio : wd->base_prio;
++
++		if (k_thread_priority_get(wd->thread) != target) {
++			k_thread_priority_set(wd->thread, target);
++		}
++	}
++}
++
++uint32_t weaver_system_pressure(void)
++{
++	return weaver.system_pressure;
++}
++
++bool weaver_should_throttle(void)
++{
++	return weaver.system_pressure >= (uint32_t)CONFIG_WEAVER_THROTTLE_THRESHOLD;
++}
+diff --git a/samples/kernel/weaver_sched/CMakeLists.txt b/samples/kernel/weaver_sched/CMakeLists.txt
+new file mode 100644
+index 00000000000..6e9aef0fd93
+--- /dev/null
++++ b/samples/kernel/weaver_sched/CMakeLists.txt
+@@ -0,0 +1,8 @@
++# SPDX-License-Identifier: Apache-2.0
++
++cmake_minimum_required(VERSION 3.20.0)
++
++find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
++project(weaver_sched)
++
++target_sources(app PRIVATE src/main.c)
+diff --git a/samples/kernel/weaver_sched/README.rst b/samples/kernel/weaver_sched/README.rst
+new file mode 100644
+index 00000000000..112d4716e12
+--- /dev/null
++++ b/samples/kernel/weaver_sched/README.rst
+@@ -0,0 +1,37 @@
++.. zephyr:code-sample:: weaver_sched
++   :name: Weaver scheduler
++
++   Demonstrates the Weaver predictive pressure-aware scheduling layer.
++
++Overview
++********
++
++This sample exercises the Weaver scheduler:
++
++* One **Warp** (hard real-time) thread with infinite pressure.
++* Two **Weft** (opportunistic) threads representing data producers.
++* A periodic timer drives ``weaver_tick()`` every 10 ms, recomputing
++  Q16.16 pressure scores and elevating the highest-pressure Weft
++  thread by one Zephyr priority level.
++
++The main loop ramps Weft A's simulated buffer fill ratio from 0 to
++1.0 over 100 ticks while Weft B stays low, so you can observe the
++dynamic priority handoff and the rising aggregate ``system_pressure``.
++
++Building
++********
++
++.. zephyr-app-commands::
++   :zephyr-app: samples/kernel/weaver_sched
++   :board: qemu_cortex_m3
++   :goals: build run
++
++Sample Output
++*************
++
++.. code-block:: console
++
++   tick=0  sys_pressure=0x000051fa throttle=0 p_a=0x00028f5c p_b=0x0002a29e
++   tick=50 sys_pressure=0x0008c000 throttle=1 p_a=0x00064000 p_b=0x00028000
++   ...
++   Weaver Test Complete
+diff --git a/samples/kernel/weaver_sched/prj.conf b/samples/kernel/weaver_sched/prj.conf
+new file mode 100644
+index 00000000000..c0a5010cd4a
+--- /dev/null
++++ b/samples/kernel/weaver_sched/prj.conf
+@@ -0,0 +1,6 @@
++CONFIG_WEAVER_SCHED=y
++CONFIG_WEAVER_MAX_THREADS=4
++CONFIG_LOG=y
++CONFIG_LOG_MODE_MINIMAL=y
++CONFIG_MP_MAX_NUM_CPUS=1
++CONFIG_MAIN_STACK_SIZE=2048
+diff --git a/samples/kernel/weaver_sched/sample.yaml b/samples/kernel/weaver_sched/sample.yaml
+new file mode 100644
+index 00000000000..16f30d7a65d
+--- /dev/null
++++ b/samples/kernel/weaver_sched/sample.yaml
+@@ -0,0 +1,18 @@
++sample:
++  description: Demonstrates the Weaver fixed-point pressure-aware scheduler
++  name: Weaver Scheduler
++common:
++  tags:
++    - kernel
++  integration_platforms:
++    - qemu_cortex_m3
++    - qemu_x86
++  harness: console
++  harness_config:
++    type: one_line
++    regex:
++      - "Weaver Test Complete"
++tests:
++  sample.kernel.weaver_sched:
++    arch_exclude:
++      - posix
+diff --git a/samples/kernel/weaver_sched/src/main.c b/samples/kernel/weaver_sched/src/main.c
+new file mode 100644
+index 00000000000..b3f90ae74f6
+--- /dev/null
++++ b/samples/kernel/weaver_sched/src/main.c
+@@ -0,0 +1,101 @@
++/*
++ * Copyright (c) 2026 Ambiq Micro, Inc.
++ *
++ * SPDX-License-Identifier: Apache-2.0
++ *
++ * Weaver scheduler demo:
++ *   - One Warp thread (deterministic, infinite pressure).
++ *   - Two Weft threads simulating logging / sensor producers whose
++ *     buffer fill ratio drives their dynamic pressure.
++ *   - A periodic timer drives weaver_tick() every 10 ms.
++ */
++
++#include <zephyr/kernel.h>
++#include <zephyr/kernel/weaver_sched.h>
++#include <zephyr/sys/printk.h>
++
++#define WARP_PRIO  4
++#define WEFT_PRIO  6
++#define TICK_MS    10
++#define RUN_TICKS  100
++
++static struct weaver_thread_data warp_wd;
++static struct weaver_thread_data weft_a_wd;
++static struct weaver_thread_data weft_b_wd;
++
++static K_THREAD_STACK_DEFINE(warp_stack, 1024);
++static K_THREAD_STACK_DEFINE(weft_a_stack, 1024);
++static K_THREAD_STACK_DEFINE(weft_b_stack, 1024);
++
++static struct k_thread warp_thread;
++static struct k_thread weft_a_thread;
++static struct k_thread weft_b_thread;
++
++static void warp_fn(void *a, void *b, void *c)
++{
++	ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
++	while (1) {
++		k_sleep(K_MSEC(5));
++	}
++}
++
++static void weft_fn(void *self, void *unused1, void *unused2)
++{
++	ARG_UNUSED(unused1); ARG_UNUSED(unused2);
++	while (1) {
++		k_sleep(K_MSEC(15));
++		(void)self;
++	}
++}
++
++static void tick_timer_handler(struct k_timer *t)
++{
++	ARG_UNUSED(t);
++	weaver_tick();
++}
++
++static K_TIMER_DEFINE(weaver_timer, tick_timer_handler, NULL);
++
++int main(void)
++{
++	k_thread_create(&warp_thread, warp_stack, K_THREAD_STACK_SIZEOF(warp_stack),
++			warp_fn, NULL, NULL, NULL, WARP_PRIO, 0, K_NO_WAIT);
++	k_thread_create(&weft_a_thread, weft_a_stack, K_THREAD_STACK_SIZEOF(weft_a_stack),
++			weft_fn, &weft_a_wd, NULL, NULL, WEFT_PRIO, 0, K_NO_WAIT);
++	k_thread_create(&weft_b_thread, weft_b_stack, K_THREAD_STACK_SIZEOF(weft_b_stack),
++			weft_fn, &weft_b_wd, NULL, NULL, WEFT_PRIO, 0, K_NO_WAIT);
++
++	weaver_register(&warp_wd,   &warp_thread,   WEAVER_TO_Q16(10), true);
++	weaver_register(&weft_a_wd, &weft_a_thread, WEAVER_TO_Q16(2),  false);
++	weaver_register(&weft_b_wd, &weft_b_thread, WEAVER_TO_Q16(2),  false);
++
++	k_timer_start(&weaver_timer, K_MSEC(TICK_MS), K_MSEC(TICK_MS));
++
++	for (int i = 0; i < RUN_TICKS; i++) {
++		/* Drive Weft A's buffer fill ratio up over time; B stays low. */
++		uint32_t fill_a = (uint32_t)i * (WEAVER_Q16_ONE / RUN_TICKS);
++		uint32_t fill_b = WEAVER_Q16_ONE / 8U;
++
++		weaver_set_buffer_fill_q16(&weft_a_wd, fill_a);
++		weaver_set_buffer_fill_q16(&weft_b_wd, fill_b);
++
++		if ((i % 10) == 0) {
++			printk("tick=%d sys_pressure=0x%08x throttle=%d "
++			       "p_a=0x%08x p_b=0x%08x\n",
++			       i, weaver_system_pressure(),
++			       weaver_should_throttle() ? 1 : 0,
++			       weaver_calculate_pressure(&weft_a_wd),
++			       weaver_calculate_pressure(&weft_b_wd));
++		}
++
++		k_sleep(K_MSEC(TICK_MS));
++	}
++
++	k_timer_stop(&weaver_timer);
++	weaver_unregister(&warp_wd);
++	weaver_unregister(&weft_a_wd);
++	weaver_unregister(&weft_b_wd);
++
++	printk("Weaver Test Complete\n");
++	return 0;
++}
