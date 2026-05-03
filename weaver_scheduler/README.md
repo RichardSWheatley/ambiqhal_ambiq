@@ -71,7 +71,9 @@ true, signaling non-essential producers to slow down.
 | File | Purpose |
 |------|---------|
 | `include/zephyr/kernel/weaver_sched.h` | Public API, Q16.16 macros, struct definitions |
-| `kernel/weaver_sched.c` | Implementation: pressure calc, dispatcher, throttle |
-| `kernel/Kconfig.weaver` | `WEAVER_SCHED`, `WEAVER_MAX_THREADS`, `WEAVER_THROTTLE_THRESHOLD` |
-| `samples/kernel/weaver_sched/` | Demo: 1 Warp + 2 Weft producers, 100-tick ramp |
+| `kernel/weaver_sched.c` | Implementation: pressure calc, dispatcher, pre-warp clear, throttle, stats |
+| `kernel/Kconfig.weaver` | `WEAVER_SCHED`, `WEAVER_MAX_THREADS`, `WEAVER_THROTTLE_THRESHOLD`, `WEAVER_WEARABLE_PRESET`, `WEAVER_POWER_AWARE`, `WEAVER_PREWARP_GUARD_TICKS` |
+| `samples/kernel/weaver_sched/` | Generic demo: 1 Warp + 2 Weft producers, 100-tick ramp |
+| `samples/boards/apollo510_evb/weaver_wearable/` | Apollo510 LP @ 96 MHz wearable demo: 3 Warp (BLE/IMU/PPG) + 6 Weft (fusion/HR/GATT/classifier/display/NVM) |
 | `0001-weaver-scheduler.patch` | Patch to apply on top of `ambiq-stable` in `ambiqzephyr` |
+| `DECISIONS.md` | All assumptions and tuning rationale for the wearable target |

@@ -61,9 +61,13 @@ struct weaver_thread_data {
 	uint32_t priority_q16;         /**< Static "Warp priority" (Q16.16). */
 	uint32_t buffer_fill_q16;      /**< Buffer fill ratio: 0..ONE. */
 	uint32_t wait_ticks;           /**< Aging counter (incremented per tick). */
+	uint32_t period_ticks;         /**< Warp period (0 if Weft or aperiodic). */
+	uint32_t next_deadline_ticks;  /**< Ticks remaining to next Warp run. */
+	void    *meta;                 /**< Owner-defined: e.g. sensor FIFO ptr. */
 	uint8_t  is_warp;              /**< Non-zero: deterministic Warp thread. */
 	int8_t   base_prio;            /**< Captured Zephyr base priority. */
 	int8_t   weft_boost_prio;      /**< Priority used when promoted (Weft). */
+	uint8_t  boost_levels;         /**< How many priority levels to lift. */
 	uint8_t  in_use;               /**< Slot occupancy flag. */
 };
 
@@ -102,6 +106,30 @@ int weaver_register(struct weaver_thread_data *wd, struct k_thread *thread,
 int weaver_unregister(struct weaver_thread_data *wd);
 
 /**
+ * @brief Configure a periodic Warp deadline for a thread.
+ *
+ * Used by sensor sampling threads (IMU, PPG) and BLE radio handlers
+ * whose work recurs at a known cadence. The dispatcher uses this to
+ * detect "Warp gaps" (ticks until the next deadline) and to throttle
+ * Weft work that risks overlapping a sub-millisecond deadline.
+ *
+ * @param wd Registered thread data.
+ * @param period_ticks Cadence in Weaver ticks. 0 disables the deadline.
+ */
+void weaver_set_warp_deadline(struct weaver_thread_data *wd, uint32_t period_ticks);
+
+/**
+ * @brief Override the boost magnitude (priority levels) for a Weft thread.
+ *
+ * When promoted, the thread's Zephyr priority drops by this many levels
+ * (lower numeric value = higher priority). Default is 1; wearable
+ * presets use 2 to give sensor-fusion threads a stronger advantage
+ * over background work. Capped so the boosted priority never crosses
+ * into cooperative space.
+ */
+void weaver_set_boost_levels(struct weaver_thread_data *wd, uint8_t levels);
+
+/**
  * @brief Update the buffer-fill metric driving informational pressure.
  *
  * Called by I/O subsystems whose backpressure should influence scheduling
@@ -138,6 +166,45 @@ uint32_t weaver_system_pressure(void);
  * polling rate) until the data fabric stabilizes.
  */
 bool weaver_should_throttle(void);
+
+/**
+ * @brief Ticks remaining until the next Warp deadline across the registry.
+ *
+ * Returns UINT32_MAX if no Warp threads have a deadline configured.
+ * Producers can use this to defer non-essential work that would extend
+ * past the next radio or sensor window (the "Pattern Slicing" strategy).
+ */
+uint32_t weaver_ticks_to_next_warp(void);
+
+/**
+ * @brief Aggregate Weaver runtime statistics ("Fabric View").
+ *
+ * Tracks per-system counters useful for tuning. Reset on system start.
+ */
+struct weaver_stats {
+	uint32_t total_ticks;          /**< weaver_tick() invocation count. */
+	uint32_t throttle_events;      /**< Times throttle threshold crossed. */
+	uint32_t weft_promotions;      /**< Total Weft priority elevations. */
+	uint32_t pre_warp_clears;      /**< "Pattern Slicing" clears performed. */
+	uint32_t skipped_idle_ticks;   /**< Power-aware ticks bypassed. */
+};
+
+/** @brief Snapshot the Weaver stats counters. */
+void weaver_get_stats(struct weaver_stats *out);
+
+/**
+ * @brief Override the global pressure weights at runtime.
+ *
+ * Defaults are WEAVER_W_URGENCY / W_DENSITY / W_AGING. Exposed so an
+ * external controller (e.g. a workload-classifier task or a fuzzy
+ * inference engine) can adapt weights without recompiling. All three
+ * are Q16.16 and SHOULD sum to roughly WEAVER_Q16_ONE for normalized
+ * pressure, but the dispatcher does not enforce that.
+ *
+ * Pass 0 to a weight to leave it unchanged.
+ */
+void weaver_set_weights(uint32_t w_urgency_q16, uint32_t w_density_q16,
+			uint32_t w_aging_q16);
 
 #ifdef __cplusplus
 }
