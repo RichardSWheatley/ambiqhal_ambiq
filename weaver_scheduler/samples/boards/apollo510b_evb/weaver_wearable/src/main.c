@@ -260,14 +260,15 @@ int main(void)
 		weaver_get_stats(&s);
 
 		printk("[t=%4ums] sys_p=0x%06x throttle=%d level=%3u next_warp=%u "
-		       "ticks=%u promo=%u clear=%u idle=%u\n",
+		       "ticks=%u promo=%u clear=%u idle=%u tick_cyc=%u\n",
 		       k_uptime_get_32() - t0,
 		       weaver_system_pressure(),
 		       weaver_should_throttle() ? 1 : 0,
 		       weaver_throttle_level(),
 		       weaver_ticks_to_next_warp(),
 		       s.total_ticks, s.weft_promotions,
-		       s.pre_warp_clears, s.skipped_idle_ticks);
+		       s.pre_warp_clears, s.skipped_idle_ticks,
+		       weaver_get_last_tick_cycles());
 	}
 
 	k_timer_stop(&weaver_timer);
