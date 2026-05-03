@@ -1109,6 +1109,1637 @@ index 00000000000..c330f4e72c1
 +	}
 +	k_spin_unlock(&weaver.lock, key);
 +}
+diff --git a/samples/boards/apollo510_evb/weaver_wearable/CMakeLists.txt b/samples/boards/apollo510_evb/weaver_wearable/CMakeLists.txt
+new file mode 100644
+index 00000000000..7914a85db3f
+--- /dev/null
++++ b/samples/boards/apollo510_evb/weaver_wearable/CMakeLists.txt
+@@ -0,0 +1,8 @@
++# SPDX-License-Identifier: Apache-2.0
++
++cmake_minimum_required(VERSION 3.20.0)
++
++find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
++project(weaver_wearable)
++
++target_sources(app PRIVATE src/main.c)
+diff --git a/samples/boards/apollo510_evb/weaver_wearable/README.rst b/samples/boards/apollo510_evb/weaver_wearable/README.rst
+new file mode 100644
+index 00000000000..3f57c03f333
+--- /dev/null
++++ b/samples/boards/apollo510_evb/weaver_wearable/README.rst
+@@ -0,0 +1,40 @@
++.. zephyr:code-sample:: weaver_wearable
++   :name: Weaver Wearable (Apollo510 LP @ 96 MHz)
++
++   Wearable sensor pipeline demo for the Weaver pressure-aware scheduler
++   on Ambiq Apollo510 in 96 MHz Low-Power mode.
++
++Overview
++********
++
++Models a fitness/health wearable workload with three Warp threads
++(BLE link-layer, IMU, PPG) and six Weft threads (sensor fusion, HR
++algorithm, GATT TX, activity classifier, display, NVM flush).
++
++Each tick (1 ms), Weaver computes Q16.16 pressure for every Weft
++based on its associated FIFO depth and how long it has waited, then
++elevates the highest-pressure Weft by two priority levels. When a
++BLE/IMU/PPG deadline is within ``CONFIG_WEAVER_PREWARP_GUARD_TICKS``,
++promotion is suppressed so the deadline-bound thread sees a quiet
++system (Pattern Slicing).
++
++Building
++********
++
++.. zephyr-app-commands::
++   :zephyr-app: samples/boards/apollo510_evb/weaver_wearable
++   :board: apollo510_evb
++   :goals: build flash
++
++Tuning
++******
++
++The wearable preset (``CONFIG_WEAVER_WEARABLE_PRESET=y``) sets:
++
++* ``WEAVER_MAX_THREADS=12``
++* ``WEAVER_THROTTLE_THRESHOLD=0x30000`` (3.0 in Q16.16)
++* ``WEAVER_DEFAULT_BOOST_LEVELS=2``
++* ``WEAVER_POWER_AWARE=y``
++
++Override individual settings in ``prj.conf`` if your sensor lineup
++differs (more PPG channels, multi-mic audio, etc.).
+diff --git a/samples/boards/apollo510_evb/weaver_wearable/prj.conf b/samples/boards/apollo510_evb/weaver_wearable/prj.conf
+new file mode 100644
+index 00000000000..2904835c203
+--- /dev/null
++++ b/samples/boards/apollo510_evb/weaver_wearable/prj.conf
+@@ -0,0 +1,22 @@
++# Weaver wearable sample tuned for Apollo510 LP @ 96 MHz.
++
++CONFIG_WEAVER_SCHED=y
++CONFIG_WEAVER_WEARABLE_PRESET=y
++
++CONFIG_LOG=y
++CONFIG_LOG_MODE_MINIMAL=y
++
++CONFIG_MAIN_STACK_SIZE=2048
++CONFIG_THREAD_NAME=y
++CONFIG_THREAD_RUNTIME_STATS=y
++
++# 1 ms system tick keeps Weaver granularity tight without dominating
++# CPU at 96 MHz (per-tick dispatch cost ~1.9 us = 0.19% of CPU).
++CONFIG_SYS_CLOCK_TICKS_PER_SEC=1000
++
++# Single-CPU; SMP-aware Weaver is a follow-up.
++CONFIG_MP_MAX_NUM_CPUS=1
++
++# Wearables stay in deepsleep most of the time.
++CONFIG_PM=y
++CONFIG_PM_DEVICE=y
+diff --git a/samples/boards/apollo510_evb/weaver_wearable/sample.yaml b/samples/boards/apollo510_evb/weaver_wearable/sample.yaml
+new file mode 100644
+index 00000000000..bb9357da3dc
+--- /dev/null
++++ b/samples/boards/apollo510_evb/weaver_wearable/sample.yaml
+@@ -0,0 +1,20 @@
++sample:
++  description: Weaver pressure-aware scheduler tuned for Apollo510 LP at 96 MHz
++    with a wearable sensor pipeline (BLE LL + IMU + PPG + fusion).
++  name: Weaver Wearable (Apollo510)
++common:
++  tags:
++    - kernel
++    - weaver
++    - wearable
++  harness: console
++  harness_config:
++    type: one_line
++    regex:
++      - "Weaver Wearable Demo Complete"
++tests:
++  sample.kernel.weaver_wearable.apollo510:
++    platform_allow:
++      - apollo510_evb
++    integration_platforms:
++      - apollo510_evb
+diff --git a/samples/boards/apollo510_evb/weaver_wearable/src/main.c b/samples/boards/apollo510_evb/weaver_wearable/src/main.c
+new file mode 100644
+index 00000000000..c671c88b31d
+--- /dev/null
++++ b/samples/boards/apollo510_evb/weaver_wearable/src/main.c
+@@ -0,0 +1,261 @@
++/*
++ * Copyright (c) 2026 Ambiq Micro, Inc.
++ *
++ * SPDX-License-Identifier: Apache-2.0
++ *
++ * Apollo510 LP @ 96 MHz wearable workload demo for Weaver scheduler.
++ *
++ * Models a typical fitness/health wearable:
++ *
++ *   Warp (deterministic, fixed deadlines):
++ *     - BLE LL  : connection event every 50 ms (CONFIG_BLE_INTERVAL_MS)
++ *     - IMU     : 6-axis sample @ 50 Hz   -> period 20 ms
++ *     - PPG/HR  : optical sample  @ 25 Hz -> period 40 ms
++ *
++ *   Weft (opportunistic, pressure scales with FIFO depth):
++ *     - Sensor fusion / step counter (consumes IMU FIFO)
++ *     - HR algorithm                  (consumes PPG FIFO)
++ *     - GATT TX queue                 (consumes notification ring)
++ *     - Activity classifier           (periodic ML inference)
++ *     - Display update                (frame buffer presents on change)
++ *     - NVM/log flush                 (persists hourly summaries)
++ *
++ * The mocked sensors push synthetic FIFO-depth data into Weaver via
++ * weaver_set_buffer_fill_q16(). The dispatcher boosts whichever Weft
++ * is closest to overflow. Pre-Warp guard ticks suppress promotion when
++ * a BLE/IMU/PPG deadline is imminent.
++ */
++
++#include <zephyr/kernel.h>
++#include <zephyr/kernel/weaver_sched.h>
++#include <zephyr/sys/printk.h>
++#include <zephyr/random/random.h>
++
++/* ---------- Wearable workload constants ---------- */
++
++#define TICK_MS                 1
++#define DEMO_DURATION_MS        2000
++
++#define BLE_INTERVAL_MS         50
++#define IMU_INTERVAL_MS         20
++#define PPG_INTERVAL_MS         40
++#define CLASSIFIER_INTERVAL_MS  500
++#define DISPLAY_INTERVAL_MS     33   /* 30 fps */
++#define NVM_INTERVAL_MS         1000
++
++/* Cooperative range is negative; we run all of these in preemptible
++ * space so Weaver can adjust priorities. Lower number = higher prio.
++ */
++#define BLE_LL_PRIO     2  /* Warp */
++#define IMU_PRIO        3  /* Warp */
++#define PPG_PRIO        4  /* Warp */
++#define FUSION_PRIO     8  /* Weft */
++#define HR_PRIO         8  /* Weft */
++#define GATT_TX_PRIO    9  /* Weft */
++#define CLASSIFIER_PRIO 10 /* Weft */
++#define DISPLAY_PRIO    11 /* Weft */
++#define NVM_PRIO        12 /* Weft */
++
++/* ---------- Mocked sensor FIFOs ---------- */
++
++struct fifo_sim {
++	uint32_t depth;     /* Q16.16 fill: 0 = empty, ONE = full */
++	uint32_t prod_step; /* Per-tick increment in Q16.16. */
++	uint32_t cons_step; /* Per-consumer-run drain in Q16.16. */
++};
++
++static struct fifo_sim imu_fifo  = { 0, WEAVER_Q16_ONE / 200, WEAVER_Q16_ONE / 4 };
++static struct fifo_sim ppg_fifo  = { 0, WEAVER_Q16_ONE / 400, WEAVER_Q16_ONE / 4 };
++static struct fifo_sim gatt_tx   = { 0, WEAVER_Q16_ONE / 300, WEAVER_Q16_ONE / 3 };
++
++/* ---------- Stacks + thread structs ---------- */
++
++#define STACK_SIZE 1024
++
++static K_THREAD_STACK_DEFINE(s_ble,        STACK_SIZE);
++static K_THREAD_STACK_DEFINE(s_imu,        STACK_SIZE);
++static K_THREAD_STACK_DEFINE(s_ppg,        STACK_SIZE);
++static K_THREAD_STACK_DEFINE(s_fusion,     STACK_SIZE);
++static K_THREAD_STACK_DEFINE(s_hr,         STACK_SIZE);
++static K_THREAD_STACK_DEFINE(s_gatt_tx,    STACK_SIZE);
++static K_THREAD_STACK_DEFINE(s_classifier, STACK_SIZE);
++static K_THREAD_STACK_DEFINE(s_display,    STACK_SIZE);
++static K_THREAD_STACK_DEFINE(s_nvm,        STACK_SIZE);
++
++static struct k_thread t_ble, t_imu, t_ppg, t_fusion, t_hr, t_gatt_tx,
++		       t_classifier, t_display, t_nvm;
++
++static struct weaver_thread_data wd_ble, wd_imu, wd_ppg, wd_fusion, wd_hr,
++				 wd_gatt_tx, wd_classifier, wd_display, wd_nvm;
++
++/* ---------- Warp threads ---------- */
++
++static void ble_ll_fn(void *a, void *b, void *c)
++{
++	ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
++	while (1) {
++		/* Connection event: minimal CPU, but the deadline is sacred. */
++		(void)k_uptime_get();
++		k_sleep(K_MSEC(BLE_INTERVAL_MS));
++	}
++}
++
++static void imu_sample_fn(void *a, void *b, void *c)
++{
++	ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
++	while (1) {
++		/* "Read" 6 axes -> push to FIFO. */
++		imu_fifo.depth = MIN(imu_fifo.depth + imu_fifo.prod_step, WEAVER_Q16_ONE);
++		weaver_set_buffer_fill_q16(&wd_fusion, imu_fifo.depth);
++		k_sleep(K_MSEC(IMU_INTERVAL_MS));
++	}
++}
++
++static void ppg_sample_fn(void *a, void *b, void *c)
++{
++	ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
++	while (1) {
++		ppg_fifo.depth = MIN(ppg_fifo.depth + ppg_fifo.prod_step, WEAVER_Q16_ONE);
++		weaver_set_buffer_fill_q16(&wd_hr, ppg_fifo.depth);
++		k_sleep(K_MSEC(PPG_INTERVAL_MS));
++	}
++}
++
++/* ---------- Weft threads ---------- */
++
++static void fusion_fn(void *a, void *b, void *c)
++{
++	ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
++	while (1) {
++		if (imu_fifo.depth > 0) {
++			imu_fifo.depth = (imu_fifo.depth > imu_fifo.cons_step)
++				? imu_fifo.depth - imu_fifo.cons_step : 0;
++			weaver_set_buffer_fill_q16(&wd_fusion, imu_fifo.depth);
++		}
++		k_sleep(K_MSEC(5));
++	}
++}
++
++static void hr_fn(void *a, void *b, void *c)
++{
++	ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
++	while (1) {
++		if (ppg_fifo.depth > 0) {
++			ppg_fifo.depth = (ppg_fifo.depth > ppg_fifo.cons_step)
++				? ppg_fifo.depth - ppg_fifo.cons_step : 0;
++			weaver_set_buffer_fill_q16(&wd_hr, ppg_fifo.depth);
++		}
++		k_sleep(K_MSEC(10));
++	}
++}
++
++static void gatt_tx_fn(void *a, void *b, void *c)
++{
++	ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
++	while (1) {
++		gatt_tx.depth = MIN(gatt_tx.depth + gatt_tx.prod_step, WEAVER_Q16_ONE);
++		weaver_set_buffer_fill_q16(&wd_gatt_tx, gatt_tx.depth);
++		if (gatt_tx.depth > gatt_tx.cons_step) {
++			gatt_tx.depth -= gatt_tx.cons_step;
++		}
++		k_sleep(K_MSEC(15));
++	}
++}
++
++static void classifier_fn(void *a, void *b, void *c)
++{
++	ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
++	while (1) {
++		k_sleep(K_MSEC(CLASSIFIER_INTERVAL_MS));
++	}
++}
++
++static void display_fn(void *a, void *b, void *c)
++{
++	ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
++	while (1) {
++		k_sleep(K_MSEC(DISPLAY_INTERVAL_MS));
++	}
++}
++
++static void nvm_fn(void *a, void *b, void *c)
++{
++	ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
++	while (1) {
++		k_sleep(K_MSEC(NVM_INTERVAL_MS));
++	}
++}
++
++/* ---------- Weaver tick driver ---------- */
++
++static void tick_handler(struct k_timer *t) { ARG_UNUSED(t); weaver_tick(); }
++static K_TIMER_DEFINE(weaver_timer, tick_handler, NULL);
++
++int main(void)
++{
++	printk("Weaver wearable demo on Apollo510 LP @ 96 MHz\n");
++
++	/* Create all threads. */
++	k_thread_create(&t_ble,        s_ble,        STACK_SIZE, ble_ll_fn,     NULL, NULL, NULL, BLE_LL_PRIO,     0, K_NO_WAIT);
++	k_thread_create(&t_imu,        s_imu,        STACK_SIZE, imu_sample_fn, NULL, NULL, NULL, IMU_PRIO,        0, K_NO_WAIT);
++	k_thread_create(&t_ppg,        s_ppg,        STACK_SIZE, ppg_sample_fn, NULL, NULL, NULL, PPG_PRIO,        0, K_NO_WAIT);
++	k_thread_create(&t_fusion,     s_fusion,     STACK_SIZE, fusion_fn,     NULL, NULL, NULL, FUSION_PRIO,     0, K_NO_WAIT);
++	k_thread_create(&t_hr,         s_hr,         STACK_SIZE, hr_fn,         NULL, NULL, NULL, HR_PRIO,         0, K_NO_WAIT);
++	k_thread_create(&t_gatt_tx,    s_gatt_tx,    STACK_SIZE, gatt_tx_fn,    NULL, NULL, NULL, GATT_TX_PRIO,    0, K_NO_WAIT);
++	k_thread_create(&t_classifier, s_classifier, STACK_SIZE, classifier_fn, NULL, NULL, NULL, CLASSIFIER_PRIO, 0, K_NO_WAIT);
++	k_thread_create(&t_display,    s_display,    STACK_SIZE, display_fn,    NULL, NULL, NULL, DISPLAY_PRIO,    0, K_NO_WAIT);
++	k_thread_create(&t_nvm,        s_nvm,        STACK_SIZE, nvm_fn,        NULL, NULL, NULL, NVM_PRIO,        0, K_NO_WAIT);
++
++	/* Register Warp threads with their deadlines. */
++	weaver_register(&wd_ble, &t_ble, WEAVER_TO_Q16(20), true);
++	weaver_set_warp_deadline(&wd_ble, BLE_INTERVAL_MS / TICK_MS);
++
++	weaver_register(&wd_imu, &t_imu, WEAVER_TO_Q16(15), true);
++	weaver_set_warp_deadline(&wd_imu, IMU_INTERVAL_MS / TICK_MS);
++
++	weaver_register(&wd_ppg, &t_ppg, WEAVER_TO_Q16(15), true);
++	weaver_set_warp_deadline(&wd_ppg, PPG_INTERVAL_MS / TICK_MS);
++
++	/* Register Weft threads. */
++	weaver_register(&wd_fusion,     &t_fusion,     WEAVER_TO_Q16(8), false);
++	weaver_register(&wd_hr,         &t_hr,         WEAVER_TO_Q16(8), false);
++	weaver_register(&wd_gatt_tx,    &t_gatt_tx,    WEAVER_TO_Q16(7), false);
++	weaver_register(&wd_classifier, &t_classifier, WEAVER_TO_Q16(5), false);
++	weaver_register(&wd_display,    &t_display,    WEAVER_TO_Q16(4), false);
++	weaver_register(&wd_nvm,        &t_nvm,        WEAVER_TO_Q16(2), false);
++
++	k_timer_start(&weaver_timer, K_MSEC(TICK_MS), K_MSEC(TICK_MS));
++
++	/* Run for DEMO_DURATION_MS, log fabric stats every 250 ms. */
++	uint32_t t0 = k_uptime_get_32();
++	while ((k_uptime_get_32() - t0) < DEMO_DURATION_MS) {
++		k_sleep(K_MSEC(250));
++
++		struct weaver_stats s;
++		weaver_get_stats(&s);
++
++		printk("[t=%4ums] sys_p=0x%06x throttle=%d next_warp=%u "
++		       "ticks=%u promo=%u clear=%u idle=%u\n",
++		       k_uptime_get_32() - t0,
++		       weaver_system_pressure(),
++		       weaver_should_throttle() ? 1 : 0,
++		       weaver_ticks_to_next_warp(),
++		       s.total_ticks, s.weft_promotions,
++		       s.pre_warp_clears, s.skipped_idle_ticks);
++	}
++
++	k_timer_stop(&weaver_timer);
++
++	weaver_unregister(&wd_ble);
++	weaver_unregister(&wd_imu);
++	weaver_unregister(&wd_ppg);
++	weaver_unregister(&wd_fusion);
++	weaver_unregister(&wd_hr);
++	weaver_unregister(&wd_gatt_tx);
++	weaver_unregister(&wd_classifier);
++	weaver_unregister(&wd_display);
++	weaver_unregister(&wd_nvm);
++
++	printk("Weaver Wearable Demo Complete\n");
++	return 0;
++}
+diff --git a/samples/boards/apollo510b_evb/weaver_benchmark/CMakeLists.txt b/samples/boards/apollo510b_evb/weaver_benchmark/CMakeLists.txt
+new file mode 100644
+index 00000000000..c3e907c9ed1
+--- /dev/null
++++ b/samples/boards/apollo510b_evb/weaver_benchmark/CMakeLists.txt
+@@ -0,0 +1,8 @@
++# SPDX-License-Identifier: Apache-2.0
++
++cmake_minimum_required(VERSION 3.20.0)
++
++find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
++project(weaver_benchmark)
++
++target_sources(app PRIVATE src/main.c)
+diff --git a/samples/boards/apollo510b_evb/weaver_benchmark/README.rst b/samples/boards/apollo510b_evb/weaver_benchmark/README.rst
+new file mode 100644
+index 00000000000..ec729bb208c
+--- /dev/null
++++ b/samples/boards/apollo510b_evb/weaver_benchmark/README.rst
+@@ -0,0 +1,74 @@
++.. zephyr:code-sample:: weaver_benchmark
++   :name: Weaver Benchmark (Apollo510B)
++
++   Canonical wearable workload (RFC §7.1) for measuring the Weaver
++   scheduler against stock Zephyr and across the three pressure-batch
++   variants.
++
++Overview
++********
++
++Runs the workload defined in ``RFC.md §7.1`` for 60 seconds with two
++burst events at t=10s and t=20s. Tracks IMU/PPG/GATT FIFO overruns,
++sensor-to-process latency histograms (P50/P99/max), Weaver dispatch
++cycles via DWT, and Weaver internal stats.
++
++Final output is a single ``CSV`` line per run that ``scripts/bench.sh``
++parses into a comparison table.
++
++Building each variant
++*********************
++
++.. zephyr-app-commands::
++   :zephyr-app: samples/boards/apollo510b_evb/weaver_benchmark
++   :board: apollo510b_evb
++   :goals: build flash
++
++Default ``prj.conf`` selects the SCALAR Weaver variant. Override:
++
++.. code-block:: console
++
++   # Stock Zephyr baseline (no Weaver)
++   west build -p -b apollo510b_evb samples/boards/apollo510b_evb/weaver_benchmark \
++       -- -DEXTRA_CONF_FILE=stock.conf
++
++   # Hybrid MVE (vector load/store + scalar mul)
++   west build -p -b apollo510b_evb samples/boards/apollo510b_evb/weaver_benchmark \
++       -- -DEXTRA_CONF_FILE=hybrid.conf
++
++   # Full MVE (4-wide multiply)
++   west build -p -b apollo510b_evb samples/boards/apollo510b_evb/weaver_benchmark \
++       -- -DEXTRA_CONF_FILE=mve.conf
++
++Or use ``scripts/bench.sh`` to build, flash, capture, and tabulate
++all four variants in one run.
++
++Reading the output
++******************
++
++::
++
++    --- METRICS [weaver-scalar] ---
++    M1 imu_overruns=0 ppg_overruns=0 gatt_overruns=2
++    M2 fusion_lat_us p50=2000 p99=10000 max=14523 (n=2944)
++    M2 hr_lat_us     p50=10000 p99=20000 max=28341 (n=1492)
++    M4 last_tick_cyc=181
++    WV ticks=60002 promo=312 prewarp=4128 throttle=8 idle_skip=14982
++    CSV weaver-scalar,0,0,2,2000,10000,10000,20000,181,312,4128
++    BENCHMARK COMPLETE
++
++Comparing the ``CSV`` line across builds tells you whether Weaver
++beats stock on the M1/M2/M4 metrics defined in the RFC. The
++acceptance criteria are listed in ``RFC.md §7``.
++
++Caveats
++*******
++
++* Latency histograms use bucket upper edges - they are pessimistic
++  but consistent across runs, which is what matters for comparison.
++* The synthetic FIFO model substitutes for hardware sensor FIFOs.
++  For absolute (vs. relative) numbers, populate the BMI270 / MAX30101
++  Click boards and use the ``weaver_wearable`` sample, which reads
++  hardware FIFOs.
++* Burst events are deterministic at t=10s and t=20s. Real wearable
++  bursts are not periodic; expect higher variance in production.
+diff --git a/samples/boards/apollo510b_evb/weaver_benchmark/hybrid.conf b/samples/boards/apollo510b_evb/weaver_benchmark/hybrid.conf
+new file mode 100644
+index 00000000000..252cddbd8c9
+--- /dev/null
++++ b/samples/boards/apollo510b_evb/weaver_benchmark/hybrid.conf
+@@ -0,0 +1,3 @@
++# Override prj.conf to select the HYBRID pressure-batch variant.
++CONFIG_WEAVER_BATCH_SCALAR=n
++CONFIG_WEAVER_BATCH_HYBRID=y
+diff --git a/samples/boards/apollo510b_evb/weaver_benchmark/mve.conf b/samples/boards/apollo510b_evb/weaver_benchmark/mve.conf
+new file mode 100644
+index 00000000000..7ed717bc3a0
+--- /dev/null
++++ b/samples/boards/apollo510b_evb/weaver_benchmark/mve.conf
+@@ -0,0 +1,3 @@
++# Override prj.conf to select the FULL MVE pressure-batch variant.
++CONFIG_WEAVER_BATCH_SCALAR=n
++CONFIG_WEAVER_BATCH_MVE=y
+diff --git a/samples/boards/apollo510b_evb/weaver_benchmark/prj.conf b/samples/boards/apollo510b_evb/weaver_benchmark/prj.conf
+new file mode 100644
+index 00000000000..1fb5193fa03
+--- /dev/null
++++ b/samples/boards/apollo510b_evb/weaver_benchmark/prj.conf
+@@ -0,0 +1,28 @@
++# Weaver canonical benchmark workload (RFC §7.1).
++#
++# Build three times to compare the pressure-batch variants. Use
++# scripts/bench.sh in this sample directory to automate.
++#
++# Default here is SCALAR. Override via:
++#   west build ... -- -DEXTRA_CONF_FILE=hybrid.conf
++#   west build ... -- -DEXTRA_CONF_FILE=mve.conf
++#   west build ... -- -DEXTRA_CONF_FILE=stock.conf
++
++CONFIG_WEAVER_SCHED=y
++CONFIG_WEAVER_WEARABLE_PRESET=y
++CONFIG_WEAVER_BATCH_SCALAR=y
++CONFIG_WEAVER_TIMING=y
++
++CONFIG_LOG=y
++CONFIG_LOG_MODE_MINIMAL=y
++CONFIG_THREAD_NAME=y
++CONFIG_THREAD_RUNTIME_STATS=y
++
++CONFIG_MAIN_STACK_SIZE=4096
++CONFIG_HEAP_MEM_POOL_SIZE=4096
++CONFIG_SYS_CLOCK_TICKS_PER_SEC=1000
++CONFIG_MP_MAX_NUM_CPUS=1
++
++CONFIG_PM=y
++CONFIG_PM_DEVICE=y
++CONFIG_PM_DEVICE_RUNTIME=y
+diff --git a/samples/boards/apollo510b_evb/weaver_benchmark/sample.yaml b/samples/boards/apollo510b_evb/weaver_benchmark/sample.yaml
+new file mode 100644
+index 00000000000..e68abd37797
+--- /dev/null
++++ b/samples/boards/apollo510b_evb/weaver_benchmark/sample.yaml
+@@ -0,0 +1,31 @@
++sample:
++  description: Canonical Weaver benchmark workload (RFC §7.1) for Apollo510B
++    LP at 96 MHz. Builds with one of stock / scalar / hybrid / full-MVE batch
++    variants (extra_args).
++  name: Weaver Benchmark
++common:
++  tags:
++    - kernel
++    - weaver
++    - benchmark
++  harness: console
++  harness_config:
++    type: one_line
++    regex:
++      - "BENCHMARK COMPLETE"
++tests:
++  sample.kernel.weaver_benchmark.scalar:
++    platform_allow: apollo510b_evb
++    integration_platforms: [apollo510b_evb]
++  sample.kernel.weaver_benchmark.hybrid:
++    platform_allow: apollo510b_evb
++    integration_platforms: [apollo510b_evb]
++    extra_args: EXTRA_CONF_FILE=hybrid.conf
++  sample.kernel.weaver_benchmark.mve:
++    platform_allow: apollo510b_evb
++    integration_platforms: [apollo510b_evb]
++    extra_args: EXTRA_CONF_FILE=mve.conf
++  sample.kernel.weaver_benchmark.stock:
++    platform_allow: apollo510b_evb
++    integration_platforms: [apollo510b_evb]
++    extra_args: EXTRA_CONF_FILE=stock.conf
+diff --git a/samples/boards/apollo510b_evb/weaver_benchmark/scripts/bench.sh b/samples/boards/apollo510b_evb/weaver_benchmark/scripts/bench.sh
+new file mode 100755
+index 00000000000..f3302e6506b
+--- /dev/null
++++ b/samples/boards/apollo510b_evb/weaver_benchmark/scripts/bench.sh
+@@ -0,0 +1,45 @@
++#!/usr/bin/env bash
++#
++# Build and flash the canonical benchmark with each variant in turn.
++# Captures the per-variant log + parses the CSV line into a comparison
++# table.
++#
++# Usage: cd <zephyr-root> && samples/boards/apollo510b_evb/weaver_benchmark/scripts/bench.sh
++# Requires: west, J-Link, pylink, a serial terminal capture tool.
++
++set -euo pipefail
++
++SAMPLE=samples/boards/apollo510b_evb/weaver_benchmark
++LOGDIR=${WEAVER_BENCH_LOGDIR:-/tmp/weaver_bench}
++mkdir -p "$LOGDIR"
++
++run_variant() {
++    local name=$1
++    local extra_conf=$2
++
++    echo "=== build [$name] ==="
++    west build -p -b apollo510b_evb "$SAMPLE" \
++        ${extra_conf:+-- -DEXTRA_CONF_FILE=$extra_conf}
++
++    echo "=== flash [$name] ==="
++    west flash
++
++    echo "=== capture 65 s for [$name] ==="
++    # Adjust the device path for your host.
++    timeout 65 cat /dev/ttyUSB0 | tee "$LOGDIR/$name.log" || true
++}
++
++run_variant stock          stock.conf
++run_variant weaver-scalar  ""
++run_variant weaver-hybrid  hybrid.conf
++run_variant weaver-mve     mve.conf
++
++echo
++echo "=== comparison table ==="
++printf "%-15s %-8s %-8s %-8s %-8s %-8s %-8s %-8s %-8s %-8s %-8s\n" \
++       variant imu_ovr ppg_ovr gatt_ovr fus_p50 fus_p99 hr_p50 hr_p99 tick_cyc promo prewarp
++for v in stock weaver-scalar weaver-hybrid weaver-mve; do
++    line=$(grep "^CSV " "$LOGDIR/$v.log" | tail -1 | sed 's/^CSV //')
++    IFS=',' read -ra fields <<< "$line"
++    printf "%-15s %-8s %-8s %-8s %-8s %-8s %-8s %-8s %-8s %-8s %-8s\n" "${fields[@]}"
++done
+diff --git a/samples/boards/apollo510b_evb/weaver_benchmark/src/main.c b/samples/boards/apollo510b_evb/weaver_benchmark/src/main.c
+new file mode 100644
+index 00000000000..b9a59b2f2c0
+--- /dev/null
++++ b/samples/boards/apollo510b_evb/weaver_benchmark/src/main.c
+@@ -0,0 +1,472 @@
++/*
++ * Copyright (c) 2026 Ambiq Micro, Inc.
++ * SPDX-License-Identifier: Apache-2.0
++ *
++ * Canonical Weaver benchmark workload (RFC §7.1).
++ *
++ * Models a wearable sensor pipeline:
++ *   3 Warp threads:  BLE LL (50 ms), IMU (50 Hz), PPG (25 Hz)
++ *   6 Weft threads:  fusion, HR, GATT TX, classifier, display, NVM
++ *
++ * Two burst events at t=10 s and t=20 s (50 ms IMU @ 200 Hz + 30
++ * GATT notifications) stress the dispatcher.
++ *
++ * Runs for 60 s, then prints a single-line metrics summary that can
++ * be diffed across builds:
++ *
++ *   stock / scalar / hybrid / full-MVE
++ *
++ * Build any of these via EXTRA_CONF_FILE=stock.conf|hybrid.conf|mve.conf
++ * Default prj.conf selects the SCALAR Weaver variant.
++ */
++
++#include <zephyr/kernel.h>
++#include <zephyr/sys/printk.h>
++#include <zephyr/logging/log.h>
++
++#ifdef CONFIG_WEAVER_SCHED
++#include <zephyr/kernel/weaver_sched.h>
++#endif
++
++LOG_MODULE_REGISTER(weaver_bench, LOG_LEVEL_INF);
++
++#define DEMO_DURATION_MS    60000
++#define BURST_AT_MS_1       10000
++#define BURST_AT_MS_2       20000
++#define BURST_DURATION_MS   50
++#define WARMUP_MS           2000
++
++#define IMU_PERIOD_MS       20
++#define IMU_BURST_PERIOD_MS 5
++#define PPG_PERIOD_MS       40
++#define BLE_PERIOD_MS       50
++#define DISP_PERIOD_MS      33
++#define NVM_PERIOD_MS       1000
++#define CLASS_PERIOD_MS     500
++
++/* Mock workload: each thread uses k_busy_wait to simulate compute. */
++#define BLE_WORK_US         3000
++#define IMU_WORK_US         200
++#define PPG_WORK_US         600
++#define FUSION_WORK_US      1500
++#define HR_WORK_US          8000
++#define GATT_WORK_US        300
++#define DISP_WORK_US        4000
++#define NVM_WORK_US         12000
++#define CLASS_WORK_US       2000
++
++/* Priorities. Same values whether Weaver is on or off. */
++#define BLE_PRIO        2
++#define IMU_PRIO        3
++#define PPG_PRIO        4
++#define FUSION_PRIO     8
++#define HR_PRIO         8
++#define GATT_PRIO       9
++#define CLASS_PRIO      10
++#define DISP_PRIO       11
++#define NVM_PRIO        12
++
++#define STACK_SIZE 2048
++#define FIFO_DEPTH 32
++
++/* ---- Synthetic FIFO models (replace hardware sensor FIFOs) ---- */
++
++struct fifo {
++	atomic_t depth;
++	atomic_t produced;
++	atomic_t consumed;
++	atomic_t overruns;
++};
++
++static struct fifo imu_fifo, ppg_fifo, gatt_fifo;
++
++static inline void fifo_produce(struct fifo *f, int n)
++{
++	int d = atomic_add(&f->depth, n) + n;
++	atomic_add(&f->produced, n);
++	if (d > FIFO_DEPTH) {
++		atomic_add(&f->overruns, d - FIFO_DEPTH);
++		atomic_set(&f->depth, FIFO_DEPTH);
++	}
++}
++
++static inline int fifo_consume(struct fifo *f, int n)
++{
++	int d = atomic_get(&f->depth);
++	int c = (d < n) ? d : n;
++	if (c > 0) {
++		atomic_sub(&f->depth, c);
++		atomic_add(&f->consumed, c);
++	}
++	return c;
++}
++
++#ifdef CONFIG_WEAVER_SCHED
++static inline uint32_t depth_to_q16(int depth)
++{
++	if (depth <= 0) return 0;
++	if (depth >= FIFO_DEPTH) return WEAVER_Q16_ONE;
++	return ((uint32_t)depth * WEAVER_Q16_ONE) / FIFO_DEPTH;
++}
++#endif
++
++/* ---- Per-thread latency histograms (sensor-to-process M2) ---- */
++
++#define HIST_BUCKETS 16
++struct latency_hist {
++	uint32_t count;
++	uint32_t bucket_us[HIST_BUCKETS];  /* upper edges in us, last is +inf */
++	atomic_t buckets[HIST_BUCKETS];
++	uint32_t sum_us;
++	uint32_t max_us;
++};
++
++static struct latency_hist fusion_lat = {
++	.bucket_us = { 100, 200, 500, 1000, 2000, 5000, 10000,
++		       20000, 50000, 100000, 200000, 500000,
++		       1000000, 2000000, 5000000, UINT32_MAX },
++};
++
++static struct latency_hist hr_lat = {
++	.bucket_us = { 100, 200, 500, 1000, 2000, 5000, 10000,
++		       20000, 50000, 100000, 200000, 500000,
++		       1000000, 2000000, 5000000, UINT32_MAX },
++};
++
++static void hist_add(struct latency_hist *h, uint32_t lat_us)
++{
++	for (int i = 0; i < HIST_BUCKETS; i++) {
++		if (lat_us <= h->bucket_us[i]) {
++			atomic_inc(&h->buckets[i]);
++			break;
++		}
++	}
++	h->count++;
++	h->sum_us += lat_us;
++	if (lat_us > h->max_us) h->max_us = lat_us;
++}
++
++/* Return percentile (0..100) latency from histogram. Pessimistic:
++ * returns the bucket upper edge. Good enough for relative comparison.
++ */
++static uint32_t hist_percentile(const struct latency_hist *h, int pct)
++{
++	uint32_t total = 0;
++	for (int i = 0; i < HIST_BUCKETS; i++) total += atomic_get(&h->buckets[i]);
++	if (total == 0) return 0;
++	uint32_t target = (total * pct) / 100;
++	uint32_t cum = 0;
++	for (int i = 0; i < HIST_BUCKETS; i++) {
++		cum += atomic_get(&h->buckets[i]);
++		if (cum >= target) return h->bucket_us[i];
++	}
++	return h->bucket_us[HIST_BUCKETS - 1];
++}
++
++/* Producer-side timestamp queue so consumer can compute latency. */
++struct ts_queue {
++	uint32_t ts[FIFO_DEPTH];
++	atomic_t head;
++	atomic_t tail;
++};
++
++static struct ts_queue imu_ts, ppg_ts;
++
++static inline void ts_push(struct ts_queue *q, uint32_t ts_us)
++{
++	int h = atomic_inc(&q->head);
++	q->ts[h % FIFO_DEPTH] = ts_us;
++}
++
++static inline uint32_t ts_pop(struct ts_queue *q)
++{
++	int t = atomic_get(&q->tail);
++	int h = atomic_get(&q->head);
++	if (t >= h) return 0;
++	uint32_t v = q->ts[t % FIFO_DEPTH];
++	atomic_inc(&q->tail);
++	return v;
++}
++
++/* ---- Burst injection state ---- */
++
++static atomic_t in_burst = ATOMIC_INIT(0);
++
++/* ---- Warp dummy / Weft dummy ---- */
++
++#ifdef CONFIG_WEAVER_SCHED
++static struct weaver_thread_data wd_ble, wd_imu, wd_ppg, wd_fusion, wd_hr,
++				 wd_gatt, wd_class, wd_disp, wd_nvm;
++#endif
++
++static void ble_fn(void *a, void *b, void *c)
++{
++	ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
++	while (1) {
++		k_busy_wait(BLE_WORK_US);
++		k_sleep(K_MSEC(BLE_PERIOD_MS));
++	}
++}
++
++static void imu_fn(void *a, void *b, void *c)
++{
++	ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
++	while (1) {
++		uint32_t period = atomic_get(&in_burst) ?
++			IMU_BURST_PERIOD_MS : IMU_PERIOD_MS;
++
++		k_busy_wait(IMU_WORK_US);
++
++		/* One sample per loop normally; 4 per loop in burst to
++		 * model the 200 Hz burst as 4× the data without
++		 * changing thread cadence. */
++		int n = atomic_get(&in_burst) ? 4 : 1;
++		uint32_t now_us = k_cyc_to_us_floor32(k_cycle_get_32());
++		for (int i = 0; i < n; i++) ts_push(&imu_ts, now_us);
++		fifo_produce(&imu_fifo, n);
++
++#ifdef CONFIG_WEAVER_SCHED
++		weaver_set_buffer_fill_predictive_q16(
++			&wd_fusion, depth_to_q16(atomic_get(&imu_fifo.depth)));
++#endif
++		k_sleep(K_MSEC(period));
++	}
++}
++
++static void ppg_fn(void *a, void *b, void *c)
++{
++	ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
++	while (1) {
++		k_busy_wait(PPG_WORK_US);
++		uint32_t now_us = k_cyc_to_us_floor32(k_cycle_get_32());
++		ts_push(&ppg_ts, now_us);
++		fifo_produce(&ppg_fifo, 1);
++#ifdef CONFIG_WEAVER_SCHED
++		weaver_set_buffer_fill_predictive_q16(
++			&wd_hr, depth_to_q16(atomic_get(&ppg_fifo.depth)));
++#endif
++		k_sleep(K_MSEC(PPG_PERIOD_MS));
++	}
++}
++
++static void fusion_fn(void *a, void *b, void *c)
++{
++	ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
++	while (1) {
++		int got = fifo_consume(&imu_fifo, 8);
++		if (got > 0) {
++			uint32_t now_us = k_cyc_to_us_floor32(k_cycle_get_32());
++			for (int i = 0; i < got; i++) {
++				uint32_t prod_us = ts_pop(&imu_ts);
++				if (prod_us != 0) {
++					hist_add(&fusion_lat, now_us - prod_us);
++				}
++			}
++			k_busy_wait(FUSION_WORK_US);
++#ifdef CONFIG_WEAVER_SCHED
++			weaver_set_buffer_fill_predictive_q16(
++				&wd_fusion,
++				depth_to_q16(atomic_get(&imu_fifo.depth)));
++#endif
++		}
++		k_sleep(K_MSEC(5));
++	}
++}
++
++static void hr_fn(void *a, void *b, void *c)
++{
++	ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
++	while (1) {
++		int got = fifo_consume(&ppg_fifo, 4);
++		if (got > 0) {
++			uint32_t now_us = k_cyc_to_us_floor32(k_cycle_get_32());
++			for (int i = 0; i < got; i++) {
++				uint32_t prod_us = ts_pop(&ppg_ts);
++				if (prod_us != 0) {
++					hist_add(&hr_lat, now_us - prod_us);
++				}
++			}
++			k_busy_wait(HR_WORK_US);
++#ifdef CONFIG_WEAVER_SCHED
++			weaver_set_buffer_fill_predictive_q16(
++				&wd_hr,
++				depth_to_q16(atomic_get(&ppg_fifo.depth)));
++#endif
++		}
++		k_sleep(K_MSEC(10));
++	}
++}
++
++static void gatt_fn(void *a, void *b, void *c)
++{
++	ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
++	while (1) {
++		int n = atomic_get(&in_burst) ? 6 : 1;
++		fifo_produce(&gatt_fifo, n);
++#ifdef CONFIG_WEAVER_SCHED
++		weaver_set_buffer_fill_predictive_q16(
++			&wd_gatt, depth_to_q16(atomic_get(&gatt_fifo.depth)));
++#endif
++		k_busy_wait(GATT_WORK_US);
++		fifo_consume(&gatt_fifo, 3);
++#ifdef CONFIG_WEAVER_SCHED
++		weaver_set_buffer_fill_predictive_q16(
++			&wd_gatt, depth_to_q16(atomic_get(&gatt_fifo.depth)));
++#endif
++		k_sleep(K_MSEC(15));
++	}
++}
++
++static void classifier_fn(void *a, void *b, void *c)
++{
++	ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
++	while (1) {
++		k_busy_wait(CLASS_WORK_US);
++		k_sleep(K_MSEC(CLASS_PERIOD_MS));
++	}
++}
++
++static void disp_fn(void *a, void *b, void *c)
++{
++	ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
++	while (1) {
++		k_busy_wait(DISP_WORK_US);
++		k_sleep(K_MSEC(DISP_PERIOD_MS));
++	}
++}
++
++static void nvm_fn(void *a, void *b, void *c)
++{
++	ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
++	while (1) {
++		k_busy_wait(NVM_WORK_US);
++		k_sleep(K_MSEC(NVM_PERIOD_MS));
++	}
++}
++
++/* ---- Stacks + thread structs ---- */
++
++static K_THREAD_STACK_DEFINE(s_ble,    STACK_SIZE);
++static K_THREAD_STACK_DEFINE(s_imu,    STACK_SIZE);
++static K_THREAD_STACK_DEFINE(s_ppg,    STACK_SIZE);
++static K_THREAD_STACK_DEFINE(s_fusion, STACK_SIZE);
++static K_THREAD_STACK_DEFINE(s_hr,     STACK_SIZE);
++static K_THREAD_STACK_DEFINE(s_gatt,   STACK_SIZE);
++static K_THREAD_STACK_DEFINE(s_class,  STACK_SIZE);
++static K_THREAD_STACK_DEFINE(s_disp,   STACK_SIZE);
++static K_THREAD_STACK_DEFINE(s_nvm,    STACK_SIZE);
++
++static struct k_thread t_ble, t_imu, t_ppg, t_fusion, t_hr, t_gatt,
++		       t_class, t_disp, t_nvm;
++
++#ifdef CONFIG_WEAVER_SCHED
++static void weaver_tick_fn(struct k_timer *t) { ARG_UNUSED(t); weaver_tick(); }
++static K_TIMER_DEFINE(weaver_timer, weaver_tick_fn, NULL);
++#endif
++
++/* ---- Build label for the metrics line ---- */
++
++#if !defined(CONFIG_WEAVER_SCHED)
++#define BUILD_LABEL "stock"
++#elif defined(CONFIG_WEAVER_BATCH_MVE)
++#define BUILD_LABEL "weaver-mve"
++#elif defined(CONFIG_WEAVER_BATCH_HYBRID)
++#define BUILD_LABEL "weaver-hybrid"
++#elif defined(CONFIG_WEAVER_BATCH_SCALAR)
++#define BUILD_LABEL "weaver-scalar"
++#else
++#define BUILD_LABEL "weaver-?"
++#endif
++
++int main(void)
++{
++	printk("\n=== Weaver Benchmark (%s) on Apollo510B EVB LP @ 96 MHz ===\n",
++	       BUILD_LABEL);
++	printk("Workload: 3 Warp + 6 Weft, 60 s, bursts at 10s and 20s\n\n");
++
++	k_thread_create(&t_ble,    s_ble,    STACK_SIZE, ble_fn,        NULL,NULL,NULL, BLE_PRIO,    0, K_NO_WAIT);
++	k_thread_create(&t_imu,    s_imu,    STACK_SIZE, imu_fn,        NULL,NULL,NULL, IMU_PRIO,    0, K_NO_WAIT);
++	k_thread_create(&t_ppg,    s_ppg,    STACK_SIZE, ppg_fn,        NULL,NULL,NULL, PPG_PRIO,    0, K_NO_WAIT);
++	k_thread_create(&t_fusion, s_fusion, STACK_SIZE, fusion_fn,     NULL,NULL,NULL, FUSION_PRIO, 0, K_NO_WAIT);
++	k_thread_create(&t_hr,     s_hr,     STACK_SIZE, hr_fn,         NULL,NULL,NULL, HR_PRIO,     0, K_NO_WAIT);
++	k_thread_create(&t_gatt,   s_gatt,   STACK_SIZE, gatt_fn,       NULL,NULL,NULL, GATT_PRIO,   0, K_NO_WAIT);
++	k_thread_create(&t_class,  s_class,  STACK_SIZE, classifier_fn, NULL,NULL,NULL, CLASS_PRIO,  0, K_NO_WAIT);
++	k_thread_create(&t_disp,   s_disp,   STACK_SIZE, disp_fn,       NULL,NULL,NULL, DISP_PRIO,   0, K_NO_WAIT);
++	k_thread_create(&t_nvm,    s_nvm,    STACK_SIZE, nvm_fn,        NULL,NULL,NULL, NVM_PRIO,    0, K_NO_WAIT);
++
++#ifdef CONFIG_WEAVER_SCHED
++	weaver_register(&wd_ble,    &t_ble,    WEAVER_TO_Q16(20), true);
++	weaver_set_warp_deadline(&wd_ble, BLE_PERIOD_MS);
++
++	weaver_register(&wd_imu,    &t_imu,    WEAVER_TO_Q16(15), true);
++	weaver_set_warp_deadline(&wd_imu, IMU_PERIOD_MS);
++
++	weaver_register(&wd_ppg,    &t_ppg,    WEAVER_TO_Q16(15), true);
++	weaver_set_warp_deadline(&wd_ppg, PPG_PERIOD_MS);
++
++	weaver_register(&wd_fusion, &t_fusion, WEAVER_TO_Q16(8), false);
++	weaver_register(&wd_hr,     &t_hr,     WEAVER_TO_Q16(8), false);
++	weaver_register(&wd_gatt,   &t_gatt,   WEAVER_TO_Q16(7), false);
++	weaver_register(&wd_class,  &t_class,  WEAVER_TO_Q16(5), false);
++	weaver_register(&wd_disp,   &t_disp,   WEAVER_TO_Q16(4), false);
++	weaver_register(&wd_nvm,    &t_nvm,    WEAVER_TO_Q16(2), false);
++
++	k_timer_start(&weaver_timer, K_MSEC(1), K_MSEC(1));
++#endif
++
++	uint32_t t0 = k_uptime_get_32();
++	while (1) {
++		uint32_t t = k_uptime_get_32() - t0;
++		if (t >= DEMO_DURATION_MS) break;
++
++		bool burst = ((t >= BURST_AT_MS_1 && t < BURST_AT_MS_1 + BURST_DURATION_MS) ||
++			      (t >= BURST_AT_MS_2 && t < BURST_AT_MS_2 + BURST_DURATION_MS));
++		atomic_set(&in_burst, burst ? 1 : 0);
++
++		k_sleep(K_MSEC(50));
++	}
++
++	/* ---- Final report ---- */
++
++	uint32_t imu_overruns  = atomic_get(&imu_fifo.overruns);
++	uint32_t ppg_overruns  = atomic_get(&ppg_fifo.overruns);
++	uint32_t gatt_overruns = atomic_get(&gatt_fifo.overruns);
++
++	uint32_t fusion_p50 = hist_percentile(&fusion_lat, 50);
++	uint32_t fusion_p99 = hist_percentile(&fusion_lat, 99);
++	uint32_t hr_p50     = hist_percentile(&hr_lat, 50);
++	uint32_t hr_p99     = hist_percentile(&hr_lat, 99);
++	uint32_t fusion_max = fusion_lat.max_us;
++	uint32_t hr_max     = hr_lat.max_us;
++
++#ifdef CONFIG_WEAVER_SCHED
++	struct weaver_stats s;
++	weaver_get_stats(&s);
++	uint32_t tick_cyc   = weaver_get_last_tick_cycles();
++	uint32_t throttle   = s.throttle_events;
++	uint32_t promotions = s.weft_promotions;
++	uint32_t prewarp    = s.pre_warp_clears;
++	uint32_t idle_skip  = s.skipped_idle_ticks;
++	uint32_t total_ticks = s.total_ticks;
++#else
++	uint32_t tick_cyc = 0, throttle = 0, promotions = 0;
++	uint32_t prewarp = 0, idle_skip = 0, total_ticks = 0;
++#endif
++
++	printk("\n--- METRICS [%s] ---\n", BUILD_LABEL);
++	printk("M1 imu_overruns=%u ppg_overruns=%u gatt_overruns=%u\n",
++	       imu_overruns, ppg_overruns, gatt_overruns);
++	printk("M2 fusion_lat_us p50=%u p99=%u max=%u (n=%u)\n",
++	       fusion_p50, fusion_p99, fusion_max, fusion_lat.count);
++	printk("M2 hr_lat_us     p50=%u p99=%u max=%u (n=%u)\n",
++	       hr_p50, hr_p99, hr_max, hr_lat.count);
++	printk("M4 last_tick_cyc=%u\n", tick_cyc);
++	printk("WV ticks=%u promo=%u prewarp=%u throttle=%u idle_skip=%u\n",
++	       total_ticks, promotions, prewarp, throttle, idle_skip);
++	printk("CSV %s,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u\n",
++	       BUILD_LABEL, imu_overruns, ppg_overruns, gatt_overruns,
++	       fusion_p50, fusion_p99, hr_p50, hr_p99,
++	       tick_cyc, promotions, prewarp);
++	printk("BENCHMARK COMPLETE\n");
++	return 0;
++}
+diff --git a/samples/boards/apollo510b_evb/weaver_benchmark/stock.conf b/samples/boards/apollo510b_evb/weaver_benchmark/stock.conf
+new file mode 100644
+index 00000000000..bf918ace76a
+--- /dev/null
++++ b/samples/boards/apollo510b_evb/weaver_benchmark/stock.conf
+@@ -0,0 +1,5 @@
++# Stock-Zephyr baseline: disables the Weaver layer entirely.
++# Same workload, same priorities, no Weaver-side priority adjustment,
++# no pre-Warp guard, no fuzzy throttle. The benchmark prints
++# stock-equivalent metrics so reviewers can compare apples to apples.
++CONFIG_WEAVER_SCHED=n
+diff --git a/samples/boards/apollo510b_evb/weaver_wearable/CMakeLists.txt b/samples/boards/apollo510b_evb/weaver_wearable/CMakeLists.txt
+new file mode 100644
+index 00000000000..ff2cffe4cec
+--- /dev/null
++++ b/samples/boards/apollo510b_evb/weaver_wearable/CMakeLists.txt
+@@ -0,0 +1,8 @@
++# SPDX-License-Identifier: Apache-2.0
++
++cmake_minimum_required(VERSION 3.20.0)
++
++find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
++project(weaver_wearable_b)
++
++target_sources(app PRIVATE src/main.c)
+diff --git a/samples/boards/apollo510b_evb/weaver_wearable/README.rst b/samples/boards/apollo510b_evb/weaver_wearable/README.rst
+new file mode 100644
+index 00000000000..5639e4da9ba
+--- /dev/null
++++ b/samples/boards/apollo510b_evb/weaver_wearable/README.rst
+@@ -0,0 +1,62 @@
++.. zephyr:code-sample:: weaver_wearable_apollo510b
++   :name: Weaver Wearable on Apollo510 Blue EVB
++
++   Drives real wearable sensors via mikroBUS Click boards on the
++   Apollo510 Blue EVB at 96 MHz LP mode, scheduled by the Weaver
++   pressure-aware fixed-point dispatcher.
++
++Hardware
++********
++
++Required:
++
++* **Apollo510 Blue EVB** (``apollo510b_evb``) — has BLE + mikroBUS slot
++* **6DOF IMU 14 Click** (BMI270) — wired to mikroBUS slot 1 → IOM0/I2C0
++* **Heart Rate 4 Click** (MAX30101) — wired to mikroBUS slot 2 → IOM1/I2C1
++  (or move BMI270 to slot 2 if your EVB has only one mikroBUS)
++
++Optional:
++
++* **ap510_disp** display shield (CO5300 AMOLED 468x468 + CHSC5x touch)
++* Onboard BLE controller is used by the Zephyr Bluetooth host
++
++Building
++********
++
++.. zephyr-app-commands::
++   :zephyr-app: samples/boards/apollo510b_evb/weaver_wearable
++   :board: apollo510b_evb
++   :shield: ap510_disp
++   :goals: build flash
++
++Sample Output
++*************
++
++.. code-block:: console
++
++   Weaver wearable demo on Apollo510B EVB (LP @ 96 MHz, mikroBUS Click)
++   BMI270   ready: yes
++   MAX30101 ready: yes
++   [t= 500ms] sys_p=0x004210 throttle=0 next_warp=12 ticks=500 promo=18 clear=4 idle=0
++   ...
++   Weaver Wearable Demo Complete
++
++Predictive scheduling
++*********************
++
++Each sensor producer calls
++``weaver_set_buffer_fill_predictive_q16()`` instead of the plain
++setter. That function performs a one-step linear extrapolation
++(``next ~= fill + (fill - last_fill)``) so the dispatcher acts on the
++buffer's predicted state next tick rather than its current state.
++This is the "Predictive" half of "Predictive and Pressure-Aware" —
++implemented in 6 cycles of integer arithmetic instead of an ML
++inference path.
++
++Single-mikroBUS-slot variant
++****************************
++
++If your EVB only has one mikroBUS slot, populate it with the BMI270
++click and edit ``boards/apollo510b_evb.overlay``: remove the ``&iom1``
++block. The PPG pipeline becomes inactive but the scheduler still
++demonstrates Warp/Weft handoff with IMU traffic.
+diff --git a/samples/boards/apollo510b_evb/weaver_wearable/boards/apollo510b_evb.overlay b/samples/boards/apollo510b_evb/weaver_wearable/boards/apollo510b_evb.overlay
+new file mode 100644
+index 00000000000..733c24cd394
+--- /dev/null
++++ b/samples/boards/apollo510b_evb/weaver_wearable/boards/apollo510b_evb.overlay
+@@ -0,0 +1,69 @@
++/*
++ * Copyright (c) 2026 Ambiq Micro, Inc.
++ *
++ * SPDX-License-Identifier: Apache-2.0
++ *
++ * Apollo510 Blue EVB overlay for the Weaver wearable demo.
++ *
++ * Wiring assumptions:
++ *   mikroBUS slot 1 -> 6DOF IMU 14 Click   (BMI270)  on IOM0 / I2C0
++ *   mikroBUS slot 2 -> Heart Rate 4 Click  (MAX30101) on IOM1 / I2C1
++ *
++ * If the EVB exposes a single mikroBUS slot, populate it with the
++ * BMI270 click and remove the &iom1 / max30101 block below. The
++ * scheduler logic is identical; the demo just won't drive the PPG
++ * pipeline.
++ *
++ * The display is provided by the ap510_disp shield (MIPI-DSI AMOLED
++ * + CHSC5x touch on iom2/i2c2). BLE is on iom6/spi6 from the board
++ * DTS.
++ */
++
++&iom0 {
++	cmdq-buffer-location = "SRAM_NO_CACHE";
++	cmdq-buffer-size = <256>;
++
++	i2c0: i2c {
++		pinctrl-0 = <&i2c0_default>;
++		pinctrl-names = "default";
++		clock-frequency = <I2C_BITRATE_FAST>;
++		status = "okay";
++
++		bmi270@68 {
++			compatible = "bosch,bmi270-i2c";
++			reg = <0x68>;
++			label = "BMI270";
++			status = "okay";
++		};
++	};
++};
++
++&iom1 {
++	cmdq-buffer-location = "SRAM_NO_CACHE";
++	cmdq-buffer-size = <256>;
++
++	i2c1: i2c {
++		pinctrl-0 = <&i2c1_default>;
++		pinctrl-names = "default";
++		clock-frequency = <I2C_BITRATE_FAST>;
++		status = "okay";
++
++		max30101@57 {
++			compatible = "maxim,max30101";
++			reg = <0x57>;
++			label = "MAX30101";
++			status = "okay";
++
++			/* Conservative defaults; tune for your wearable. */
++			fifo = <0x4f>;
++			smp-ave = "1";
++			fifo-rollover-en;
++			mode = "multi-led";
++			slot1 = "red";
++			slot2 = "ir";
++			adc-rge = "16384";
++			sr = "100";
++			led-pa = [02 02 00 00];
++		};
++	};
++};
+diff --git a/samples/boards/apollo510b_evb/weaver_wearable/prj.conf b/samples/boards/apollo510b_evb/weaver_wearable/prj.conf
+new file mode 100644
+index 00000000000..9e5a1cc5b4a
+--- /dev/null
++++ b/samples/boards/apollo510b_evb/weaver_wearable/prj.conf
+@@ -0,0 +1,43 @@
++# Weaver wearable on Apollo510 Blue EVB at 96 MHz LP mode.
++# Real sensors via mikroBUS Click boards: BMI270 (IMU) + MAX30101 (PPG).
++# BLE on iom6/spi6 (built into board DTS).
++# Display via ap510_disp shield (built-in option).
++
++# --- Weaver scheduler ---
++CONFIG_WEAVER_SCHED=y
++CONFIG_WEAVER_WEARABLE_PRESET=y
++
++# --- Sensor API ---
++CONFIG_I2C=y
++CONFIG_SENSOR=y
++CONFIG_BMI270=y
++CONFIG_MAX30101=y
++
++# --- BLE host stack (optional, demo registers GATT TX as a Weft) ---
++CONFIG_BT=y
++CONFIG_BT_PERIPHERAL=y
++CONFIG_BT_DEVICE_NAME="Weaver Wearable"
++CONFIG_BT_DIS=y
++
++# --- Console / logging ---
++CONFIG_LOG=y
++CONFIG_LOG_MODE_MINIMAL=y
++CONFIG_THREAD_NAME=y
++CONFIG_THREAD_RUNTIME_STATS=y
++
++CONFIG_MAIN_STACK_SIZE=4096
++CONFIG_HEAP_MEM_POOL_SIZE=4096
++
++# --- 1 ms tick for fine-grained pre-warp guard timing ---
++CONFIG_SYS_CLOCK_TICKS_PER_SEC=1000
++
++# --- Single core M55 ---
++CONFIG_MP_MAX_NUM_CPUS=1
++
++# --- Power management for wearable battery life ---
++CONFIG_PM=y
++CONFIG_PM_DEVICE=y
++CONFIG_PM_DEVICE_RUNTIME=y
++
++# --- On-target dispatch-cycle measurement (DWT cycle counter) ---
++CONFIG_WEAVER_TIMING=y
+diff --git a/samples/boards/apollo510b_evb/weaver_wearable/sample.yaml b/samples/boards/apollo510b_evb/weaver_wearable/sample.yaml
+new file mode 100644
+index 00000000000..78267874e7b
+--- /dev/null
++++ b/samples/boards/apollo510b_evb/weaver_wearable/sample.yaml
+@@ -0,0 +1,23 @@
++sample:
++  description: Weaver scheduler driving real wearable sensors (BMI270 IMU +
++    MAX30101 PPG) via MikroElektronika Click boards on the Apollo510 Blue EVB.
++  name: Weaver Wearable (Apollo510B + Click)
++common:
++  tags:
++    - kernel
++    - weaver
++    - wearable
++    - sensor
++  harness: console
++  harness_config:
++    type: one_line
++    regex:
++      - "Weaver Wearable Demo Complete"
++tests:
++  sample.kernel.weaver_wearable.apollo510b:
++    platform_allow:
++      - apollo510b_evb
++    integration_platforms:
++      - apollo510b_evb
++    extra_args:
++      - SHIELD=ap510_disp
+diff --git a/samples/boards/apollo510b_evb/weaver_wearable/src/main.c b/samples/boards/apollo510b_evb/weaver_wearable/src/main.c
+new file mode 100644
+index 00000000000..7a752f87f7f
+--- /dev/null
++++ b/samples/boards/apollo510b_evb/weaver_wearable/src/main.c
+@@ -0,0 +1,286 @@
++/*
++ * Copyright (c) 2026 Ambiq Micro, Inc.
++ *
++ * SPDX-License-Identifier: Apache-2.0
++ *
++ * Weaver wearable demo on Apollo510 Blue EVB at 96 MHz LP mode using
++ * real sensors via mikroBUS Click boards:
++ *
++ *   IOM0 / I2C0  ->  6DOF IMU 14 Click   (BMI270)  @ 0x68
++ *   IOM1 / I2C1  ->  Heart Rate 4 Click  (MAX30101) @ 0x57
++ *   IOM6 / SPI6  ->  BLE controller (built into apollo510b_evb DTS)
++ *   ap510_disp shield -> AMOLED + touch
++ *
++ * Warp threads:
++ *   - IMU sample thread:  reads BMI270 at 50 Hz (period 20 ms)
++ *   - PPG sample thread:  reads MAX30101 at 25 Hz (period 40 ms)
++ *   - BLE LL connection event handler (Zephyr Bluetooth host owns this)
++ *
++ * Weft threads (compete via Weaver pressure):
++ *   - sensor_fusion: consumes IMU samples, runs step counter
++ *   - hr_algorithm:  consumes PPG samples, runs HR estimator
++ *   - gatt_tx:       drains GATT notification ring
++ *   - display:       updates AMOLED watch face on change
++ *   - nvm_logger:    persists hourly summaries
++ *
++ * Each producer calls weaver_set_buffer_fill_predictive_q16() so the
++ * scheduler reacts to where the FIFO will be next tick, not where it
++ * is now. That is the "Predictive" half of the Weaver design and
++ * costs ~6 cycles per call. No ML, no FPU.
++ */
++
++#include <zephyr/kernel.h>
++#include <zephyr/kernel/weaver_sched.h>
++#include <zephyr/device.h>
++#include <zephyr/drivers/sensor.h>
++#include <zephyr/sys/printk.h>
++#include <zephyr/logging/log.h>
++
++LOG_MODULE_REGISTER(weaver_wearable, LOG_LEVEL_INF);
++
++#define IMU_PERIOD_MS  20    /* 50 Hz */
++#define PPG_PERIOD_MS  40    /* 25 Hz */
++#define DEMO_DURATION_MS 5000
++
++#define IMU_PRIO        3
++#define PPG_PRIO        4
++#define FUSION_PRIO     8
++#define HR_PRIO         8
++#define GATT_TX_PRIO    9
++#define DISPLAY_PRIO    11
++#define NVM_PRIO        12
++
++/* IMU FIFO holds 6 axes * N samples; we model the high-water mark of a
++ * 32-sample software ring as 1.0 in Q16.16. */
++#define FIFO_SAMPLES 32
++
++struct ring_sim {
++	atomic_t depth;
++};
++
++static struct ring_sim imu_ring  = ATOMIC_INIT(0);
++static struct ring_sim ppg_ring  = ATOMIC_INIT(0);
++static struct ring_sim gatt_ring = ATOMIC_INIT(0);
++
++static const struct device *const bmi270_dev   = DEVICE_DT_GET_ANY(bosch_bmi270_i2c);
++static const struct device *const max30101_dev = DEVICE_DT_GET_ANY(maxim_max30101);
++
++#define STACK_SIZE 2048
++
++static K_THREAD_STACK_DEFINE(s_imu,    STACK_SIZE);
++static K_THREAD_STACK_DEFINE(s_ppg,    STACK_SIZE);
++static K_THREAD_STACK_DEFINE(s_fusion, STACK_SIZE);
++static K_THREAD_STACK_DEFINE(s_hr,     STACK_SIZE);
++static K_THREAD_STACK_DEFINE(s_gatt,   STACK_SIZE);
++static K_THREAD_STACK_DEFINE(s_disp,   STACK_SIZE);
++static K_THREAD_STACK_DEFINE(s_nvm,    STACK_SIZE);
++
++static struct k_thread t_imu, t_ppg, t_fusion, t_hr, t_gatt, t_disp, t_nvm;
++
++static struct weaver_thread_data wd_imu, wd_ppg, wd_fusion, wd_hr,
++				 wd_gatt, wd_disp, wd_nvm;
++
++static inline uint32_t depth_to_q16(int depth)
++{
++	if (depth <= 0) {
++		return 0;
++	}
++	if (depth >= FIFO_SAMPLES) {
++		return WEAVER_Q16_ONE;
++	}
++	return ((uint32_t)depth * WEAVER_Q16_ONE) / FIFO_SAMPLES;
++}
++
++/* ---------- Warp threads ---------- */
++
++static void imu_sample_fn(void *a, void *b, void *c)
++{
++	ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
++
++	if (!device_is_ready(bmi270_dev)) {
++		LOG_WRN("BMI270 not ready; IMU thread idling");
++	}
++
++	while (1) {
++		if (device_is_ready(bmi270_dev)) {
++			(void)sensor_sample_fetch(bmi270_dev);
++			/* Real driver would push 6 axes into a ring buffer
++			 * here. We model the FIFO as a counter. */
++			int d = atomic_inc(&imu_ring.depth) + 1;
++			if (d > FIFO_SAMPLES) {
++				atomic_set(&imu_ring.depth, FIFO_SAMPLES);
++			}
++			weaver_set_buffer_fill_predictive_q16(
++				&wd_fusion, depth_to_q16(d));
++		}
++		k_sleep(K_MSEC(IMU_PERIOD_MS));
++	}
++}
++
++static void ppg_sample_fn(void *a, void *b, void *c)
++{
++	ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
++
++	if (!device_is_ready(max30101_dev)) {
++		LOG_WRN("MAX30101 not ready; PPG thread idling");
++	}
++
++	while (1) {
++		if (device_is_ready(max30101_dev)) {
++			(void)sensor_sample_fetch(max30101_dev);
++			int d = atomic_inc(&ppg_ring.depth) + 1;
++			if (d > FIFO_SAMPLES) {
++				atomic_set(&ppg_ring.depth, FIFO_SAMPLES);
++			}
++			weaver_set_buffer_fill_predictive_q16(
++				&wd_hr, depth_to_q16(d));
++		}
++		k_sleep(K_MSEC(PPG_PERIOD_MS));
++	}
++}
++
++/* ---------- Weft consumers ---------- */
++
++static void fusion_fn(void *a, void *b, void *c)
++{
++	ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
++	while (1) {
++		int d = atomic_get(&imu_ring.depth);
++		if (d > 0) {
++			/* Drain a batch; real fusion would do orientation,
++			 * step count, gesture detection. */
++			int new_d = MAX(0, d - 8);
++			atomic_set(&imu_ring.depth, new_d);
++			weaver_set_buffer_fill_predictive_q16(
++				&wd_fusion, depth_to_q16(new_d));
++		}
++		k_sleep(K_MSEC(5));
++	}
++}
++
++static void hr_fn(void *a, void *b, void *c)
++{
++	ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
++	while (1) {
++		int d = atomic_get(&ppg_ring.depth);
++		if (d > 0) {
++			int new_d = MAX(0, d - 4);
++			atomic_set(&ppg_ring.depth, new_d);
++			weaver_set_buffer_fill_predictive_q16(
++				&wd_hr, depth_to_q16(new_d));
++		}
++		k_sleep(K_MSEC(10));
++	}
++}
++
++static void gatt_tx_fn(void *a, void *b, void *c)
++{
++	ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
++	while (1) {
++		/* Mock: producer side bumps the ring, consumer drains. */
++		int d = atomic_inc(&gatt_ring.depth) + 1;
++		if (d > FIFO_SAMPLES) {
++			atomic_set(&gatt_ring.depth, FIFO_SAMPLES);
++		}
++		weaver_set_buffer_fill_predictive_q16(
++			&wd_gatt, depth_to_q16(d));
++
++		k_sleep(K_MSEC(15));
++
++		int new_d = MAX(0, atomic_get(&gatt_ring.depth) - 3);
++		atomic_set(&gatt_ring.depth, new_d);
++		weaver_set_buffer_fill_predictive_q16(
++			&wd_gatt, depth_to_q16(new_d));
++	}
++}
++
++static void display_fn(void *a, void *b, void *c)
++{
++	ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
++	while (1) {
++		k_sleep(K_MSEC(33));   /* 30 fps watch face */
++	}
++}
++
++static void nvm_fn(void *a, void *b, void *c)
++{
++	ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
++	while (1) {
++		k_sleep(K_MSEC(1000));
++	}
++}
++
++/* ---------- Tick driver ---------- */
++
++static void tick_handler(struct k_timer *t) { ARG_UNUSED(t); weaver_tick(); }
++static K_TIMER_DEFINE(weaver_timer, tick_handler, NULL);
++
++int main(void)
++{
++	printk("Weaver wearable demo on Apollo510B EVB (LP @ 96 MHz, mikroBUS Click)\n");
++	printk("BMI270  ready: %s\n",
++	       (bmi270_dev   && device_is_ready(bmi270_dev))   ? "yes" : "no");
++	printk("MAX30101 ready: %s\n",
++	       (max30101_dev && device_is_ready(max30101_dev)) ? "yes" : "no");
++
++	k_thread_create(&t_imu,    s_imu,    STACK_SIZE, imu_sample_fn,
++			NULL, NULL, NULL, IMU_PRIO,     0, K_NO_WAIT);
++	k_thread_create(&t_ppg,    s_ppg,    STACK_SIZE, ppg_sample_fn,
++			NULL, NULL, NULL, PPG_PRIO,     0, K_NO_WAIT);
++	k_thread_create(&t_fusion, s_fusion, STACK_SIZE, fusion_fn,
++			NULL, NULL, NULL, FUSION_PRIO,  0, K_NO_WAIT);
++	k_thread_create(&t_hr,     s_hr,     STACK_SIZE, hr_fn,
++			NULL, NULL, NULL, HR_PRIO,      0, K_NO_WAIT);
++	k_thread_create(&t_gatt,   s_gatt,   STACK_SIZE, gatt_tx_fn,
++			NULL, NULL, NULL, GATT_TX_PRIO, 0, K_NO_WAIT);
++	k_thread_create(&t_disp,   s_disp,   STACK_SIZE, display_fn,
++			NULL, NULL, NULL, DISPLAY_PRIO, 0, K_NO_WAIT);
++	k_thread_create(&t_nvm,    s_nvm,    STACK_SIZE, nvm_fn,
++			NULL, NULL, NULL, NVM_PRIO,     0, K_NO_WAIT);
++
++	weaver_register(&wd_imu, &t_imu, WEAVER_TO_Q16(15), true);
++	weaver_set_warp_deadline(&wd_imu, IMU_PERIOD_MS);
++
++	weaver_register(&wd_ppg, &t_ppg, WEAVER_TO_Q16(15), true);
++	weaver_set_warp_deadline(&wd_ppg, PPG_PERIOD_MS);
++
++	weaver_register(&wd_fusion, &t_fusion, WEAVER_TO_Q16(8), false);
++	weaver_register(&wd_hr,     &t_hr,     WEAVER_TO_Q16(8), false);
++	weaver_register(&wd_gatt,   &t_gatt,   WEAVER_TO_Q16(7), false);
++	weaver_register(&wd_disp,   &t_disp,   WEAVER_TO_Q16(4), false);
++	weaver_register(&wd_nvm,    &t_nvm,    WEAVER_TO_Q16(2), false);
++
++	k_timer_start(&weaver_timer, K_MSEC(1), K_MSEC(1));
++
++	uint32_t t0 = k_uptime_get_32();
++	while ((k_uptime_get_32() - t0) < DEMO_DURATION_MS) {
++		k_sleep(K_MSEC(500));
++
++		struct weaver_stats s;
++		weaver_get_stats(&s);
++
++		printk("[t=%4ums] sys_p=0x%06x throttle=%d level=%3u next_warp=%u "
++		       "ticks=%u promo=%u clear=%u idle=%u tick_cyc=%u\n",
++		       k_uptime_get_32() - t0,
++		       weaver_system_pressure(),
++		       weaver_should_throttle() ? 1 : 0,
++		       weaver_throttle_level(),
++		       weaver_ticks_to_next_warp(),
++		       s.total_ticks, s.weft_promotions,
++		       s.pre_warp_clears, s.skipped_idle_ticks,
++		       weaver_get_last_tick_cycles());
++	}
++
++	k_timer_stop(&weaver_timer);
++
++	weaver_unregister(&wd_imu);
++	weaver_unregister(&wd_ppg);
++	weaver_unregister(&wd_fusion);
++	weaver_unregister(&wd_hr);
++	weaver_unregister(&wd_gatt);
++	weaver_unregister(&wd_disp);
++	weaver_unregister(&wd_nvm);
++
++	printk("Weaver Wearable Demo Complete\n");
++	return 0;
++}
 diff --git a/samples/kernel/weaver_sched/CMakeLists.txt b/samples/kernel/weaver_sched/CMakeLists.txt
 new file mode 100644
 index 00000000000..6e9aef0fd93

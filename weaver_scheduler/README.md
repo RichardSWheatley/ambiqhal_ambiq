@@ -81,4 +81,6 @@ true, signaling non-essential producers to slow down.
 | `FUZZY_THROTTLE.md` | TSK fuzzy + EMA throttle controller: design, math, why it's strictly an improvement |
 | `ML_AND_FUZZY_LOGIC.md` | Why we kept the dispatcher hot path linear and where heavier ML belongs |
 | `MVE_PATHS.md` | Three pressure-batch paths (scalar / hybrid / full MVE), break-even analysis, FP-save-tax explanation |
+| `RFC.md` | **Peer-review RFC**: rationale, problem statement, goals/non-goals, alternatives considered, **measurables and acceptance criteria (M1–M7)**, risk analysis, implementation plan, ballot |
 | `tests/kernel/weaver_paths_equiv/` | Host-buildable test proving all three paths produce bit-identical results (10000 fuzz trials) |
+| `samples/boards/apollo510b_evb/weaver_benchmark/` | Canonical RFC §7.1 workload. Build with `stock.conf` / default / `hybrid.conf` / `mve.conf`. `scripts/bench.sh` automates all four runs and prints a comparison table. |
