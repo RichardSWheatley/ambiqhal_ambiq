@@ -80,3 +80,5 @@ true, signaling non-essential producers to slow down.
 | `DECISIONS.md` | All assumptions and tuning rationale for the wearable target |
 | `FUZZY_THROTTLE.md` | TSK fuzzy + EMA throttle controller: design, math, why it's strictly an improvement |
 | `ML_AND_FUZZY_LOGIC.md` | Why we kept the dispatcher hot path linear and where heavier ML belongs |
+| `MVE_PATHS.md` | Three pressure-batch paths (scalar / hybrid / full MVE), break-even analysis, FP-save-tax explanation |
+| `tests/kernel/weaver_paths_equiv/` | Host-buildable test proving all three paths produce bit-identical results (10000 fuzz trials) |

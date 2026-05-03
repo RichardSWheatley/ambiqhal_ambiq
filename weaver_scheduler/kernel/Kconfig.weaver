@@ -72,17 +72,54 @@ config WEAVER_POWER_AWARE
 	  zero pressure. This prevents priority churn from blocking
 	  deepsleep entry on battery-powered designs.
 
-config WEAVER_USE_MVE
-	bool "Use Helium MVE intrinsics for the pressure inner loop"
-	depends on CPU_CORTEX_M55 || CPU_HAS_MVE
-	default n
+choice
+	prompt "Pressure-batch implementation"
+	default WEAVER_BATCH_SCALAR
 	help
-	  Vectorize weaver_calculate_pressure_batch() using Helium MVE so
-	  four threads' pressures are computed in parallel. Worth enabling
-	  only when WEAVER_MAX_THREADS exceeds about 32, because vector
-	  register save/restore on every preemption (~50 cycles) eats the
-	  per-tick savings at low thread counts. Default off; integer path
-	  is faster for typical wearable workloads.
+	  Selects which implementation of the per-tick pressure batch is
+	  compiled in. All three produce identical numeric results; the
+	  tradeoff is purely cycle count vs. FP/MVE context-save cost on
+	  preemption.
+
+config WEAVER_BATCH_SCALAR
+	bool "Pure scalar (no MVE)"
+	help
+	  Integer ALU only. Never touches FPU/MVE registers, so the lazy
+	  floating-point context save mechanism is never armed by the
+	  scheduler. Best choice when registered thread count <= ~16, or
+	  when other parts of the system avoid FP/MVE on the preempted
+	  threads. ~12 cycles per thread on Cortex-M55.
+
+config WEAVER_BATCH_HYBRID
+	bool "Hybrid MVE (vector load/store, scalar multiply)"
+	depends on CPU_CORTEX_M55 || CPU_HAS_MVE
+	help
+	  Loads/stores 4 lanes via vld1q_u32 / vst1q_u32 and uses
+	  vqaddq_u32 for saturating add, but the Q16.16 multiply is still
+	  per-lane scalar. Useful for measuring how much of the MVE cost
+	  is the vector context-save vs. the multiply itself. Touches
+	  the MVE register file, so any later preemption pays the
+	  ~50-cycle vector context-save.
+
+config WEAVER_BATCH_MVE
+	bool "Full MVE (true 4-wide multiply)"
+	depends on CPU_CORTEX_M55 || CPU_HAS_MVE
+	help
+	  Vectorizes the 32x32 -> 64 Q16 multiply via vmullbq_int_u32 +
+	  vmulltq_int_u32 + vshrnbq/vshrntq. Roughly 4 MVE instructions
+	  for 4 lanes of Q16 multiply. Break-even with the scalar path
+	  is around 32 registered threads on Apollo510, because the
+	  per-preemption MVE context save costs about 50 cycles. Use only
+	  when WEAVER_MAX_THREADS is large or when the rest of the system
+	  already pays the MVE save cost.
+
+endchoice
+
+config WEAVER_USE_MVE
+	bool
+	default y if WEAVER_BATCH_HYBRID || WEAVER_BATCH_MVE
+	help
+	  Internal: set when any MVE-touching variant is selected.
 
 config WEAVER_TIMING
 	bool "Measure dispatcher cycles via DWT cycle counter"

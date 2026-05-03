@@ -151,53 +151,198 @@ uint32_t weaver_calculate_pressure(const struct weaver_thread_data *t)
 	return saturate_add(saturate_add(p_urgency, p_density), p_aging);
 }
 
-#ifdef CONFIG_WEAVER_USE_MVE
 /*
- * MVE batch: compute pressures for up to 4 Weft threads at once.
- * 32-bit lanes (uint32x4_t). Warp threads are still handled scalar
- * because the saturating-to-0xFFFFFFFF branch breaks the SIMD pattern.
- *
- * Used only when CONFIG_WEAVER_MAX_THREADS > 32 makes the vector
- * context-save cost worthwhile. Same numeric semantics as the scalar
- * path; verified equivalent in test/weaver_mve_equiv.c (host build).
+ * Pull the three Q16 inputs out of a thread record into parallel arrays.
+ * Warp lanes get zero inputs; the post-batch fixup overrides them to
+ * WEAVER_PRESSURE_WARP. NULL or !in_use slots also get zero inputs and
+ * a zero output, which is correct (no pressure, never wins dispatch).
  */
-static inline void mve_pressure_batch4(const uint32_t prio[4],
-				       const uint32_t fill[4],
-				       const uint32_t wait[4],
-				       uint32_t out[4])
+static inline void gather_inputs(const struct weaver_thread_data *wd,
+				 uint32_t *prio, uint32_t *fill, uint32_t *aged)
 {
-	uint32x4_t v_prio = vld1q_u32(prio);
-	uint32x4_t v_fill = vld1q_u32(fill);
-	uint32x4_t v_wait = vld1q_u32(wait);
+	if (wd == NULL || !wd->in_use || wd->is_warp) {
+		*prio = 0;
+		*fill = 0;
+		*aged = 0;
+		return;
+	}
+	*prio = wd->priority_q16;
+	*fill = wd->buffer_fill_q16;
+	uint32_t w = MIN(wd->wait_ticks, WEAVER_WAIT_TICKS_MAX);
+	*aged = WEAVER_TO_Q16(w);
+}
 
-	uint32x4_t v_w_u = vdupq_n_u32(weaver.w_urgency);
-	uint32x4_t v_w_d = vdupq_n_u32(weaver.w_density);
-	uint32x4_t v_w_a = vdupq_n_u32(weaver.w_aging);
+/*
+ * Scalar Q16.16 pressure batch. Always available. Used:
+ *   - on every build when CONFIG_WEAVER_USE_MVE=n
+ *   - on the tail (count not divisible by 4) when MVE=y
+ *   - by the host-side equivalence harness
+ */
+static void scalar_pressure_batch(const struct weaver_thread_data * const snap[],
+				  uint32_t pressures[],
+				  size_t n)
+{
+	for (size_t i = 0; i < n; i++) {
+		const struct weaver_thread_data *wd = snap[i];
+		if (wd == NULL || !wd->in_use) {
+			pressures[i] = 0;
+		} else if (wd->is_warp) {
+			pressures[i] = WEAVER_PRESSURE_WARP;
+		} else {
+			pressures[i] = weaver_calculate_pressure(wd);
+		}
+	}
+}
 
-	/* Q16 multiplies: 64-bit intermediate then >>16. MVE has no
-	 * 32x32->64 widening multiply with shift; emulate per lane via
-	 * the high/low 16-bit unsigned multiply pair. For brevity we
-	 * fall back to per-lane 64-bit through a tmp; an optimized
-	 * version would use vmullbq_int_u32 + vmulltq_int_u32 + vshlcq.
-	 */
-	uint32_t pu[4], pd[4], pa[4];
-	for (int i = 0; i < 4; i++) {
-		pu[i] = WEAVER_Q16_MUL(prio[i], weaver.w_urgency);
-		pd[i] = WEAVER_Q16_MUL(fill[i], weaver.w_density);
-		uint32_t w = MIN(wait[i], WEAVER_WAIT_TICKS_MAX);
-		pa[i] = WEAVER_Q16_MUL(WEAVER_TO_Q16(w), weaver.w_aging);
+/*
+ * Helper: post-batch fixup. Replaces empty-slot lanes with 0 and
+ * Warp-thread lanes with WEAVER_PRESSURE_WARP. Shared by hybrid and
+ * full-MVE paths.
+ */
+static inline void fixup_warp_and_empty(const struct weaver_thread_data * const snap[],
+					uint32_t pressures[],
+					size_t base, size_t count)
+{
+	for (size_t j = 0; j < count; j++) {
+		const struct weaver_thread_data *wd = snap[base + j];
+		if (wd == NULL || !wd->in_use) {
+			pressures[base + j] = 0;
+		} else if (wd->is_warp) {
+			pressures[base + j] = WEAVER_PRESSURE_WARP;
+		}
+	}
+}
+
+#ifdef CONFIG_WEAVER_BATCH_HYBRID
+/*
+ * Hybrid path: vector loads/stores around scalar multiplies.
+ *
+ * Touches the MVE register file (via vld1q/vst1q/vqaddq) so the lazy
+ * floating-point context save mechanism is armed. The Q16 multiply
+ * itself runs scalar, lane-by-lane, on the integer ALU.
+ *
+ * Useful for measurement: subtracting hybrid cycles from full MVE
+ * cycles isolates the cost of the vector multiply alone, while
+ * subtracting scalar cycles from hybrid isolates the cost of the
+ * vector loads/stores plus saturating add.
+ */
+static void hybrid_pressure_batch(const struct weaver_thread_data * const snap[],
+				  uint32_t pressures[],
+				  size_t n)
+{
+	size_t i = 0;
+	for (; i + 4 <= n; i += 4) {
+		uint32_t prio[4], fill[4], aged[4];
+		uint32_t pu[4], pd[4], pa[4];
+
+		for (size_t j = 0; j < 4; j++) {
+			gather_inputs(snap[i + j], &prio[j], &fill[j], &aged[j]);
+		}
+
+		/* Scalar Q16 multiplies (still on the integer ALU). */
+		for (size_t j = 0; j < 4; j++) {
+			pu[j] = WEAVER_Q16_MUL(prio[j], weaver.w_urgency);
+			pd[j] = WEAVER_Q16_MUL(fill[j], weaver.w_density);
+			pa[j] = WEAVER_Q16_MUL(aged[j], weaver.w_aging);
+		}
+
+		/* Vector loads + saturating add + vector store. */
+		uint32x4_t v_pu = vld1q_u32(pu);
+		uint32x4_t v_pd = vld1q_u32(pd);
+		uint32x4_t v_pa = vld1q_u32(pa);
+		uint32x4_t v_sum = vqaddq_u32(vqaddq_u32(v_pu, v_pd), v_pa);
+		vst1q_u32(&pressures[i], v_sum);
+
+		fixup_warp_and_empty(snap, pressures, i, 4);
 	}
 
-	uint32x4_t v_pu = vld1q_u32(pu);
-	uint32x4_t v_pd = vld1q_u32(pd);
-	uint32x4_t v_pa = vld1q_u32(pa);
-
-	uint32x4_t v_sum = vqaddq_u32(vqaddq_u32(v_pu, v_pd), v_pa);
-	vst1q_u32(out, v_sum);
-	(void)v_w_u; (void)v_w_d; (void)v_w_a;  /* Reserved for the
-						   fully-vectorized variant. */
+	if (i < n) {
+		scalar_pressure_batch(&snap[i], &pressures[i], n - i);
+	}
 }
-#endif /* CONFIG_WEAVER_USE_MVE */
+#endif /* CONFIG_WEAVER_BATCH_HYBRID */
+
+#ifdef CONFIG_WEAVER_BATCH_MVE
+/*
+ * Full MVE path: true 4-wide Q16.16 multiply.
+ *
+ * a, b are uint32x4_t. We need (a * b) >> 16 per lane with the full
+ * 32x32 -> 64 intermediate (the inputs span up to 32 bits, e.g.
+ * WEAVER_TO_Q16(WAIT_TICKS_MAX) = 0xFFFF0000).
+ *
+ * MVE provides:
+ *   vmullbq_int_u32(a, b) -> u64x2 from the EVEN-indexed u32 lanes
+ *   vmulltq_int_u32(a, b) -> u64x2 from the ODD-indexed u32 lanes
+ *   vshrnbq_n_u64(inactive, src, imm) shifts u64x2 right by imm and
+ *                                     narrows to u32x4 even lanes
+ *   vshrntq_n_u64(inactive, src, imm) shifts u64x2 right by imm and
+ *                                     narrows to u32x4 odd lanes
+ *
+ * Result: 4 lanes of (a * b) >> 16 in 4 MVE instructions.
+ */
+static inline uint32x4_t mve_q16_mul(uint32x4_t a, uint32x4_t b)
+{
+	uint64x2_t lo = vmullbq_int_u32(a, b);
+	uint64x2_t hi = vmulltq_int_u32(a, b);
+	uint32x4_t out = vshrnbq_n_u64(vuninitializedq_u32(), lo,
+				       WEAVER_Q16_SHIFT);
+	out = vshrntq_n_u64(out, hi, WEAVER_Q16_SHIFT);
+	return out;
+}
+
+static void mve_pressure_batch(const struct weaver_thread_data * const snap[],
+			       uint32_t pressures[],
+			       size_t n)
+{
+	const uint32x4_t v_w_u = vdupq_n_u32(weaver.w_urgency);
+	const uint32x4_t v_w_d = vdupq_n_u32(weaver.w_density);
+	const uint32x4_t v_w_a = vdupq_n_u32(weaver.w_aging);
+
+	size_t i = 0;
+	for (; i + 4 <= n; i += 4) {
+		uint32_t prio[4], fill[4], aged[4];
+
+		for (size_t j = 0; j < 4; j++) {
+			gather_inputs(snap[i + j], &prio[j], &fill[j], &aged[j]);
+		}
+
+		uint32x4_t v_prio = vld1q_u32(prio);
+		uint32x4_t v_fill = vld1q_u32(fill);
+		uint32x4_t v_aged = vld1q_u32(aged);
+
+		uint32x4_t v_pu = mve_q16_mul(v_prio, v_w_u);
+		uint32x4_t v_pd = mve_q16_mul(v_fill, v_w_d);
+		uint32x4_t v_pa = mve_q16_mul(v_aged, v_w_a);
+
+		uint32x4_t v_sum = vqaddq_u32(vqaddq_u32(v_pu, v_pd), v_pa);
+		vst1q_u32(&pressures[i], v_sum);
+
+		fixup_warp_and_empty(snap, pressures, i, 4);
+	}
+
+	if (i < n) {
+		scalar_pressure_batch(&snap[i], &pressures[i], n - i);
+	}
+}
+#endif /* CONFIG_WEAVER_BATCH_MVE */
+
+/*
+ * Single dispatch entry. The selected variant is fixed at build time
+ * by CONFIG_WEAVER_BATCH_*, so this function compiles to a direct call
+ * with no runtime dispatch overhead.
+ */
+static void compute_pressure_batch(const struct weaver_thread_data * const snap[],
+				   uint32_t pressures[],
+				   size_t n)
+{
+#if   defined(CONFIG_WEAVER_BATCH_MVE)
+	mve_pressure_batch(snap, pressures, n);
+#elif defined(CONFIG_WEAVER_BATCH_HYBRID)
+	hybrid_pressure_batch(snap, pressures, n);
+#else
+	scalar_pressure_batch(snap, pressures, n);
+#endif
+}
 
 int weaver_register(struct weaver_thread_data *wd, struct k_thread *thread,
 		    uint32_t priority_q16, bool is_warp)
@@ -329,6 +474,10 @@ void weaver_tick(void)
 	memcpy(snap, weaver.slots, sizeof(snap));
 	k_spin_unlock(&weaver.lock, key);
 
+	/* ---- Pass 1: aging + Warp deadline countdown.
+	 *      Pure scalar, mutates wd state. Cheap (~3 ops per slot). ----
+	 */
+	struct k_thread *current = k_current_get();
 	for (size_t i = 0; i < ARRAY_SIZE(snap); i++) {
 		struct weaver_thread_data *wd = snap[i];
 
@@ -336,16 +485,12 @@ void weaver_tick(void)
 			continue;
 		}
 
-		if (wd->thread == k_current_get()) {
+		if (wd->thread == current) {
 			wd->wait_ticks = 0;
 		} else if (wd->wait_ticks < WEAVER_WAIT_TICKS_MAX) {
 			wd->wait_ticks++;
 		}
 
-		/* Tick the Warp deadline countdown. When it reaches zero
-		 * the thread is "due"; we reset to one period and treat
-		 * remaining=0 (within guard) for the rest of this pass.
-		 */
 		if (wd->is_warp && wd->period_ticks > 0) {
 			if (wd->next_deadline_ticks == 0) {
 				wd->next_deadline_ticks = wd->period_ticks;
@@ -356,18 +501,36 @@ void weaver_tick(void)
 				min_warp_remaining = wd->next_deadline_ticks;
 			}
 		}
+	}
 
-		uint32_t p = weaver_calculate_pressure(wd);
+	/* ---- Pass 2: batch pressure computation.
+	 *      MVE-vectorized when CONFIG_WEAVER_USE_MVE=y, scalar otherwise.
+	 *      Both paths produce identical results; tested in
+	 *      test/weaver_mve_equiv.c on host. ----
+	 */
+	uint32_t pressures[CONFIG_WEAVER_MAX_THREADS];
+	compute_pressure_batch(
+		(const struct weaver_thread_data * const *)snap,
+		pressures, ARRAY_SIZE(snap));
 
-		if (!wd->is_warp) {
-			sys_pressure = saturate_add(sys_pressure, p);
-			if (p > 0) {
-				any_weft_pressure = true;
-			}
-			if (p > max_pressure) {
-				max_pressure = p;
-				winner = wd;
-			}
+	/* ---- Pass 3: dispatch decisions.
+	 *      Aggregate sys_pressure, find winning Weft, track activity. ----
+	 */
+	for (size_t i = 0; i < ARRAY_SIZE(snap); i++) {
+		struct weaver_thread_data *wd = snap[i];
+		uint32_t p = pressures[i];
+
+		if (wd == NULL || !wd->in_use || wd->is_warp) {
+			continue;
+		}
+
+		sys_pressure = saturate_add(sys_pressure, p);
+		if (p > 0) {
+			any_weft_pressure = true;
+		}
+		if (p > max_pressure) {
+			max_pressure = p;
+			winner = wd;
 		}
 	}
 

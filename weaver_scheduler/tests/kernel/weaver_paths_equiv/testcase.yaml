@@ -1,0 +1,10 @@
+tests:
+  kernel.weaver_paths_equiv:
+    tags: kernel weaver
+    integration_platforms:
+      - native_sim
+    harness: console
+    harness_config:
+      type: one_line
+      regex:
+        - "ALL THREE PATHS EQUIVALENT"
