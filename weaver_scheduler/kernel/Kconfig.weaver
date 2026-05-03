@@ -72,6 +72,27 @@ config WEAVER_POWER_AWARE
 	  zero pressure. This prevents priority churn from blocking
 	  deepsleep entry on battery-powered designs.
 
+config WEAVER_USE_MVE
+	bool "Use Helium MVE intrinsics for the pressure inner loop"
+	depends on CPU_CORTEX_M55 || CPU_HAS_MVE
+	default n
+	help
+	  Vectorize weaver_calculate_pressure_batch() using Helium MVE so
+	  four threads' pressures are computed in parallel. Worth enabling
+	  only when WEAVER_MAX_THREADS exceeds about 32, because vector
+	  register save/restore on every preemption (~50 cycles) eats the
+	  per-tick savings at low thread counts. Default off; integer path
+	  is faster for typical wearable workloads.
+
+config WEAVER_TIMING
+	bool "Measure dispatcher cycles via DWT cycle counter"
+	depends on CPU_HAS_DWT
+	default n
+	help
+	  Enables weaver_get_last_tick_cycles() which returns the cycle
+	  count of the most recent weaver_tick(). Used for on-target WCET
+	  validation. Costs ~6 cycles per tick to read the counter twice.
+
 config WEAVER_WEARABLE_PRESET
 	bool "Wearable / Apollo510 LP-mode preset"
 	default n

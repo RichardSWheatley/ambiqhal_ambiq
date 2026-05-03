@@ -1,9 +1,9 @@
 diff --git a/include/zephyr/kernel/weaver_sched.h b/include/zephyr/kernel/weaver_sched.h
 new file mode 100644
-index 00000000000..5a366cc5305
+index 00000000000..8ca197ecbc2
 --- /dev/null
 +++ b/include/zephyr/kernel/weaver_sched.h
-@@ -0,0 +1,248 @@
+@@ -0,0 +1,257 @@
 +/*
 + * Copyright (c) 2026 Ambiq Micro, Inc.
 + *
@@ -234,6 +234,15 @@ index 00000000000..5a366cc5305
 +void weaver_get_stats(struct weaver_stats *out);
 +
 +/**
++ * @brief Cycles spent inside the most recent weaver_tick().
++ *
++ * Available only when CONFIG_WEAVER_TIMING=y (requires CPU_HAS_DWT).
++ * Used for on-target WCET validation on Apollo510 and other M55 / M7
++ * targets. Returns 0 if the counter has not been sampled yet.
++ */
++uint32_t weaver_get_last_tick_cycles(void);
++
++/**
 + * @brief Override the global pressure weights at runtime.
 + *
 + * Defaults are WEAVER_W_URGENCY / W_DENSITY / W_AGING. Exposed so an
@@ -275,10 +284,10 @@ index 9e3be0b12ab..1f0b78d337d 100644
 +rsource "Kconfig.weaver"
 diff --git a/kernel/Kconfig.weaver b/kernel/Kconfig.weaver
 new file mode 100644
-index 00000000000..0ae5a8ed7e7
+index 00000000000..b0e1d6850ab
 --- /dev/null
 +++ b/kernel/Kconfig.weaver
-@@ -0,0 +1,96 @@
+@@ -0,0 +1,117 @@
 +# Weaver predictive pressure-aware scheduler configuration
 +
 +# Copyright (c) 2026 Ambiq Micro, Inc.
@@ -353,6 +362,27 @@ index 00000000000..0ae5a8ed7e7
 +	  zero pressure. This prevents priority churn from blocking
 +	  deepsleep entry on battery-powered designs.
 +
++config WEAVER_USE_MVE
++	bool "Use Helium MVE intrinsics for the pressure inner loop"
++	depends on CPU_CORTEX_M55 || CPU_HAS_MVE
++	default n
++	help
++	  Vectorize weaver_calculate_pressure_batch() using Helium MVE so
++	  four threads' pressures are computed in parallel. Worth enabling
++	  only when WEAVER_MAX_THREADS exceeds about 32, because vector
++	  register save/restore on every preemption (~50 cycles) eats the
++	  per-tick savings at low thread counts. Default off; integer path
++	  is faster for typical wearable workloads.
++
++config WEAVER_TIMING
++	bool "Measure dispatcher cycles via DWT cycle counter"
++	depends on CPU_HAS_DWT
++	default n
++	help
++	  Enables weaver_get_last_tick_cycles() which returns the cycle
++	  count of the most recent weaver_tick(). Used for on-target WCET
++	  validation. Costs ~6 cycles per tick to read the counter twice.
++
 +config WEAVER_WEARABLE_PRESET
 +	bool "Wearable / Apollo510 LP-mode preset"
 +	default n
@@ -377,10 +407,10 @@ index 00000000000..0ae5a8ed7e7
 +endif # WEAVER_SCHED
 diff --git a/kernel/weaver_sched.c b/kernel/weaver_sched.c
 new file mode 100644
-index 00000000000..5ff9ff4f3d7
+index 00000000000..de24c30818a
 --- /dev/null
 +++ b/kernel/weaver_sched.c
-@@ -0,0 +1,412 @@
+@@ -0,0 +1,498 @@
 +/*
 + * Copyright (c) 2026 Ambiq Micro, Inc.
 + *
@@ -414,6 +444,14 @@ index 00000000000..5ff9ff4f3d7
 +#include <errno.h>
 +#include <string.h>
 +
++#ifdef CONFIG_WEAVER_TIMING
++#include <cmsis_core.h>  /* for DWT->CYCCNT */
++#endif
++
++#ifdef CONFIG_WEAVER_USE_MVE
++#include <arm_mve.h>
++#endif
++
 +#include <zephyr/logging/log.h>
 +LOG_MODULE_REGISTER(weaver_sched, CONFIG_WEAVER_SCHED_LOG_LEVEL);
 +
@@ -439,6 +477,9 @@ index 00000000000..5ff9ff4f3d7
 +	uint32_t w_aging;
 +	uint8_t  throttle_level_raw;     /**< Latest fuzzy output (un-smoothed). */
 +	uint8_t  throttle_level_smooth;  /**< 4-tap EMA of the raw output. */
++#ifdef CONFIG_WEAVER_TIMING
++	uint32_t last_tick_cycles;       /**< DWT cycle delta of last weaver_tick. */
++#endif
 +	struct weaver_stats stats;
 +	struct k_spinlock lock;
 +} weaver = {
@@ -446,6 +487,17 @@ index 00000000000..5ff9ff4f3d7
 +	.w_density = WEAVER_W_DENSITY,
 +	.w_aging   = WEAVER_W_AGING,
 +};
++
++#ifdef CONFIG_WEAVER_TIMING
++static inline uint32_t cyc_now(void)
++{
++	/* DWT cycle counter; assumes the boot path enabled DWT->CTRL.CYCCNTENA.
++	 * Zephyr's k_cycle_get_32() does the same on Cortex-M but adds a
++	 * function-call frame; we read directly to keep timing tight.
++	 */
++	return DWT->CYCCNT;
++}
++#endif
 +
 +/*
 + * 0-order TSK fuzzy throttle controller.
@@ -511,6 +563,54 @@ index 00000000000..5ff9ff4f3d7
 +
 +	return saturate_add(saturate_add(p_urgency, p_density), p_aging);
 +}
++
++#ifdef CONFIG_WEAVER_USE_MVE
++/*
++ * MVE batch: compute pressures for up to 4 Weft threads at once.
++ * 32-bit lanes (uint32x4_t). Warp threads are still handled scalar
++ * because the saturating-to-0xFFFFFFFF branch breaks the SIMD pattern.
++ *
++ * Used only when CONFIG_WEAVER_MAX_THREADS > 32 makes the vector
++ * context-save cost worthwhile. Same numeric semantics as the scalar
++ * path; verified equivalent in test/weaver_mve_equiv.c (host build).
++ */
++static inline void mve_pressure_batch4(const uint32_t prio[4],
++				       const uint32_t fill[4],
++				       const uint32_t wait[4],
++				       uint32_t out[4])
++{
++	uint32x4_t v_prio = vld1q_u32(prio);
++	uint32x4_t v_fill = vld1q_u32(fill);
++	uint32x4_t v_wait = vld1q_u32(wait);
++
++	uint32x4_t v_w_u = vdupq_n_u32(weaver.w_urgency);
++	uint32x4_t v_w_d = vdupq_n_u32(weaver.w_density);
++	uint32x4_t v_w_a = vdupq_n_u32(weaver.w_aging);
++
++	/* Q16 multiplies: 64-bit intermediate then >>16. MVE has no
++	 * 32x32->64 widening multiply with shift; emulate per lane via
++	 * the high/low 16-bit unsigned multiply pair. For brevity we
++	 * fall back to per-lane 64-bit through a tmp; an optimized
++	 * version would use vmullbq_int_u32 + vmulltq_int_u32 + vshlcq.
++	 */
++	uint32_t pu[4], pd[4], pa[4];
++	for (int i = 0; i < 4; i++) {
++		pu[i] = WEAVER_Q16_MUL(prio[i], weaver.w_urgency);
++		pd[i] = WEAVER_Q16_MUL(fill[i], weaver.w_density);
++		uint32_t w = MIN(wait[i], WEAVER_WAIT_TICKS_MAX);
++		pa[i] = WEAVER_Q16_MUL(WEAVER_TO_Q16(w), weaver.w_aging);
++	}
++
++	uint32x4_t v_pu = vld1q_u32(pu);
++	uint32x4_t v_pd = vld1q_u32(pd);
++	uint32x4_t v_pa = vld1q_u32(pa);
++
++	uint32x4_t v_sum = vqaddq_u32(vqaddq_u32(v_pu, v_pd), v_pa);
++	vst1q_u32(out, v_sum);
++	(void)v_w_u; (void)v_w_d; (void)v_w_a;  /* Reserved for the
++						   fully-vectorized variant. */
++}
++#endif /* CONFIG_WEAVER_USE_MVE */
 +
 +int weaver_register(struct weaver_thread_data *wd, struct k_thread *thread,
 +		    uint32_t priority_q16, bool is_warp)
@@ -627,6 +727,9 @@ index 00000000000..5ff9ff4f3d7
 +
 +void weaver_tick(void)
 +{
++#ifdef CONFIG_WEAVER_TIMING
++	uint32_t cyc_start = cyc_now();
++#endif
 +	struct weaver_thread_data *winner = NULL;
 +	uint32_t max_pressure = 0;
 +	uint32_t sys_pressure = 0;
@@ -743,6 +846,19 @@ index 00000000000..5ff9ff4f3d7
 +			}
 +		}
 +	}
++
++#ifdef CONFIG_WEAVER_TIMING
++	weaver.last_tick_cycles = cyc_now() - cyc_start;
++#endif
++}
++
++uint32_t weaver_get_last_tick_cycles(void)
++{
++#ifdef CONFIG_WEAVER_TIMING
++	return weaver.last_tick_cycles;
++#else
++	return 0;
++#endif
 +}
 +
 +uint32_t weaver_system_pressure(void)

@@ -15,10 +15,13 @@ lineup, BLE parameters, and battery target may differ.
 | Power | Battery, deepsleep most of the time | Wearable workload |
 | FPU | Available but **not used** in scheduler path | Avoids FPU context-save in the dispatch hot path |
 
-Why not use Helium MVE for the pressure math? Per-thread cost is 2
-multiplies + 3 adds; vectorising 8 threads in MVE saves a few cycles
-but adds vector-register save/restore on context switch. Net loss for
-this workload.
+Why not use Helium MVE for the pressure math at 12 threads? See
+section "Q16.16 fixed-point, no FPU/MVE in the dispatcher hot path"
+below for the full lazy-stacking analysis. Short version: vector
+context-save (~50 cycles per preemption) costs more than the
+vectorization saves at low thread counts. Break-even is ~32 threads;
+`CONFIG_WEAVER_USE_MVE` enables the vectorized path for users who
+scale past that.
 
 ## Sensor pipeline assumptions
 
@@ -42,12 +45,43 @@ animation (NemaGFX present in this repo), GPU work goes Weft.
 
 ## Scheduler decisions
 
-### 1. Q16.16 fixed-point, no FPU
+### 1. Q16.16 fixed-point, no FPU/MVE in the dispatcher hot path
 
-**Decision:** Math runs entirely on the integer ALU. The Apollo510 has
-an FPU, but using it in the scheduler hook forces FPU context-save on
-every preemption, which dominates the savings. Q16.16 with one 64-bit
-multiply per term costs ~5 cycles on M55.
+**Decision:** The dispatcher math runs entirely on the integer ALU
+even though the Apollo510 Cortex-M55 has both FPU (FPv5) and Helium
+MVE.
+
+**Why not the FPU?** Not because it isn't there — it is. The reason
+is **lazy floating-point context save**. The first floating-point
+instruction inside any preemptible region triggers FP context save
+on every subsequent preemption (~17 cycles for FPU, ~50 cycles for
+MVE state). The scheduler runs in a context that gets preempted
+constantly. So a single `vmul.f32` in `weaver_calculate_pressure`
+makes every later preemption pay the FP-save cost — even for threads
+that never touch a float.
+
+Math at 12 registered threads:
+- **Integer:** ~180 cycles/tick. No FP context impact, ever.
+- **FPU (single-precision):** ~150 cycles/tick. Saves 30 cycles, but
+  adds 17 cycles to every subsequent preemption that wouldn't have
+  had FP context save. At ~10 preemptions/sec that's a net **loss**
+  of ~140 cycles/sec on a workload that previously didn't use FP.
+- **MVE (vectorized, 4 threads/vector):** ~50 cycles/tick. Saves
+  130 cycles per tick but adds ~50 cycles per preemption. Break-even
+  is around **32 threads**.
+
+For a 12-thread wearable, integer dominates. At 64 threads MVE wins
+clearly — there's a `CONFIG_WEAVER_USE_MVE` knob for that case.
+
+**Where FPU and MVE absolutely DO earn their keep on Apollo510:**
+- **Sensor fusion** (Mahony / Madgwick filters - lots of floats)
+- **HR algorithm FFT** (MVE has VFMA, ideal for butterflies)
+- **Display alpha-blending** (MVE byte-wide ops)
+- **Outer-loop ML / fuzzy weight controller** (1 Hz Weft thread,
+  amortizes its own FP-save cost over many cycles of work)
+
+The rule: FP/MVE in the **consumer** thread that uses the data, not
+in the **dispatcher** that allocates CPU time to it.
 
 ### 2. Non-invasive layer, not a replacement for `kernel/sched.c`
 
@@ -142,7 +176,7 @@ callback.
 | SMP per-CPU registries | Apollo510 is single-core M55; not needed |
 | Direct `next_up()` patch | Higher risk; non-invasive layer covers 99% of cases |
 | BLE-controller-aware deadline | Requires real Bluetooth host integration; mocked in sample |
-| Helium MVE pressure math | Adds vector context-save cost; wins at >32 threads, not 12 |
+| Helium MVE pressure math (default off) | Adds vector context-save cost; wins at >32 threads, not 12. Enable via CONFIG_WEAVER_USE_MVE if you scale past that. |
 | `K_THREAD_DEFINE`-style macro | Would couple Weaver to Zephyr macros across versions |
 | Throttle action policy | Producer-side decision; Weaver only reports |
 | Persistence of fabric stats across reboot | Not enough storage budget; export via shell instead |

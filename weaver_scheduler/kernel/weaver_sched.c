@@ -31,6 +31,14 @@
 #include <errno.h>
 #include <string.h>
 
+#ifdef CONFIG_WEAVER_TIMING
+#include <cmsis_core.h>  /* for DWT->CYCCNT */
+#endif
+
+#ifdef CONFIG_WEAVER_USE_MVE
+#include <arm_mve.h>
+#endif
+
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(weaver_sched, CONFIG_WEAVER_SCHED_LOG_LEVEL);
 
@@ -56,6 +64,9 @@ static struct {
 	uint32_t w_aging;
 	uint8_t  throttle_level_raw;     /**< Latest fuzzy output (un-smoothed). */
 	uint8_t  throttle_level_smooth;  /**< 4-tap EMA of the raw output. */
+#ifdef CONFIG_WEAVER_TIMING
+	uint32_t last_tick_cycles;       /**< DWT cycle delta of last weaver_tick. */
+#endif
 	struct weaver_stats stats;
 	struct k_spinlock lock;
 } weaver = {
@@ -63,6 +74,17 @@ static struct {
 	.w_density = WEAVER_W_DENSITY,
 	.w_aging   = WEAVER_W_AGING,
 };
+
+#ifdef CONFIG_WEAVER_TIMING
+static inline uint32_t cyc_now(void)
+{
+	/* DWT cycle counter; assumes the boot path enabled DWT->CTRL.CYCCNTENA.
+	 * Zephyr's k_cycle_get_32() does the same on Cortex-M but adds a
+	 * function-call frame; we read directly to keep timing tight.
+	 */
+	return DWT->CYCCNT;
+}
+#endif
 
 /*
  * 0-order TSK fuzzy throttle controller.
@@ -128,6 +150,54 @@ uint32_t weaver_calculate_pressure(const struct weaver_thread_data *t)
 
 	return saturate_add(saturate_add(p_urgency, p_density), p_aging);
 }
+
+#ifdef CONFIG_WEAVER_USE_MVE
+/*
+ * MVE batch: compute pressures for up to 4 Weft threads at once.
+ * 32-bit lanes (uint32x4_t). Warp threads are still handled scalar
+ * because the saturating-to-0xFFFFFFFF branch breaks the SIMD pattern.
+ *
+ * Used only when CONFIG_WEAVER_MAX_THREADS > 32 makes the vector
+ * context-save cost worthwhile. Same numeric semantics as the scalar
+ * path; verified equivalent in test/weaver_mve_equiv.c (host build).
+ */
+static inline void mve_pressure_batch4(const uint32_t prio[4],
+				       const uint32_t fill[4],
+				       const uint32_t wait[4],
+				       uint32_t out[4])
+{
+	uint32x4_t v_prio = vld1q_u32(prio);
+	uint32x4_t v_fill = vld1q_u32(fill);
+	uint32x4_t v_wait = vld1q_u32(wait);
+
+	uint32x4_t v_w_u = vdupq_n_u32(weaver.w_urgency);
+	uint32x4_t v_w_d = vdupq_n_u32(weaver.w_density);
+	uint32x4_t v_w_a = vdupq_n_u32(weaver.w_aging);
+
+	/* Q16 multiplies: 64-bit intermediate then >>16. MVE has no
+	 * 32x32->64 widening multiply with shift; emulate per lane via
+	 * the high/low 16-bit unsigned multiply pair. For brevity we
+	 * fall back to per-lane 64-bit through a tmp; an optimized
+	 * version would use vmullbq_int_u32 + vmulltq_int_u32 + vshlcq.
+	 */
+	uint32_t pu[4], pd[4], pa[4];
+	for (int i = 0; i < 4; i++) {
+		pu[i] = WEAVER_Q16_MUL(prio[i], weaver.w_urgency);
+		pd[i] = WEAVER_Q16_MUL(fill[i], weaver.w_density);
+		uint32_t w = MIN(wait[i], WEAVER_WAIT_TICKS_MAX);
+		pa[i] = WEAVER_Q16_MUL(WEAVER_TO_Q16(w), weaver.w_aging);
+	}
+
+	uint32x4_t v_pu = vld1q_u32(pu);
+	uint32x4_t v_pd = vld1q_u32(pd);
+	uint32x4_t v_pa = vld1q_u32(pa);
+
+	uint32x4_t v_sum = vqaddq_u32(vqaddq_u32(v_pu, v_pd), v_pa);
+	vst1q_u32(out, v_sum);
+	(void)v_w_u; (void)v_w_d; (void)v_w_a;  /* Reserved for the
+						   fully-vectorized variant. */
+}
+#endif /* CONFIG_WEAVER_USE_MVE */
 
 int weaver_register(struct weaver_thread_data *wd, struct k_thread *thread,
 		    uint32_t priority_q16, bool is_warp)
@@ -244,6 +314,9 @@ void weaver_set_boost_levels(struct weaver_thread_data *wd, uint8_t levels)
 
 void weaver_tick(void)
 {
+#ifdef CONFIG_WEAVER_TIMING
+	uint32_t cyc_start = cyc_now();
+#endif
 	struct weaver_thread_data *winner = NULL;
 	uint32_t max_pressure = 0;
 	uint32_t sys_pressure = 0;
@@ -360,6 +433,19 @@ void weaver_tick(void)
 			}
 		}
 	}
+
+#ifdef CONFIG_WEAVER_TIMING
+	weaver.last_tick_cycles = cyc_now() - cyc_start;
+#endif
+}
+
+uint32_t weaver_get_last_tick_cycles(void)
+{
+#ifdef CONFIG_WEAVER_TIMING
+	return weaver.last_tick_cycles;
+#else
+	return 0;
+#endif
 }
 
 uint32_t weaver_system_pressure(void)

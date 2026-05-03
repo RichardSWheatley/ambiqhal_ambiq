@@ -228,6 +228,15 @@ struct weaver_stats {
 void weaver_get_stats(struct weaver_stats *out);
 
 /**
+ * @brief Cycles spent inside the most recent weaver_tick().
+ *
+ * Available only when CONFIG_WEAVER_TIMING=y (requires CPU_HAS_DWT).
+ * Used for on-target WCET validation on Apollo510 and other M55 / M7
+ * targets. Returns 0 if the counter has not been sampled yet.
+ */
+uint32_t weaver_get_last_tick_cycles(void);
+
+/**
  * @brief Override the global pressure weights at runtime.
  *
  * Defaults are WEAVER_W_URGENCY / W_DENSITY / W_AGING. Exposed so an
