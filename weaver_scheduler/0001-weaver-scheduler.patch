@@ -1,9 +1,9 @@
 diff --git a/include/zephyr/kernel/weaver_sched.h b/include/zephyr/kernel/weaver_sched.h
 new file mode 100644
-index 00000000000..d8f78ccd49c
+index 00000000000..5a366cc5305
 --- /dev/null
 +++ b/include/zephyr/kernel/weaver_sched.h
-@@ -0,0 +1,229 @@
+@@ -0,0 +1,248 @@
 +/*
 + * Copyright (c) 2026 Ambiq Micro, Inc.
 + *
@@ -186,8 +186,27 @@ index 00000000000..d8f78ccd49c
 + *
 + * When true, non-essential producers should slow down (e.g. drop sensor
 + * polling rate) until the data fabric stabilizes.
++ *
++ * Backed by the smoothed fuzzy throttle level: stable across single-tick
++ * pressure spikes near the threshold (no flap).
 + */
 +bool weaver_should_throttle(void);
++
++/**
++ * @brief Graded throttle level (0..255) from a TSK fuzzy controller.
++ *
++ * Three rules, linear membership, EMA-smoothed across ticks:
++ *   p <= T/2  -> 0     (no throttle)
++ *   p ~  T    -> 128   (entering throttle region)
++ *   p >= 2T   -> 255   (full throttle)
++ *
++ * where T is CONFIG_WEAVER_THROTTLE_THRESHOLD. Producers that can do
++ * graceful degradation (drop sensor rate by N%) should consume this
++ * value directly instead of the binary weaver_should_throttle().
++ *
++ * Recomputed once per weaver_tick(); reading is a single byte load.
++ */
++uint8_t weaver_throttle_level(void);
 +
 +/**
 + * @brief Ticks remaining until the next Warp deadline across the registry.
@@ -256,10 +275,10 @@ index 9e3be0b12ab..1f0b78d337d 100644
 +rsource "Kconfig.weaver"
 diff --git a/kernel/Kconfig.weaver b/kernel/Kconfig.weaver
 new file mode 100644
-index 00000000000..add49231904
+index 00000000000..0ae5a8ed7e7
 --- /dev/null
 +++ b/kernel/Kconfig.weaver
-@@ -0,0 +1,92 @@
+@@ -0,0 +1,96 @@
 +# Weaver predictive pressure-aware scheduler configuration
 +
 +# Copyright (c) 2026 Ambiq Micro, Inc.
@@ -293,12 +312,16 @@ index 00000000000..add49231904
 +	default 0x00030000 if WEAVER_WEARABLE_PRESET
 +	default 0x00040000
 +	help
-+	  When the sum of all Weft thread pressures crosses this Q16.16
-+	  threshold, weaver_should_throttle() returns true so non-essential
-+	  producers can slow down. Default 0x40000 corresponds to roughly
-+	  4.0 in Q16.16 (e.g. four threads each at full pressure). The
-+	  wearable preset uses a tighter 3.0 since FIFO overruns lose
-+	  irreplaceable user biometric data.
++	  Center of the fuzzy throttle controller's MID region (in Q16.16).
++	  The TSK rules are:
++	    LOW  (level=0):    pressure <= T/2
++	    MID  (level=ramp): pressure in (T/2, 3T/2) - centered on T
++	    HIGH (level=255):  pressure >= 3T/2
++	  pressure == T yields level == 128, the binary throttle boundary.
++	  Output is EMA-smoothed across 4 ticks so weaver_should_throttle()
++	  does not flap when pressure dances around T. Default 0x40000 ~=
++	  4.0 in Q16.16. Wearable preset uses 3.0 because FIFO overruns
++	  lose irreplaceable biometric data.
 +
 +config WEAVER_DEFAULT_BOOST_LEVELS
 +	int "Default Weft promotion magnitude (priority levels)"
@@ -354,10 +377,10 @@ index 00000000000..add49231904
 +endif # WEAVER_SCHED
 diff --git a/kernel/weaver_sched.c b/kernel/weaver_sched.c
 new file mode 100644
-index 00000000000..e3c0b896e31
+index 00000000000..5ff9ff4f3d7
 --- /dev/null
 +++ b/kernel/weaver_sched.c
-@@ -0,0 +1,353 @@
+@@ -0,0 +1,412 @@
 +/*
 + * Copyright (c) 2026 Ambiq Micro, Inc.
 + *
@@ -414,6 +437,8 @@ index 00000000000..e3c0b896e31
 +	uint32_t w_urgency;
 +	uint32_t w_density;
 +	uint32_t w_aging;
++	uint8_t  throttle_level_raw;     /**< Latest fuzzy output (un-smoothed). */
++	uint8_t  throttle_level_smooth;  /**< 4-tap EMA of the raw output. */
 +	struct weaver_stats stats;
 +	struct k_spinlock lock;
 +} weaver = {
@@ -421,6 +446,39 @@ index 00000000000..e3c0b896e31
 +	.w_density = WEAVER_W_DENSITY,
 +	.w_aging   = WEAVER_W_AGING,
 +};
++
++/*
++ * 0-order TSK fuzzy throttle controller.
++ *
++ * Three rules with triangular/trapezoidal membership; MID is centered
++ * symmetrically on the configured threshold T so that pressure == T
++ * yields level == 128 (the binary "throttle on" boundary):
++ *
++ *   LOW:  p <= T/2          -> level = 0
++ *   MID:  p in (T/2, 3T/2)  -> level = linear interp 0..255 (ramp width T)
++ *   HIGH: p >= 3T/2         -> level = 255
++ *
++ * Closed-form defuzzification (the linear ramp is the centroid of the
++ * three rules under linear membership). One uint64 multiply + one
++ * uint32 division by a positive non-zero divisor. Bounded WCET.
++ */
++static inline uint8_t fuzzy_throttle_level(uint32_t pressure)
++{
++	const uint32_t T      = (uint32_t)CONFIG_WEAVER_THROTTLE_THRESHOLD;
++	const uint32_t T_low  = T >> 1;              /* T/2  */
++	const uint32_t T_high = T + (T >> 1);        /* 3T/2 */
++
++	if (pressure <= T_low) {
++		return 0;
++	}
++	if (pressure >= T_high) {
++		return 255;
++	}
++
++	/* range = T_high - T_low = T; non-zero by construction. */
++	uint64_t num = (uint64_t)(pressure - T_low) * 255U;
++	return (uint8_t)(num / T);
++}
 +
 +static inline uint32_t saturate_add(uint32_t a, uint32_t b)
 +{
@@ -627,8 +685,24 @@ index 00000000000..e3c0b896e31
 +	weaver.ticks_to_next_warp = min_warp_remaining;
 +	weaver.stats.total_ticks++;
 +
-+	if (sys_pressure >= (uint32_t)CONFIG_WEAVER_THROTTLE_THRESHOLD) {
-+		weaver.stats.throttle_events++;
++	/* Fuzzy throttle: compute graded level, then 4-tap EMA smooth.
++	 * Smoothed value drives weaver_should_throttle() for hysteresis.
++	 */
++	uint8_t level = fuzzy_throttle_level(sys_pressure);
++	weaver.throttle_level_raw = level;
++	weaver.throttle_level_smooth =
++		(uint8_t)((3U * (uint32_t)weaver.throttle_level_smooth + level) >> 2);
++
++	/* Count entry edges into throttle (smoothed-value rising past 128).
++	 * EMA hysteresis means brief pressure spikes do not inflate this.
++	 */
++	{
++		static uint8_t prev_above;
++		uint8_t now_above = (weaver.throttle_level_smooth >= 128U) ? 1U : 0U;
++		if (now_above && !prev_above) {
++			weaver.stats.throttle_events++;
++		}
++		prev_above = now_above;
 +	}
 +
 +#ifdef CONFIG_WEAVER_POWER_AWARE
@@ -678,7 +752,15 @@ index 00000000000..e3c0b896e31
 +
 +bool weaver_should_throttle(void)
 +{
-+	return weaver.system_pressure >= (uint32_t)CONFIG_WEAVER_THROTTLE_THRESHOLD;
++	/* Backed by the smoothed fuzzy level so single-tick spikes do not
++	 * flap throttle on/off near the threshold.
++	 */
++	return weaver.throttle_level_smooth >= 128U;
++}
++
++uint8_t weaver_throttle_level(void)
++{
++	return weaver.throttle_level_smooth;
 +}
 +
 +uint32_t weaver_ticks_to_next_warp(void)
