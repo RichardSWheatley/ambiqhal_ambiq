@@ -174,16 +174,65 @@ scheduler overhead is dwarfed by even one BLE TX burst.
 4. **`CONFIG_WEAVER_THROTTLE_THRESHOLD`** — start at 3.0, watch the
    throttle event counter under realistic load, tune from there.
 
+## Click board stack (apollo510b_evb)
+
+The right target is **apollo510b_evb**, not the bare apollo510_evb:
+
+* mikroBUS slot for Click boards
+* On-board BLE radio wired to `iom6` / `spi6` (`ambiq,bt-hci-spi`)
+* Console on `uart1`
+* Compatible with the **ap510_disp** shield (MIPI-DSI AMOLED 468x468
+  + CHSC5x touch on `iom2`/`i2c2`)
+
+Recommended Click stack:
+
+| Sensor | Click board | Driver | Bus | I2C addr |
+|---|---|---|---|---|
+| 6-axis IMU | **6DOF IMU 14 Click** | `bosch,bmi270-i2c` | IOM0 → I2C0 | 0x68 |
+| PPG / HR | **Heart Rate 4 Click** | `maxim,max30101` | IOM1 → I2C1 | 0x57 |
+
+Both drivers ship in this Zephyr fork. The DTS overlay lives at
+`samples/boards/apollo510b_evb/weaver_wearable/boards/apollo510b_evb.overlay`.
+
+If your EVB has only one mikroBUS slot, populate it with the IMU click
+(pressure-active workload) and remove the `&iom1` / max30101 block
+from the overlay.
+
+Alternative Click options if these are unavailable:
+
+* IMU: 6DOF IMU 11/17 Click (LSM6DSL/LSM6DSO), ICM-20948 Click
+* PPG: Heart Rate 9 Click (MAX86916), Heart Rate 11 Click (MAX86161)
+* Skin temp: Thermo 3 Click (TMP102), Thermo 18 Click (TMP117)
+
+## Predictive scheduling (added)
+
+The original screenshot called for "Predictive **and** Pressure-Aware"
+scheduling. v1 was reactive (current FIFO depth → pressure). v2 adds:
+
+```c
+weaver_set_buffer_fill_predictive_q16(wd, current_fill_q16);
+```
+
+which stores `current + (current - last)` so the dispatcher reacts to
+where the FIFO will be next tick. 6 cycles. No ML, no FPU.
+
+See `ML_AND_FUZZY_LOGIC.md` for the longer answer on why we use a
+2-multiply linear path instead of fuzzy/NN inference in the hot path,
+and where heavier learning DOES belong (1 Hz weight controller via
+`weaver_set_weights()`, fuzzy throttle as graded `should_throttle`).
+
 ## Open questions for you
 
-- **Real BLE host:** the sample mocks BLE LL. Want me to wire it to
-  the Apollo510 cooper/em9305 bluetooth driver from this repo's
-  `components/bluetooth/`?
-- **Real sensor drivers:** I have access to the Ambiq IOM/SPI drivers
-  in this HAL. Want me to swap the synthetic FIFOs for real BMI270 /
-  ADPD188 driver bindings?
-- **Power telemetry:** Apollo510 has on-die current monitoring. Want a
-  `weaver_estimate_power_uw()` accessor that correlates pressure to
-  estimated draw?
+- **BLE host integration:** the sample registers a `gatt_tx` Weft but
+  the actual notification queue isn't wired to the Bluetooth host.
+  Want me to hook `bt_gatt_notify()` so real GATT TX backpressure
+  drives the scheduler?
+- **Display shield:** I left rendering as a sleep loop. Want it to
+  call `display_blanking_off()` / submit LVGL frames so the AMOLED
+  draws an actual heart-rate watch face?
+- **Power telemetry:** Apollo510 has the `am_hal_pwrctrl` rails. Want
+  a `weaver_estimate_power_uw()` correlator?
 - **Shell command:** `weaver` shell command for live `fabric stats`
-  inspection during bring-up?
+  inspection?
+- **1 Hz weight controller:** ready to drop in once you have field
+  data on what overruns happen.

@@ -1,0 +1,23 @@
+sample:
+  description: Weaver scheduler driving real wearable sensors (BMI270 IMU +
+    MAX30101 PPG) via MikroElektronika Click boards on the Apollo510 Blue EVB.
+  name: Weaver Wearable (Apollo510B + Click)
+common:
+  tags:
+    - kernel
+    - weaver
+    - wearable
+    - sensor
+  harness: console
+  harness_config:
+    type: one_line
+    regex:
+      - "Weaver Wearable Demo Complete"
+tests:
+  sample.kernel.weaver_wearable.apollo510b:
+    platform_allow:
+      - apollo510b_evb
+    integration_platforms:
+      - apollo510b_evb
+    extra_args:
+      - SHIELD=ap510_disp

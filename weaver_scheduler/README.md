@@ -74,6 +74,7 @@ true, signaling non-essential producers to slow down.
 | `kernel/weaver_sched.c` | Implementation: pressure calc, dispatcher, pre-warp clear, throttle, stats |
 | `kernel/Kconfig.weaver` | `WEAVER_SCHED`, `WEAVER_MAX_THREADS`, `WEAVER_THROTTLE_THRESHOLD`, `WEAVER_WEARABLE_PRESET`, `WEAVER_POWER_AWARE`, `WEAVER_PREWARP_GUARD_TICKS` |
 | `samples/kernel/weaver_sched/` | Generic demo: 1 Warp + 2 Weft producers, 100-tick ramp |
-| `samples/boards/apollo510_evb/weaver_wearable/` | Apollo510 LP @ 96 MHz wearable demo: 3 Warp (BLE/IMU/PPG) + 6 Weft (fusion/HR/GATT/classifier/display/NVM) |
+| `samples/boards/apollo510_evb/weaver_wearable/` | Apollo510 LP @ 96 MHz wearable demo: 3 Warp (BLE/IMU/PPG) + 6 Weft (fusion/HR/GATT/classifier/display/NVM), synthetic FIFOs |
+| `samples/boards/apollo510b_evb/weaver_wearable/` | Apollo510 Blue EVB demo with REAL sensors via mikroBUS: 6DOF IMU 14 Click (BMI270) + Heart Rate 4 Click (MAX30101), uses on-board BLE and ap510_disp shield |
 | `0001-weaver-scheduler.patch` | Patch to apply on top of `ambiq-stable` in `ambiqzephyr` |
 | `DECISIONS.md` | All assumptions and tuning rationale for the wearable target |
