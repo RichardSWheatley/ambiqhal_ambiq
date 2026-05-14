@@ -1,0 +1,10 @@
+tests:
+  kernel.weaver_fp_vs_fixed:
+    tags: kernel weaver
+    integration_platforms:
+      - native_sim
+    harness: console
+    harness_config:
+      type: one_line
+      regex:
+        - "FIXED AND FLOAT VARIANTS EQUIVALENT"

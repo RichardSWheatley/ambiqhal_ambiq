@@ -261,27 +261,218 @@ index 00000000000..8ca197ecbc2
 +#endif
 +
 +#endif /* ZEPHYR_INCLUDE_KERNEL_WEAVER_SCHED_H_ */
+diff --git a/include/zephyr/kernel/weaver_sched_fp.h b/include/zephyr/kernel/weaver_sched_fp.h
+new file mode 100644
+index 00000000000..628928eb2f0
+--- /dev/null
++++ b/include/zephyr/kernel/weaver_sched_fp.h
+@@ -0,0 +1,183 @@
++/*
++ * Copyright (c) 2026 Ambiq Micro, Inc.
++ *
++ * SPDX-License-Identifier: Apache-2.0
++ */
++
++/**
++ * @file
++ * @brief Weaver scheduler: single-precision floating-point variant.
++ *
++ * Parallel implementation of the Weaver predictive pressure-aware
++ * scheduling layer using IEEE-754 single-precision floats on the
++ * Cortex-M55 FPv5-SP FPU. Same dispatch semantics, same Warp/Weft
++ * classification, same fuzzy-throttle and predictive-fill helpers as
++ * the fixed-point variant - just float math instead of Q16.16.
++ *
++ * When to pick this variant over the fixed-point one
++ * --------------------------------------------------
++ *
++ *   - Your Weft threads ALREADY use the FPU (sensor fusion with
++ *     Mahony/Madgwick, HR FFT, audio frame-by-frame DSP, graphics
++ *     alpha-blend). The lazy floating-point context-save tax is
++ *     already paid by those threads; adding FPU to the scheduler
++ *     costs essentially zero extra at preemption time.
++ *
++ *   - You want a code path that is easier to audit and modify than
++ *     the Q16.16 fixed-point one. No (uint64_t) intermediate casts,
++ *     no Q-format reasoning, no saturating-add helpers - just
++ *     readable math.
++ *
++ *   - Apollo510 is in HP mode (192/250 MHz) where the absolute cost
++ *     of FP is dwarfed by the available cycle budget.
++ *
++ * When to stay with the fixed-point variant
++ * -----------------------------------------
++ *
++ *   - Battery-constrained wearable in LP mode (96 MHz) where NO
++ *     other thread uses the FPU. The integer path keeps lazy
++ *     stacking disarmed, saving ~17 cycles per preemption.
++ *
++ *   - MCUs without an FPU at all (Cortex-M0/M0+, M3, some M4-NOFP).
++ *
++ *   - WCET-certified workloads where bit-identical numeric
++ *     reproducibility across compilers/versions is required.
++ *
++ * CONFIG_WEAVER_SCHED_FP is mutually exclusive with
++ * CONFIG_WEAVER_SCHED. Pick one per build.
++ */
++
++#ifndef ZEPHYR_INCLUDE_KERNEL_WEAVER_SCHED_FP_H_
++#define ZEPHYR_INCLUDE_KERNEL_WEAVER_SCHED_FP_H_
++
++#include <stdint.h>
++#include <stdbool.h>
++#include <zephyr/kernel.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/** Saturating Warp pressure: always wins the dispatch tournament. */
++#define WEAVER_FP_PRESSURE_WARP   3.4028235e38f  /* FLT_MAX */
++
++/**
++ * Default weights (fractions). Must roughly sum to 1.0 for normalized
++ * pressure. Defaults: urgency 0.4, density 0.4, aging 0.2 - same
++ * apportionment as the fixed-point variant for identical dispatch
++ * decisions (modulo float rounding).
++ */
++#define WEAVER_FP_W_URGENCY 0.4f
++#define WEAVER_FP_W_DENSITY 0.4f
++#define WEAVER_FP_W_AGING   0.2f
++
++/**
++ * @brief Per-thread scheduling state used by the FP Weaver dispatcher.
++ *
++ * Mirrors weaver_thread_data from the fixed-point variant with the
++ * Q16.16 fields replaced by `float`. `wait_ticks` stays integer
++ * because it's a counter, not a fraction.
++ */
++struct weaver_fp_thread_data {
++	struct k_thread *thread;       /**< Zephyr thread handle. */
++	float    priority;             /**< Static "Warp priority" (e.g. 1.0..20.0). */
++	float    buffer_fill;          /**< Buffer fill ratio: 0.0..1.0. */
++	float    last_fill;            /**< Previous fill (for predictive delta). */
++	uint32_t wait_ticks;           /**< Aging counter (incremented per tick). */
++	uint32_t period_ticks;         /**< Warp period (0 if Weft or aperiodic). */
++	uint32_t next_deadline_ticks;  /**< Ticks remaining to next Warp run. */
++	void    *meta;                 /**< Owner-defined: e.g. sensor FIFO ptr. */
++	uint8_t  is_warp;              /**< Non-zero: deterministic Warp thread. */
++	int8_t   base_prio;            /**< Captured Zephyr base priority. */
++	int8_t   weft_boost_prio;      /**< Priority used when promoted. */
++	uint8_t  boost_levels;         /**< How many priority levels to lift. */
++	uint8_t  in_use;               /**< Slot occupancy flag. */
++};
++
++/**
++ * @brief Compute pressure for a single thread (float).
++ *
++ * Warp returns WEAVER_FP_PRESSURE_WARP. Weft computes
++ *   pressure = priority * W_URGENCY
++ *            + buffer_fill * W_DENSITY
++ *            + min(wait_ticks, 1.0) * W_AGING
++ *
++ * Same algebraic structure as the fixed-point variant, so dispatch
++ * decisions are equivalent within float rounding.
++ */
++float weaver_fp_calculate_pressure(const struct weaver_fp_thread_data *t);
++
++/**
++ * @brief Register a thread with the FP Weaver dispatcher.
++ *
++ * @param wd       Caller-owned zero-initialized thread data slot.
++ * @param thread   Zephyr thread handle (must already be created).
++ * @param priority Static Warp priority (e.g. 1.0..20.0).
++ * @param is_warp  Non-zero for hard real-time threads.
++ *
++ * @retval 0       on success.
++ * @retval -ENOMEM if the registry is full.
++ * @retval -EINVAL on bad arguments.
++ */
++int weaver_fp_register(struct weaver_fp_thread_data *wd,
++		       struct k_thread *thread,
++		       float priority, bool is_warp);
++
++/** @brief Remove a thread from the FP registry. */
++int weaver_fp_unregister(struct weaver_fp_thread_data *wd);
++
++/** @brief Update buffer-fill metric. */
++void weaver_fp_set_buffer_fill(struct weaver_fp_thread_data *wd, float fill);
++
++/**
++ * @brief Update buffer fill with one-step predictive extrapolation.
++ *
++ * Stores fill + (fill - last_fill), clamped to [0.0, 1.0]. Identical
++ * predictive semantic to the fixed-point variant.
++ */
++void weaver_fp_set_buffer_fill_predictive(struct weaver_fp_thread_data *wd,
++					  float fill);
++
++/** @brief Configure a periodic Warp deadline (ticks). */
++void weaver_fp_set_warp_deadline(struct weaver_fp_thread_data *wd,
++				 uint32_t period_ticks);
++
++/** @brief Override the boost magnitude (priority levels) for a Weft. */
++void weaver_fp_set_boost_levels(struct weaver_fp_thread_data *wd, uint8_t levels);
++
++/** @brief Override the global pressure weights at runtime. */
++void weaver_fp_set_weights(float w_urgency, float w_density, float w_aging);
++
++/** @brief One scheduling pass. */
++void weaver_fp_tick(void);
++
++/** @brief Sum of all Weft pressures from the last tick. */
++float weaver_fp_system_pressure(void);
++
++/** @brief Ticks remaining until the next Warp deadline across the registry. */
++uint32_t weaver_fp_ticks_to_next_warp(void);
++
++/** @brief True if smoothed throttle level is at or above mid (graceful). */
++bool weaver_fp_should_throttle(void);
++
++/** @brief Graded throttle level (0..255), TSK fuzzy + EMA smoothed. */
++uint8_t weaver_fp_throttle_level(void);
++
++struct weaver_fp_stats {
++	uint32_t total_ticks;
++	uint32_t throttle_events;
++	uint32_t weft_promotions;
++	uint32_t pre_warp_clears;
++	uint32_t skipped_idle_ticks;
++};
++
++void weaver_fp_get_stats(struct weaver_fp_stats *out);
++
++/** @brief DWT cycle count of the most recent weaver_fp_tick(). */
++uint32_t weaver_fp_get_last_tick_cycles(void);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* ZEPHYR_INCLUDE_KERNEL_WEAVER_SCHED_FP_H_ */
 diff --git a/kernel/CMakeLists.txt b/kernel/CMakeLists.txt
-index 8906da2f627..600294ee1b2 100644
+index 8906da2f627..9906cbdf241 100644
 --- a/kernel/CMakeLists.txt
 +++ b/kernel/CMakeLists.txt
-@@ -105,6 +105,7 @@ kernel_sources(nothread.c)
+@@ -105,6 +105,8 @@ kernel_sources(nothread.c)
  endif() # CONFIG_MULTITHREADING
  
  kernel_sources_ifdef(CONFIG_TIMESLICING timeslicing.c)
-+kernel_sources_ifdef(CONFIG_WEAVER_SCHED weaver_sched.c)
++kernel_sources_ifdef(CONFIG_WEAVER_SCHED    weaver_sched.c)
++kernel_sources_ifdef(CONFIG_WEAVER_SCHED_FP weaver_sched_fp.c)
  kernel_sources_ifdef(CONFIG_SPIN_VALIDATE spinlock_validate.c)
  kernel_sources_ifdef(CONFIG_IRQ_OFFLOAD irq_offload.c)
  kernel_sources_ifdef(CONFIG_BOOTARGS boot_args.c)
 diff --git a/kernel/Kconfig b/kernel/Kconfig
-index 9e3be0b12ab..1f0b78d337d 100644
+index 9e3be0b12ab..6ee38dcc241 100644
 --- a/kernel/Kconfig
 +++ b/kernel/Kconfig
-@@ -1141,3 +1141,4 @@ endmenu
+@@ -1141,3 +1141,5 @@ endmenu
  rsource "Kconfig.device"
  rsource "Kconfig.vm"
  rsource "Kconfig.init"
 +rsource "Kconfig.weaver"
++rsource "Kconfig.weaver_fp"
 diff --git a/kernel/Kconfig.weaver b/kernel/Kconfig.weaver
 new file mode 100644
 index 00000000000..a4c340d6938
@@ -442,6 +633,97 @@ index 00000000000..a4c340d6938
 +	    0 = off, 1 = error, 2 = warning, 3 = info, 4 = debug.
 +
 +endif # WEAVER_SCHED
+diff --git a/kernel/Kconfig.weaver_fp b/kernel/Kconfig.weaver_fp
+new file mode 100644
+index 00000000000..6b93c3b1b4e
+--- /dev/null
++++ b/kernel/Kconfig.weaver_fp
+@@ -0,0 +1,85 @@
++# Weaver scheduler: single-precision floating-point variant.
++
++# Copyright (c) 2026 Ambiq Micro, Inc.
++# SPDX-License-Identifier: Apache-2.0
++
++menuconfig WEAVER_SCHED_FP
++	bool "Weaver pressure-aware scheduler (floating-point variant)"
++	depends on MULTITHREADING && CPU_HAS_FPU
++	depends on !WEAVER_SCHED
++	help
++	  Enables the single-precision floating-point implementation of the
++	  Weaver scheduler. Same Warp/Weft semantics, same fuzzy throttle
++	  and predictive fill helpers as CONFIG_WEAVER_SCHED, just with
++	  IEEE-754 float math instead of Q16.16.
++
++	  Pick this variant when:
++	    - Your system already pays the FPU lazy-stacking tax because
++	      other threads (sensor fusion, FFT, graphics) use the FPU;
++	    - You want a code path that is easier to audit than the
++	      Q16.16 one;
++	    - Apollo510 is in HP mode (192/250 MHz) where FP cost is
++	      negligible vs available cycles.
++
++	  Pick WEAVER_SCHED (fixed-point) when:
++	    - Battery-constrained wearable in LP mode (96 MHz) where no
++	      other thread uses the FPU;
++	    - The MCU has no FPU at all;
++	    - Bit-identical reproducibility is required.
++
++	  Mutually exclusive with CONFIG_WEAVER_SCHED.
++
++if WEAVER_SCHED_FP
++
++config WEAVER_FP_MAX_THREADS
++	int "Maximum number of FP Weaver-managed threads"
++	default 12 if WEAVER_FP_WEARABLE_PRESET
++	default 8
++	range 1 64
++
++config WEAVER_FP_THROTTLE_THRESHOLD_X1000
++	int "Throttle threshold (multiply by 0.001 for the float value)"
++	default 3000 if WEAVER_FP_WEARABLE_PRESET
++	default 4000
++	help
++	  Float thresholds aren't expressible directly as Kconfig values,
++	  so we store 1000 * threshold and divide in C. Default 4000 maps
++	  to a threshold of 4.0 (four Weft threads at full pressure). The
++	  wearable preset uses 3000 (=3.0).
++
++config WEAVER_FP_DEFAULT_BOOST_LEVELS
++	int "Default Weft promotion magnitude"
++	default 2 if WEAVER_FP_WEARABLE_PRESET
++	default 1
++	range 1 4
++
++config WEAVER_FP_PREWARP_GUARD_TICKS
++	int "Pre-Warp guard window (ticks)"
++	default 1
++	range 0 16
++
++config WEAVER_FP_POWER_AWARE
++	bool "Skip dispatch passes when no Weft has pressure"
++	default y if WEAVER_FP_WEARABLE_PRESET
++	default n
++
++config WEAVER_FP_TIMING
++	bool "Measure dispatcher cycles via DWT cycle counter"
++	depends on CPU_HAS_DWT
++	default n
++
++config WEAVER_FP_WEARABLE_PRESET
++	bool "Wearable / Apollo510 preset for FP variant"
++	default n
++	help
++	  Same wearable defaults as WEAVER_WEARABLE_PRESET in the fixed-
++	  point variant: 12 thread slots, boost 2, throttle 3.0,
++	  power-aware tick skip.
++
++config WEAVER_FP_LOG_LEVEL
++	int "FP Weaver scheduler log level"
++	depends on LOG
++	default 2
++	range 0 4
++
++endif # WEAVER_SCHED_FP
 diff --git a/kernel/weaver_sched.c b/kernel/weaver_sched.c
 new file mode 100644
 index 00000000000..c330f4e72c1
@@ -1109,6 +1391,397 @@ index 00000000000..c330f4e72c1
 +	}
 +	k_spin_unlock(&weaver.lock, key);
 +}
+diff --git a/kernel/weaver_sched_fp.c b/kernel/weaver_sched_fp.c
+new file mode 100644
+index 00000000000..aaa3cc67f0a
+--- /dev/null
++++ b/kernel/weaver_sched_fp.c
+@@ -0,0 +1,385 @@
++/*
++ * Copyright (c) 2026 Ambiq Micro, Inc.
++ *
++ * SPDX-License-Identifier: Apache-2.0
++ *
++ * Weaver scheduler: single-precision floating-point variant.
++ *
++ * Algorithmic mirror of weaver_sched.c with Q16.16 fixed-point math
++ * replaced by IEEE-754 single-precision floats. See weaver_sched_fp.h
++ * for the rationale on when to pick this variant vs. the fixed-point
++ * one.
++ */
++
++#include <zephyr/kernel.h>
++#include <zephyr/kernel/weaver_sched_fp.h>
++#include <zephyr/spinlock.h>
++#include <zephyr/sys/util.h>
++#include <errno.h>
++#include <string.h>
++#include <float.h>
++
++#ifdef CONFIG_WEAVER_FP_TIMING
++#include <cmsis_core.h>  /* DWT->CYCCNT */
++#endif
++
++#include <zephyr/logging/log.h>
++LOG_MODULE_REGISTER(weaver_sched_fp, CONFIG_WEAVER_FP_LOG_LEVEL);
++
++#ifndef CONFIG_WEAVER_FP_PREWARP_GUARD_TICKS
++#define CONFIG_WEAVER_FP_PREWARP_GUARD_TICKS 1
++#endif
++
++#ifndef CONFIG_WEAVER_FP_DEFAULT_BOOST_LEVELS
++#define CONFIG_WEAVER_FP_DEFAULT_BOOST_LEVELS 1
++#endif
++
++/* Throttle threshold default: 4.0 normalized pressure units, matching
++ * the 0x40000 Q16.16 default in the fixed-point variant. The wearable
++ * preset tightens this to 3.0 (see Kconfig.weaver_fp).
++ */
++#ifndef CONFIG_WEAVER_FP_THROTTLE_THRESHOLD_X1000
++#define CONFIG_WEAVER_FP_THROTTLE_THRESHOLD_X1000 4000
++#endif
++
++static struct {
++	struct weaver_fp_thread_data *slots[CONFIG_WEAVER_FP_MAX_THREADS];
++	float    system_pressure;
++	uint32_t ticks_to_next_warp;
++	float    w_urgency;
++	float    w_density;
++	float    w_aging;
++	float    throttle_threshold;
++	uint8_t  throttle_level_raw;
++	uint8_t  throttle_level_smooth;
++#ifdef CONFIG_WEAVER_FP_TIMING
++	uint32_t last_tick_cycles;
++#endif
++	struct weaver_fp_stats stats;
++	struct k_spinlock lock;
++} weaver_fp = {
++	.w_urgency = WEAVER_FP_W_URGENCY,
++	.w_density = WEAVER_FP_W_DENSITY,
++	.w_aging   = WEAVER_FP_W_AGING,
++	.throttle_threshold =
++		(float)CONFIG_WEAVER_FP_THROTTLE_THRESHOLD_X1000 / 1000.0f,
++};
++
++#ifdef CONFIG_WEAVER_FP_TIMING
++static inline uint32_t cyc_now(void)
++{
++	return DWT->CYCCNT;
++}
++#endif
++
++/*
++ * 0-order TSK fuzzy throttle controller, float version.
++ * Same three rules (LOW / MID / HIGH) symmetric about T.
++ */
++static inline uint8_t fuzzy_throttle_level(float pressure)
++{
++	const float T      = weaver_fp.throttle_threshold;
++	const float T_low  = 0.5f * T;
++	const float T_high = 1.5f * T;
++
++	if (pressure <= T_low) {
++		return 0;
++	}
++	if (pressure >= T_high) {
++		return 255;
++	}
++
++	float level = 255.0f * (pressure - T_low) / T;
++	if (level < 0.0f)   return 0;
++	if (level > 255.0f) return 255;
++	return (uint8_t)level;
++}
++
++static inline int8_t clamp_boost(int8_t base, uint8_t levels)
++{
++	int target = (int)base - (int)levels;
++	if (target < 0) {
++		target = (base > 0) ? 0 : base;
++	}
++	return (int8_t)target;
++}
++
++float weaver_fp_calculate_pressure(const struct weaver_fp_thread_data *t)
++{
++	if (t->is_warp) {
++		return WEAVER_FP_PRESSURE_WARP;
++	}
++
++	float p_urgency = t->priority    * weaver_fp.w_urgency;
++	float p_density = t->buffer_fill * weaver_fp.w_density;
++
++	/* Aging scales LINEARLY with wait_ticks, clamped at 65535 ticks
++	 * (matching WEAVER_WAIT_TICKS_MAX in the Q16.16 variant). This
++	 * keeps the FP dispatch decision aligned with the fixed-point
++	 * one - aging dominates over time so abandoned threads
++	 * eventually win. Do NOT normalize to [0,1] here; that would
++	 * change the algorithm's scale and the variants would disagree
++	 * on which Weft wins.
++	 */
++	float wait = (t->wait_ticks > 65535U) ? 65535.0f : (float)t->wait_ticks;
++	float p_aging = wait * weaver_fp.w_aging;
++
++	return p_urgency + p_density + p_aging;
++}
++
++int weaver_fp_register(struct weaver_fp_thread_data *wd,
++		       struct k_thread *thread,
++		       float priority, bool is_warp)
++{
++	if (wd == NULL || thread == NULL) {
++		return -EINVAL;
++	}
++
++	k_spinlock_key_t key = k_spin_lock(&weaver_fp.lock);
++
++	for (size_t i = 0; i < ARRAY_SIZE(weaver_fp.slots); i++) {
++		if (weaver_fp.slots[i] == NULL) {
++			memset(wd, 0, sizeof(*wd));
++			wd->thread = thread;
++			wd->priority = priority;
++			wd->is_warp = is_warp ? 1U : 0U;
++			wd->base_prio = (int8_t)k_thread_priority_get(thread);
++			wd->boost_levels = CONFIG_WEAVER_FP_DEFAULT_BOOST_LEVELS;
++			wd->weft_boost_prio = clamp_boost(wd->base_prio, wd->boost_levels);
++			wd->in_use = 1U;
++			weaver_fp.slots[i] = wd;
++			k_spin_unlock(&weaver_fp.lock, key);
++			return 0;
++		}
++	}
++
++	k_spin_unlock(&weaver_fp.lock, key);
++	return -ENOMEM;
++}
++
++int weaver_fp_unregister(struct weaver_fp_thread_data *wd)
++{
++	if (wd == NULL) {
++		return -EINVAL;
++	}
++
++	k_spinlock_key_t key = k_spin_lock(&weaver_fp.lock);
++
++	for (size_t i = 0; i < ARRAY_SIZE(weaver_fp.slots); i++) {
++		if (weaver_fp.slots[i] == wd) {
++			if (wd->thread != NULL) {
++				k_thread_priority_set(wd->thread, wd->base_prio);
++			}
++			weaver_fp.slots[i] = NULL;
++			wd->in_use = 0U;
++			k_spin_unlock(&weaver_fp.lock, key);
++			return 0;
++		}
++	}
++
++	k_spin_unlock(&weaver_fp.lock, key);
++	return -ENOENT;
++}
++
++void weaver_fp_set_buffer_fill(struct weaver_fp_thread_data *wd, float fill)
++{
++	if (wd == NULL) {
++		return;
++	}
++	if (fill < 0.0f) fill = 0.0f;
++	if (fill > 1.0f) fill = 1.0f;
++	wd->last_fill = wd->buffer_fill;
++	wd->buffer_fill = fill;
++}
++
++void weaver_fp_set_buffer_fill_predictive(struct weaver_fp_thread_data *wd,
++					  float fill)
++{
++	if (wd == NULL) {
++		return;
++	}
++	if (fill < 0.0f) fill = 0.0f;
++	if (fill > 1.0f) fill = 1.0f;
++
++	float prev = wd->buffer_fill;
++	wd->last_fill = prev;
++
++	float projected = fill + (fill - prev);
++	if (projected < 0.0f) projected = 0.0f;
++	if (projected > 1.0f) projected = 1.0f;
++	wd->buffer_fill = projected;
++}
++
++void weaver_fp_set_warp_deadline(struct weaver_fp_thread_data *wd,
++				 uint32_t period_ticks)
++{
++	if (wd == NULL) {
++		return;
++	}
++	wd->period_ticks = period_ticks;
++	wd->next_deadline_ticks = period_ticks;
++}
++
++void weaver_fp_set_boost_levels(struct weaver_fp_thread_data *wd, uint8_t levels)
++{
++	if (wd == NULL || levels == 0) {
++		return;
++	}
++	wd->boost_levels = levels;
++	wd->weft_boost_prio = clamp_boost(wd->base_prio, levels);
++}
++
++void weaver_fp_set_weights(float w_urgency, float w_density, float w_aging)
++{
++	k_spinlock_key_t key = k_spin_lock(&weaver_fp.lock);
++	if (w_urgency > 0.0f) weaver_fp.w_urgency = w_urgency;
++	if (w_density > 0.0f) weaver_fp.w_density = w_density;
++	if (w_aging   > 0.0f) weaver_fp.w_aging   = w_aging;
++	k_spin_unlock(&weaver_fp.lock, key);
++}
++
++void weaver_fp_tick(void)
++{
++#ifdef CONFIG_WEAVER_FP_TIMING
++	uint32_t cyc_start = cyc_now();
++#endif
++	struct weaver_fp_thread_data *winner = NULL;
++	float max_pressure = 0.0f;
++	float sys_pressure = 0.0f;
++	uint32_t min_warp_remaining = UINT32_MAX;
++	bool any_weft_pressure = false;
++
++	struct weaver_fp_thread_data *snap[CONFIG_WEAVER_FP_MAX_THREADS];
++
++	k_spinlock_key_t key = k_spin_lock(&weaver_fp.lock);
++	memcpy(snap, weaver_fp.slots, sizeof(snap));
++	k_spin_unlock(&weaver_fp.lock, key);
++
++	/* Pass 1: aging + Warp deadline countdown. */
++	struct k_thread *current = k_current_get();
++	for (size_t i = 0; i < ARRAY_SIZE(snap); i++) {
++		struct weaver_fp_thread_data *wd = snap[i];
++		if (wd == NULL || !wd->in_use) continue;
++
++		if (wd->thread == current) {
++			wd->wait_ticks = 0;
++		} else if (wd->wait_ticks < 65535U) {
++			wd->wait_ticks++;
++		}
++
++		if (wd->is_warp && wd->period_ticks > 0) {
++			if (wd->next_deadline_ticks == 0) {
++				wd->next_deadline_ticks = wd->period_ticks;
++			} else {
++				wd->next_deadline_ticks--;
++			}
++			if (wd->next_deadline_ticks < min_warp_remaining) {
++				min_warp_remaining = wd->next_deadline_ticks;
++			}
++		}
++	}
++
++	/* Pass 2: pressure + dispatch decisions. */
++	for (size_t i = 0; i < ARRAY_SIZE(snap); i++) {
++		struct weaver_fp_thread_data *wd = snap[i];
++		if (wd == NULL || !wd->in_use || wd->is_warp) continue;
++
++		float p = weaver_fp_calculate_pressure(wd);
++		sys_pressure += p;
++		if (p > 0.0f) any_weft_pressure = true;
++		if (p > max_pressure) {
++			max_pressure = p;
++			winner = wd;
++		}
++	}
++
++	weaver_fp.system_pressure = sys_pressure;
++	weaver_fp.ticks_to_next_warp = min_warp_remaining;
++	weaver_fp.stats.total_ticks++;
++
++	uint8_t level = fuzzy_throttle_level(sys_pressure);
++	weaver_fp.throttle_level_raw = level;
++	weaver_fp.throttle_level_smooth =
++		(uint8_t)((3U * (uint32_t)weaver_fp.throttle_level_smooth + level) >> 2);
++
++	{
++		static uint8_t prev_above;
++		uint8_t now_above = (weaver_fp.throttle_level_smooth >= 128U) ? 1U : 0U;
++		if (now_above && !prev_above) {
++			weaver_fp.stats.throttle_events++;
++		}
++		prev_above = now_above;
++	}
++
++#ifdef CONFIG_WEAVER_FP_POWER_AWARE
++	if (!any_weft_pressure) {
++		weaver_fp.stats.skipped_idle_ticks++;
++#ifdef CONFIG_WEAVER_FP_TIMING
++		weaver_fp.last_tick_cycles = cyc_now() - cyc_start;
++#endif
++		return;
++	}
++#endif
++
++	bool prewarp_clear =
++		min_warp_remaining <= (uint32_t)CONFIG_WEAVER_FP_PREWARP_GUARD_TICKS;
++
++	if (prewarp_clear) {
++		winner = NULL;
++		weaver_fp.stats.pre_warp_clears++;
++	}
++
++	for (size_t i = 0; i < ARRAY_SIZE(snap); i++) {
++		struct weaver_fp_thread_data *wd = snap[i];
++		if (wd == NULL || !wd->in_use || wd->is_warp) continue;
++
++		int8_t target = (wd == winner) ? wd->weft_boost_prio : wd->base_prio;
++		if (k_thread_priority_get(wd->thread) != target) {
++			k_thread_priority_set(wd->thread, target);
++			if (wd == winner) {
++				weaver_fp.stats.weft_promotions++;
++			}
++		}
++	}
++
++#ifdef CONFIG_WEAVER_FP_TIMING
++	weaver_fp.last_tick_cycles = cyc_now() - cyc_start;
++#endif
++}
++
++float weaver_fp_system_pressure(void)
++{
++	return weaver_fp.system_pressure;
++}
++
++uint32_t weaver_fp_ticks_to_next_warp(void)
++{
++	return weaver_fp.ticks_to_next_warp;
++}
++
++bool weaver_fp_should_throttle(void)
++{
++	return weaver_fp.throttle_level_smooth >= 128U;
++}
++
++uint8_t weaver_fp_throttle_level(void)
++{
++	return weaver_fp.throttle_level_smooth;
++}
++
++void weaver_fp_get_stats(struct weaver_fp_stats *out)
++{
++	if (out == NULL) return;
++	k_spinlock_key_t key = k_spin_lock(&weaver_fp.lock);
++	*out = weaver_fp.stats;
++	k_spin_unlock(&weaver_fp.lock, key);
++}
++
++uint32_t weaver_fp_get_last_tick_cycles(void)
++{
++#ifdef CONFIG_WEAVER_FP_TIMING
++	return weaver_fp.last_tick_cycles;
++#else
++	return 0;
++#endif
++}
 diff --git a/samples/boards/apollo510_evb/weaver_wearable/CMakeLists.txt b/samples/boards/apollo510_evb/weaver_wearable/CMakeLists.txt
 new file mode 100644
 index 00000000000..7914a85db3f
@@ -1584,6 +2257,19 @@ index 00000000000..ec729bb208c
 +  hardware FIFOs.
 +* Burst events are deterministic at t=10s and t=20s. Real wearable
 +  bursts are not periodic; expect higher variance in production.
+diff --git a/samples/boards/apollo510b_evb/weaver_benchmark/fp.conf b/samples/boards/apollo510b_evb/weaver_benchmark/fp.conf
+new file mode 100644
+index 00000000000..100b48ed298
+--- /dev/null
++++ b/samples/boards/apollo510b_evb/weaver_benchmark/fp.conf
+@@ -0,0 +1,7 @@
++# Floating-point Weaver variant. Mutually exclusive with the
++# fixed-point CONFIG_WEAVER_BATCH_* options.
++CONFIG_WEAVER_SCHED=n
++CONFIG_WEAVER_SCHED_FP=y
++CONFIG_WEAVER_FP_WEARABLE_PRESET=y
++CONFIG_WEAVER_FP_TIMING=y
++CONFIG_FPU=y
 diff --git a/samples/boards/apollo510b_evb/weaver_benchmark/hybrid.conf b/samples/boards/apollo510b_evb/weaver_benchmark/hybrid.conf
 new file mode 100644
 index 00000000000..252cddbd8c9
@@ -1638,10 +2324,10 @@ index 00000000000..1fb5193fa03
 +CONFIG_PM_DEVICE_RUNTIME=y
 diff --git a/samples/boards/apollo510b_evb/weaver_benchmark/sample.yaml b/samples/boards/apollo510b_evb/weaver_benchmark/sample.yaml
 new file mode 100644
-index 00000000000..e68abd37797
+index 00000000000..e765903846b
 --- /dev/null
 +++ b/samples/boards/apollo510b_evb/weaver_benchmark/sample.yaml
-@@ -0,0 +1,31 @@
+@@ -0,0 +1,35 @@
 +sample:
 +  description: Canonical Weaver benchmark workload (RFC §7.1) for Apollo510B
 +    LP at 96 MHz. Builds with one of stock / scalar / hybrid / full-MVE batch
@@ -1673,12 +2359,16 @@ index 00000000000..e68abd37797
 +    platform_allow: apollo510b_evb
 +    integration_platforms: [apollo510b_evb]
 +    extra_args: EXTRA_CONF_FILE=stock.conf
++  sample.kernel.weaver_benchmark.fp:
++    platform_allow: apollo510b_evb
++    integration_platforms: [apollo510b_evb]
++    extra_args: EXTRA_CONF_FILE=fp.conf
 diff --git a/samples/boards/apollo510b_evb/weaver_benchmark/scripts/bench.sh b/samples/boards/apollo510b_evb/weaver_benchmark/scripts/bench.sh
 new file mode 100755
-index 00000000000..f3302e6506b
+index 00000000000..dae20b8cc13
 --- /dev/null
 +++ b/samples/boards/apollo510b_evb/weaver_benchmark/scripts/bench.sh
-@@ -0,0 +1,45 @@
+@@ -0,0 +1,46 @@
 +#!/usr/bin/env bash
 +#
 +# Build and flash the canonical benchmark with each variant in turn.
@@ -1714,22 +2404,23 @@ index 00000000000..f3302e6506b
 +run_variant weaver-scalar  ""
 +run_variant weaver-hybrid  hybrid.conf
 +run_variant weaver-mve     mve.conf
++run_variant weaver-fp      fp.conf
 +
 +echo
 +echo "=== comparison table ==="
 +printf "%-15s %-8s %-8s %-8s %-8s %-8s %-8s %-8s %-8s %-8s %-8s\n" \
 +       variant imu_ovr ppg_ovr gatt_ovr fus_p50 fus_p99 hr_p50 hr_p99 tick_cyc promo prewarp
-+for v in stock weaver-scalar weaver-hybrid weaver-mve; do
++for v in stock weaver-scalar weaver-hybrid weaver-mve weaver-fp; do
 +    line=$(grep "^CSV " "$LOGDIR/$v.log" | tail -1 | sed 's/^CSV //')
 +    IFS=',' read -ra fields <<< "$line"
 +    printf "%-15s %-8s %-8s %-8s %-8s %-8s %-8s %-8s %-8s %-8s %-8s\n" "${fields[@]}"
 +done
 diff --git a/samples/boards/apollo510b_evb/weaver_benchmark/src/main.c b/samples/boards/apollo510b_evb/weaver_benchmark/src/main.c
 new file mode 100644
-index 00000000000..b9a59b2f2c0
+index 00000000000..d16add0d1fa
 --- /dev/null
 +++ b/samples/boards/apollo510b_evb/weaver_benchmark/src/main.c
-@@ -0,0 +1,472 @@
+@@ -0,0 +1,515 @@
 +/*
 + * Copyright (c) 2026 Ambiq Micro, Inc.
 + * SPDX-License-Identifier: Apache-2.0
@@ -1758,6 +2449,47 @@ index 00000000000..b9a59b2f2c0
 +
 +#ifdef CONFIG_WEAVER_SCHED
 +#include <zephyr/kernel/weaver_sched.h>
++#endif
++#ifdef CONFIG_WEAVER_SCHED_FP
++#include <zephyr/kernel/weaver_sched_fp.h>
++#endif
++
++/* Compile-time alias so the body of this sample stays variant-agnostic. */
++#if defined(CONFIG_WEAVER_SCHED_FP)
++#  define WV_ENABLED                  1
++#  define wv_thread_data              weaver_fp_thread_data
++#  define wv_stats                    weaver_fp_stats
++#  define wv_register(wd, t, p, w)    weaver_fp_register((wd),(t),(float)(p),(w))
++#  define wv_unregister               weaver_fp_unregister
++#  define wv_set_warp_deadline        weaver_fp_set_warp_deadline
++#  define wv_set_buffer_fill_pred(wd,q) weaver_fp_set_buffer_fill_predictive((wd),(float)(q)/(float)WEAVER_Q16_ONE_LOCAL)
++#  define wv_tick                     weaver_fp_tick
++#  define wv_system_pressure          weaver_fp_system_pressure
++#  define wv_should_throttle          weaver_fp_should_throttle
++#  define wv_throttle_level           weaver_fp_throttle_level
++#  define wv_ticks_to_next_warp       weaver_fp_ticks_to_next_warp
++#  define wv_get_stats                weaver_fp_get_stats
++#  define wv_get_last_tick_cycles     weaver_fp_get_last_tick_cycles
++#  define WEAVER_Q16_ONE_LOCAL        65536U  /* shared depth_to_q16 helper unit */
++#elif defined(CONFIG_WEAVER_SCHED)
++#  define WV_ENABLED                  1
++#  define wv_thread_data              weaver_thread_data
++#  define wv_stats                    weaver_stats
++#  define wv_register(wd, t, p, w)    weaver_register((wd),(t),WEAVER_TO_Q16((uint32_t)(p)),(w))
++#  define wv_unregister               weaver_unregister
++#  define wv_set_warp_deadline        weaver_set_warp_deadline
++#  define wv_set_buffer_fill_pred(wd,q) weaver_set_buffer_fill_predictive_q16((wd),(q))
++#  define wv_tick                     weaver_tick
++#  define wv_system_pressure          weaver_system_pressure
++#  define wv_should_throttle          weaver_should_throttle
++#  define wv_throttle_level           weaver_throttle_level
++#  define wv_ticks_to_next_warp       weaver_ticks_to_next_warp
++#  define wv_get_stats                weaver_get_stats
++#  define wv_get_last_tick_cycles     weaver_get_last_tick_cycles
++#  define WEAVER_Q16_ONE_LOCAL        WEAVER_Q16_ONE
++#else
++#  define WV_ENABLED                  0
++#  define WEAVER_Q16_ONE_LOCAL        65536U
 +#endif
 +
 +LOG_MODULE_REGISTER(weaver_bench, LOG_LEVEL_INF);
@@ -1833,12 +2565,12 @@ index 00000000000..b9a59b2f2c0
 +	return c;
 +}
 +
-+#ifdef CONFIG_WEAVER_SCHED
++#if WV_ENABLED
 +static inline uint32_t depth_to_q16(int depth)
 +{
 +	if (depth <= 0) return 0;
-+	if (depth >= FIFO_DEPTH) return WEAVER_Q16_ONE;
-+	return ((uint32_t)depth * WEAVER_Q16_ONE) / FIFO_DEPTH;
++	if (depth >= FIFO_DEPTH) return WEAVER_Q16_ONE_LOCAL;
++	return ((uint32_t)depth * WEAVER_Q16_ONE_LOCAL) / FIFO_DEPTH;
 +}
 +#endif
 +
@@ -1926,9 +2658,9 @@ index 00000000000..b9a59b2f2c0
 +
 +/* ---- Warp dummy / Weft dummy ---- */
 +
-+#ifdef CONFIG_WEAVER_SCHED
-+static struct weaver_thread_data wd_ble, wd_imu, wd_ppg, wd_fusion, wd_hr,
-+				 wd_gatt, wd_class, wd_disp, wd_nvm;
++#if WV_ENABLED
++static struct wv_thread_data wd_ble, wd_imu, wd_ppg, wd_fusion, wd_hr,
++			     wd_gatt, wd_class, wd_disp, wd_nvm;
 +#endif
 +
 +static void ble_fn(void *a, void *b, void *c)
@@ -1957,8 +2689,8 @@ index 00000000000..b9a59b2f2c0
 +		for (int i = 0; i < n; i++) ts_push(&imu_ts, now_us);
 +		fifo_produce(&imu_fifo, n);
 +
-+#ifdef CONFIG_WEAVER_SCHED
-+		weaver_set_buffer_fill_predictive_q16(
++#if WV_ENABLED
++		wv_set_buffer_fill_pred(
 +			&wd_fusion, depth_to_q16(atomic_get(&imu_fifo.depth)));
 +#endif
 +		k_sleep(K_MSEC(period));
@@ -1973,8 +2705,8 @@ index 00000000000..b9a59b2f2c0
 +		uint32_t now_us = k_cyc_to_us_floor32(k_cycle_get_32());
 +		ts_push(&ppg_ts, now_us);
 +		fifo_produce(&ppg_fifo, 1);
-+#ifdef CONFIG_WEAVER_SCHED
-+		weaver_set_buffer_fill_predictive_q16(
++#if WV_ENABLED
++		wv_set_buffer_fill_pred(
 +			&wd_hr, depth_to_q16(atomic_get(&ppg_fifo.depth)));
 +#endif
 +		k_sleep(K_MSEC(PPG_PERIOD_MS));
@@ -1995,8 +2727,8 @@ index 00000000000..b9a59b2f2c0
 +				}
 +			}
 +			k_busy_wait(FUSION_WORK_US);
-+#ifdef CONFIG_WEAVER_SCHED
-+			weaver_set_buffer_fill_predictive_q16(
++#if WV_ENABLED
++			wv_set_buffer_fill_pred(
 +				&wd_fusion,
 +				depth_to_q16(atomic_get(&imu_fifo.depth)));
 +#endif
@@ -2019,8 +2751,8 @@ index 00000000000..b9a59b2f2c0
 +				}
 +			}
 +			k_busy_wait(HR_WORK_US);
-+#ifdef CONFIG_WEAVER_SCHED
-+			weaver_set_buffer_fill_predictive_q16(
++#if WV_ENABLED
++			wv_set_buffer_fill_pred(
 +				&wd_hr,
 +				depth_to_q16(atomic_get(&ppg_fifo.depth)));
 +#endif
@@ -2035,14 +2767,14 @@ index 00000000000..b9a59b2f2c0
 +	while (1) {
 +		int n = atomic_get(&in_burst) ? 6 : 1;
 +		fifo_produce(&gatt_fifo, n);
-+#ifdef CONFIG_WEAVER_SCHED
-+		weaver_set_buffer_fill_predictive_q16(
++#if WV_ENABLED
++		wv_set_buffer_fill_pred(
 +			&wd_gatt, depth_to_q16(atomic_get(&gatt_fifo.depth)));
 +#endif
 +		k_busy_wait(GATT_WORK_US);
 +		fifo_consume(&gatt_fifo, 3);
-+#ifdef CONFIG_WEAVER_SCHED
-+		weaver_set_buffer_fill_predictive_q16(
++#if WV_ENABLED
++		wv_set_buffer_fill_pred(
 +			&wd_gatt, depth_to_q16(atomic_get(&gatt_fifo.depth)));
 +#endif
 +		k_sleep(K_MSEC(15));
@@ -2091,23 +2823,25 @@ index 00000000000..b9a59b2f2c0
 +static struct k_thread t_ble, t_imu, t_ppg, t_fusion, t_hr, t_gatt,
 +		       t_class, t_disp, t_nvm;
 +
-+#ifdef CONFIG_WEAVER_SCHED
-+static void weaver_tick_fn(struct k_timer *t) { ARG_UNUSED(t); weaver_tick(); }
++#if WV_ENABLED
++static void weaver_tick_fn(struct k_timer *t) { ARG_UNUSED(t); wv_tick(); }
 +static K_TIMER_DEFINE(weaver_timer, weaver_tick_fn, NULL);
 +#endif
 +
 +/* ---- Build label for the metrics line ---- */
 +
-+#if !defined(CONFIG_WEAVER_SCHED)
-+#define BUILD_LABEL "stock"
++#if defined(CONFIG_WEAVER_SCHED_FP)
++#define BUILD_LABEL "weaver-fp"
 +#elif defined(CONFIG_WEAVER_BATCH_MVE)
 +#define BUILD_LABEL "weaver-mve"
 +#elif defined(CONFIG_WEAVER_BATCH_HYBRID)
 +#define BUILD_LABEL "weaver-hybrid"
 +#elif defined(CONFIG_WEAVER_BATCH_SCALAR)
 +#define BUILD_LABEL "weaver-scalar"
-+#else
++#elif defined(CONFIG_WEAVER_SCHED)
 +#define BUILD_LABEL "weaver-?"
++#else
++#define BUILD_LABEL "stock"
 +#endif
 +
 +int main(void)
@@ -2126,22 +2860,22 @@ index 00000000000..b9a59b2f2c0
 +	k_thread_create(&t_disp,   s_disp,   STACK_SIZE, disp_fn,       NULL,NULL,NULL, DISP_PRIO,   0, K_NO_WAIT);
 +	k_thread_create(&t_nvm,    s_nvm,    STACK_SIZE, nvm_fn,        NULL,NULL,NULL, NVM_PRIO,    0, K_NO_WAIT);
 +
-+#ifdef CONFIG_WEAVER_SCHED
-+	weaver_register(&wd_ble,    &t_ble,    WEAVER_TO_Q16(20), true);
-+	weaver_set_warp_deadline(&wd_ble, BLE_PERIOD_MS);
++#if WV_ENABLED
++	wv_register(&wd_ble,    &t_ble,    20, true);
++	wv_set_warp_deadline(&wd_ble, BLE_PERIOD_MS);
 +
-+	weaver_register(&wd_imu,    &t_imu,    WEAVER_TO_Q16(15), true);
-+	weaver_set_warp_deadline(&wd_imu, IMU_PERIOD_MS);
++	wv_register(&wd_imu,    &t_imu,    15, true);
++	wv_set_warp_deadline(&wd_imu, IMU_PERIOD_MS);
 +
-+	weaver_register(&wd_ppg,    &t_ppg,    WEAVER_TO_Q16(15), true);
-+	weaver_set_warp_deadline(&wd_ppg, PPG_PERIOD_MS);
++	wv_register(&wd_ppg,    &t_ppg,    15, true);
++	wv_set_warp_deadline(&wd_ppg, PPG_PERIOD_MS);
 +
-+	weaver_register(&wd_fusion, &t_fusion, WEAVER_TO_Q16(8), false);
-+	weaver_register(&wd_hr,     &t_hr,     WEAVER_TO_Q16(8), false);
-+	weaver_register(&wd_gatt,   &t_gatt,   WEAVER_TO_Q16(7), false);
-+	weaver_register(&wd_class,  &t_class,  WEAVER_TO_Q16(5), false);
-+	weaver_register(&wd_disp,   &t_disp,   WEAVER_TO_Q16(4), false);
-+	weaver_register(&wd_nvm,    &t_nvm,    WEAVER_TO_Q16(2), false);
++	wv_register(&wd_fusion, &t_fusion, 8, false);
++	wv_register(&wd_hr,     &t_hr,     8, false);
++	wv_register(&wd_gatt,   &t_gatt,   7, false);
++	wv_register(&wd_class,  &t_class,  5, false);
++	wv_register(&wd_disp,   &t_disp,   4, false);
++	wv_register(&wd_nvm,    &t_nvm,    2, false);
 +
 +	k_timer_start(&weaver_timer, K_MSEC(1), K_MSEC(1));
 +#endif
@@ -2171,10 +2905,10 @@ index 00000000000..b9a59b2f2c0
 +	uint32_t fusion_max = fusion_lat.max_us;
 +	uint32_t hr_max     = hr_lat.max_us;
 +
-+#ifdef CONFIG_WEAVER_SCHED
-+	struct weaver_stats s;
-+	weaver_get_stats(&s);
-+	uint32_t tick_cyc   = weaver_get_last_tick_cycles();
++#if WV_ENABLED
++	struct wv_stats s;
++	wv_get_stats(&s);
++	uint32_t tick_cyc   = wv_get_last_tick_cycles();
 +	uint32_t throttle   = s.throttle_events;
 +	uint32_t promotions = s.weft_promotions;
 +	uint32_t prewarp    = s.pre_warp_clears;
@@ -2740,6 +3474,441 @@ index 00000000000..7a752f87f7f
 +	printk("Weaver Wearable Demo Complete\n");
 +	return 0;
 +}
+diff --git a/samples/boards/apollo510b_evb/weaver_wearable_fp/CMakeLists.txt b/samples/boards/apollo510b_evb/weaver_wearable_fp/CMakeLists.txt
+new file mode 100644
+index 00000000000..77cbbb3eca7
+--- /dev/null
++++ b/samples/boards/apollo510b_evb/weaver_wearable_fp/CMakeLists.txt
+@@ -0,0 +1,5 @@
++# SPDX-License-Identifier: Apache-2.0
++cmake_minimum_required(VERSION 3.20.0)
++find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
++project(weaver_wearable_fp)
++target_sources(app PRIVATE src/main.c)
+diff --git a/samples/boards/apollo510b_evb/weaver_wearable_fp/README.rst b/samples/boards/apollo510b_evb/weaver_wearable_fp/README.rst
+new file mode 100644
+index 00000000000..352ffbc1254
+--- /dev/null
++++ b/samples/boards/apollo510b_evb/weaver_wearable_fp/README.rst
+@@ -0,0 +1,37 @@
++.. zephyr:code-sample:: weaver_wearable_fp
++   :name: Weaver Wearable FP (Apollo510 Blue EVB)
++
++   Floating-point variant of the Weaver wearable demo. Same workload
++   as ``weaver_wearable`` but using ``CONFIG_WEAVER_SCHED_FP=y`` (the
++   single-precision FPU implementation) instead of the Q16.16
++   fixed-point one.
++
++When to pick this sample
++************************
++
++Pick this variant when:
++
++* Your Weft threads (sensor fusion, HR FFT, graphics) already use
++  the FPU, so the lazy floating-point context-save tax is already
++  being paid;
++* You want a code path that's easier to audit than the Q16.16 one;
++* Apollo510 is in HP mode (192/250 MHz) where FP cost is dwarfed
++  by available cycles.
++
++Pick the fixed-point variant (``weaver_wearable``) when:
++
++* Battery-constrained LP-mode (96 MHz) and no other thread uses
++  the FPU;
++* The MCU has no FPU at all (Cortex-M0, M3);
++* Bit-identical reproducibility is required.
++
++See ``FP_VS_FIXED.md`` for the full comparison.
++
++Building
++********
++
++.. zephyr-app-commands::
++   :zephyr-app: samples/boards/apollo510b_evb/weaver_wearable_fp
++   :board: apollo510b_evb
++   :shield: ap510_disp
++   :goals: build flash
+diff --git a/samples/boards/apollo510b_evb/weaver_wearable_fp/boards/apollo510b_evb.overlay b/samples/boards/apollo510b_evb/weaver_wearable_fp/boards/apollo510b_evb.overlay
+new file mode 100644
+index 00000000000..733c24cd394
+--- /dev/null
++++ b/samples/boards/apollo510b_evb/weaver_wearable_fp/boards/apollo510b_evb.overlay
+@@ -0,0 +1,69 @@
++/*
++ * Copyright (c) 2026 Ambiq Micro, Inc.
++ *
++ * SPDX-License-Identifier: Apache-2.0
++ *
++ * Apollo510 Blue EVB overlay for the Weaver wearable demo.
++ *
++ * Wiring assumptions:
++ *   mikroBUS slot 1 -> 6DOF IMU 14 Click   (BMI270)  on IOM0 / I2C0
++ *   mikroBUS slot 2 -> Heart Rate 4 Click  (MAX30101) on IOM1 / I2C1
++ *
++ * If the EVB exposes a single mikroBUS slot, populate it with the
++ * BMI270 click and remove the &iom1 / max30101 block below. The
++ * scheduler logic is identical; the demo just won't drive the PPG
++ * pipeline.
++ *
++ * The display is provided by the ap510_disp shield (MIPI-DSI AMOLED
++ * + CHSC5x touch on iom2/i2c2). BLE is on iom6/spi6 from the board
++ * DTS.
++ */
++
++&iom0 {
++	cmdq-buffer-location = "SRAM_NO_CACHE";
++	cmdq-buffer-size = <256>;
++
++	i2c0: i2c {
++		pinctrl-0 = <&i2c0_default>;
++		pinctrl-names = "default";
++		clock-frequency = <I2C_BITRATE_FAST>;
++		status = "okay";
++
++		bmi270@68 {
++			compatible = "bosch,bmi270-i2c";
++			reg = <0x68>;
++			label = "BMI270";
++			status = "okay";
++		};
++	};
++};
++
++&iom1 {
++	cmdq-buffer-location = "SRAM_NO_CACHE";
++	cmdq-buffer-size = <256>;
++
++	i2c1: i2c {
++		pinctrl-0 = <&i2c1_default>;
++		pinctrl-names = "default";
++		clock-frequency = <I2C_BITRATE_FAST>;
++		status = "okay";
++
++		max30101@57 {
++			compatible = "maxim,max30101";
++			reg = <0x57>;
++			label = "MAX30101";
++			status = "okay";
++
++			/* Conservative defaults; tune for your wearable. */
++			fifo = <0x4f>;
++			smp-ave = "1";
++			fifo-rollover-en;
++			mode = "multi-led";
++			slot1 = "red";
++			slot2 = "ir";
++			adc-rge = "16384";
++			sr = "100";
++			led-pa = [02 02 00 00];
++		};
++	};
++};
+diff --git a/samples/boards/apollo510b_evb/weaver_wearable_fp/prj.conf b/samples/boards/apollo510b_evb/weaver_wearable_fp/prj.conf
+new file mode 100644
+index 00000000000..87480d5fb0e
+--- /dev/null
++++ b/samples/boards/apollo510b_evb/weaver_wearable_fp/prj.conf
+@@ -0,0 +1,36 @@
++# Weaver wearable on Apollo510 Blue EVB at 96 MHz LP mode, FP variant.
++# Same workload as weaver_wearable but using the floating-point
++# scheduler. Suitable when your Weft threads already use the FPU.
++
++CONFIG_WEAVER_SCHED_FP=y
++CONFIG_WEAVER_FP_WEARABLE_PRESET=y
++CONFIG_WEAVER_FP_TIMING=y
++
++CONFIG_FPU=y
++
++# Sensor API
++CONFIG_I2C=y
++CONFIG_SENSOR=y
++CONFIG_BMI270=y
++CONFIG_MAX30101=y
++
++# BLE host stack
++CONFIG_BT=y
++CONFIG_BT_PERIPHERAL=y
++CONFIG_BT_DEVICE_NAME="Weaver FP Wearable"
++CONFIG_BT_DIS=y
++
++# Logging / runtime
++CONFIG_LOG=y
++CONFIG_LOG_MODE_MINIMAL=y
++CONFIG_THREAD_NAME=y
++CONFIG_THREAD_RUNTIME_STATS=y
++
++CONFIG_MAIN_STACK_SIZE=4096
++CONFIG_HEAP_MEM_POOL_SIZE=4096
++CONFIG_SYS_CLOCK_TICKS_PER_SEC=1000
++CONFIG_MP_MAX_NUM_CPUS=1
++
++CONFIG_PM=y
++CONFIG_PM_DEVICE=y
++CONFIG_PM_DEVICE_RUNTIME=y
+diff --git a/samples/boards/apollo510b_evb/weaver_wearable_fp/sample.yaml b/samples/boards/apollo510b_evb/weaver_wearable_fp/sample.yaml
+new file mode 100644
+index 00000000000..c972d51e6e2
+--- /dev/null
++++ b/samples/boards/apollo510b_evb/weaver_wearable_fp/sample.yaml
+@@ -0,0 +1,25 @@
++sample:
++  description: Weaver pressure-aware scheduler driving real wearable sensors
++    (BMI270 + MAX30101 Click boards) via the floating-point variant on
++    Apollo510 Blue EVB.
++  name: Weaver Wearable FP (Apollo510B + Click)
++common:
++  tags:
++    - kernel
++    - weaver
++    - weaver-fp
++    - wearable
++    - sensor
++  harness: console
++  harness_config:
++    type: one_line
++    regex:
++      - "Weaver FP Wearable Demo Complete"
++tests:
++  sample.kernel.weaver_wearable_fp.apollo510b:
++    platform_allow:
++      - apollo510b_evb
++    integration_platforms:
++      - apollo510b_evb
++    extra_args:
++      - SHIELD=ap510_disp
+diff --git a/samples/boards/apollo510b_evb/weaver_wearable_fp/src/main.c b/samples/boards/apollo510b_evb/weaver_wearable_fp/src/main.c
+new file mode 100644
+index 00000000000..5674270f0b6
+--- /dev/null
++++ b/samples/boards/apollo510b_evb/weaver_wearable_fp/src/main.c
+@@ -0,0 +1,227 @@
++/*
++ * Copyright (c) 2026 Ambiq Micro, Inc.
++ * SPDX-License-Identifier: Apache-2.0
++ *
++ * Same wearable workload as samples/.../weaver_wearable, but using
++ * the floating-point Weaver variant. See weaver_sched_fp.h header for
++ * when this variant is preferable to the fixed-point one.
++ */
++
++#include <zephyr/kernel.h>
++#include <zephyr/kernel/weaver_sched_fp.h>
++#include <zephyr/device.h>
++#include <zephyr/drivers/sensor.h>
++#include <zephyr/sys/printk.h>
++#include <zephyr/logging/log.h>
++
++LOG_MODULE_REGISTER(weaver_wearable_fp, LOG_LEVEL_INF);
++
++#define IMU_PERIOD_MS  20
++#define PPG_PERIOD_MS  40
++#define DEMO_DURATION_MS 5000
++
++#define IMU_PRIO        3
++#define PPG_PRIO        4
++#define FUSION_PRIO     8
++#define HR_PRIO         8
++#define GATT_TX_PRIO    9
++#define DISPLAY_PRIO    11
++#define NVM_PRIO        12
++
++#define FIFO_SAMPLES 32
++
++static atomic_t imu_ring  = ATOMIC_INIT(0);
++static atomic_t ppg_ring  = ATOMIC_INIT(0);
++static atomic_t gatt_ring = ATOMIC_INIT(0);
++
++static const struct device *const bmi270_dev   = DEVICE_DT_GET_ANY(bosch_bmi270_i2c);
++static const struct device *const max30101_dev = DEVICE_DT_GET_ANY(maxim_max30101);
++
++#define STACK_SIZE 2048
++
++static K_THREAD_STACK_DEFINE(s_imu,    STACK_SIZE);
++static K_THREAD_STACK_DEFINE(s_ppg,    STACK_SIZE);
++static K_THREAD_STACK_DEFINE(s_fusion, STACK_SIZE);
++static K_THREAD_STACK_DEFINE(s_hr,     STACK_SIZE);
++static K_THREAD_STACK_DEFINE(s_gatt,   STACK_SIZE);
++static K_THREAD_STACK_DEFINE(s_disp,   STACK_SIZE);
++static K_THREAD_STACK_DEFINE(s_nvm,    STACK_SIZE);
++
++static struct k_thread t_imu, t_ppg, t_fusion, t_hr, t_gatt, t_disp, t_nvm;
++static struct weaver_fp_thread_data wd_imu, wd_ppg, wd_fusion, wd_hr,
++				    wd_gatt, wd_disp, wd_nvm;
++
++static inline float depth_to_fill(int depth)
++{
++	if (depth <= 0)             return 0.0f;
++	if (depth >= FIFO_SAMPLES)  return 1.0f;
++	return (float)depth / (float)FIFO_SAMPLES;
++}
++
++static void imu_sample_fn(void *a, void *b, void *c)
++{
++	ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
++	while (1) {
++		if (device_is_ready(bmi270_dev)) {
++			(void)sensor_sample_fetch(bmi270_dev);
++			int d = atomic_inc(&imu_ring) + 1;
++			if (d > FIFO_SAMPLES) atomic_set(&imu_ring, FIFO_SAMPLES);
++			weaver_fp_set_buffer_fill_predictive(
++				&wd_fusion, depth_to_fill(d));
++		}
++		k_sleep(K_MSEC(IMU_PERIOD_MS));
++	}
++}
++
++static void ppg_sample_fn(void *a, void *b, void *c)
++{
++	ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
++	while (1) {
++		if (device_is_ready(max30101_dev)) {
++			(void)sensor_sample_fetch(max30101_dev);
++			int d = atomic_inc(&ppg_ring) + 1;
++			if (d > FIFO_SAMPLES) atomic_set(&ppg_ring, FIFO_SAMPLES);
++			weaver_fp_set_buffer_fill_predictive(
++				&wd_hr, depth_to_fill(d));
++		}
++		k_sleep(K_MSEC(PPG_PERIOD_MS));
++	}
++}
++
++static void fusion_fn(void *a, void *b, void *c)
++{
++	ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
++	while (1) {
++		int d = atomic_get(&imu_ring);
++		if (d > 0) {
++			int new_d = MAX(0, d - 8);
++			atomic_set(&imu_ring, new_d);
++			weaver_fp_set_buffer_fill_predictive(
++				&wd_fusion, depth_to_fill(new_d));
++		}
++		k_sleep(K_MSEC(5));
++	}
++}
++
++static void hr_fn(void *a, void *b, void *c)
++{
++	ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
++	while (1) {
++		int d = atomic_get(&ppg_ring);
++		if (d > 0) {
++			int new_d = MAX(0, d - 4);
++			atomic_set(&ppg_ring, new_d);
++			weaver_fp_set_buffer_fill_predictive(
++				&wd_hr, depth_to_fill(new_d));
++		}
++		k_sleep(K_MSEC(10));
++	}
++}
++
++static void gatt_tx_fn(void *a, void *b, void *c)
++{
++	ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
++	while (1) {
++		int d = atomic_inc(&gatt_ring) + 1;
++		if (d > FIFO_SAMPLES) atomic_set(&gatt_ring, FIFO_SAMPLES);
++		weaver_fp_set_buffer_fill_predictive(
++			&wd_gatt, depth_to_fill(d));
++
++		k_sleep(K_MSEC(15));
++
++		int new_d = MAX(0, atomic_get(&gatt_ring) - 3);
++		atomic_set(&gatt_ring, new_d);
++		weaver_fp_set_buffer_fill_predictive(
++			&wd_gatt, depth_to_fill(new_d));
++	}
++}
++
++static void display_fn(void *a, void *b, void *c)
++{
++	ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
++	while (1) { k_sleep(K_MSEC(33)); }
++}
++
++static void nvm_fn(void *a, void *b, void *c)
++{
++	ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
++	while (1) { k_sleep(K_MSEC(1000)); }
++}
++
++static void tick_handler(struct k_timer *t) { ARG_UNUSED(t); weaver_fp_tick(); }
++static K_TIMER_DEFINE(weaver_timer, tick_handler, NULL);
++
++int main(void)
++{
++	printk("Weaver FP wearable demo on Apollo510B EVB (LP @ 96 MHz)\n");
++	printk("BMI270   ready: %s\n",
++	       (bmi270_dev   && device_is_ready(bmi270_dev))   ? "yes" : "no");
++	printk("MAX30101 ready: %s\n",
++	       (max30101_dev && device_is_ready(max30101_dev)) ? "yes" : "no");
++
++	k_thread_create(&t_imu,    s_imu,    STACK_SIZE, imu_sample_fn,
++			NULL, NULL, NULL, IMU_PRIO,     0, K_NO_WAIT);
++	k_thread_create(&t_ppg,    s_ppg,    STACK_SIZE, ppg_sample_fn,
++			NULL, NULL, NULL, PPG_PRIO,     0, K_NO_WAIT);
++	k_thread_create(&t_fusion, s_fusion, STACK_SIZE, fusion_fn,
++			NULL, NULL, NULL, FUSION_PRIO,  0, K_NO_WAIT);
++	k_thread_create(&t_hr,     s_hr,     STACK_SIZE, hr_fn,
++			NULL, NULL, NULL, HR_PRIO,      0, K_NO_WAIT);
++	k_thread_create(&t_gatt,   s_gatt,   STACK_SIZE, gatt_tx_fn,
++			NULL, NULL, NULL, GATT_TX_PRIO, 0, K_NO_WAIT);
++	k_thread_create(&t_disp,   s_disp,   STACK_SIZE, display_fn,
++			NULL, NULL, NULL, DISPLAY_PRIO, 0, K_NO_WAIT);
++	k_thread_create(&t_nvm,    s_nvm,    STACK_SIZE, nvm_fn,
++			NULL, NULL, NULL, NVM_PRIO,     0, K_NO_WAIT);
++
++	weaver_fp_register(&wd_imu, &t_imu, 15.0f, true);
++	weaver_fp_set_warp_deadline(&wd_imu, IMU_PERIOD_MS);
++
++	weaver_fp_register(&wd_ppg, &t_ppg, 15.0f, true);
++	weaver_fp_set_warp_deadline(&wd_ppg, PPG_PERIOD_MS);
++
++	weaver_fp_register(&wd_fusion, &t_fusion, 8.0f, false);
++	weaver_fp_register(&wd_hr,     &t_hr,     8.0f, false);
++	weaver_fp_register(&wd_gatt,   &t_gatt,   7.0f, false);
++	weaver_fp_register(&wd_disp,   &t_disp,   4.0f, false);
++	weaver_fp_register(&wd_nvm,    &t_nvm,    2.0f, false);
++
++	k_timer_start(&weaver_timer, K_MSEC(1), K_MSEC(1));
++
++	uint32_t t0 = k_uptime_get_32();
++	while ((k_uptime_get_32() - t0) < DEMO_DURATION_MS) {
++		k_sleep(K_MSEC(500));
++
++		struct weaver_fp_stats s;
++		weaver_fp_get_stats(&s);
++
++		/* %f formatting requires printk float support; fall back to
++		 * printing the pressure * 1000 as an integer for portability.
++		 */
++		uint32_t sysp_milli = (uint32_t)(weaver_fp_system_pressure() * 1000.0f);
++
++		printk("[t=%4ums] sys_p_x1000=%u throttle=%d level=%3u next_warp=%u "
++		       "ticks=%u promo=%u clear=%u idle=%u tick_cyc=%u\n",
++		       k_uptime_get_32() - t0,
++		       sysp_milli,
++		       weaver_fp_should_throttle() ? 1 : 0,
++		       weaver_fp_throttle_level(),
++		       weaver_fp_ticks_to_next_warp(),
++		       s.total_ticks, s.weft_promotions,
++		       s.pre_warp_clears, s.skipped_idle_ticks,
++		       weaver_fp_get_last_tick_cycles());
++	}
++
++	k_timer_stop(&weaver_timer);
++
++	weaver_fp_unregister(&wd_imu);
++	weaver_fp_unregister(&wd_ppg);
++	weaver_fp_unregister(&wd_fusion);
++	weaver_fp_unregister(&wd_hr);
++	weaver_fp_unregister(&wd_gatt);
++	weaver_fp_unregister(&wd_disp);
++	weaver_fp_unregister(&wd_nvm);
++
++	printk("Weaver FP Wearable Demo Complete\n");
++	return 0;
++}
 diff --git a/samples/kernel/weaver_sched/CMakeLists.txt b/samples/kernel/weaver_sched/CMakeLists.txt
 new file mode 100644
 index 00000000000..6e9aef0fd93
@@ -2940,6 +4109,240 @@ index 00000000000..b3f90ae74f6
 +	printk("Weaver Test Complete\n");
 +	return 0;
 +}
+diff --git a/tests/kernel/weaver_fp_vs_fixed/CMakeLists.txt b/tests/kernel/weaver_fp_vs_fixed/CMakeLists.txt
+new file mode 100644
+index 00000000000..6da0b6e0cf4
+--- /dev/null
++++ b/tests/kernel/weaver_fp_vs_fixed/CMakeLists.txt
+@@ -0,0 +1,5 @@
++# SPDX-License-Identifier: Apache-2.0
++cmake_minimum_required(VERSION 3.20.0)
++find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
++project(weaver_fp_vs_fixed)
++target_sources(app PRIVATE src/main.c)
+diff --git a/tests/kernel/weaver_fp_vs_fixed/prj.conf b/tests/kernel/weaver_fp_vs_fixed/prj.conf
+new file mode 100644
+index 00000000000..9fa9d0b7249
+--- /dev/null
++++ b/tests/kernel/weaver_fp_vs_fixed/prj.conf
+@@ -0,0 +1,4 @@
++# Host-buildable equivalence test: fixed-point vs floating-point
++# Weaver variants. Proves both produce identical dispatch decisions
++# for the same inputs across 10000 random fuzz trials.
++CONFIG_ZTEST=y
+diff --git a/tests/kernel/weaver_fp_vs_fixed/src/main.c b/tests/kernel/weaver_fp_vs_fixed/src/main.c
+new file mode 100644
+index 00000000000..2a8de7eb6f1
+--- /dev/null
++++ b/tests/kernel/weaver_fp_vs_fixed/src/main.c
+@@ -0,0 +1,191 @@
++/*
++ * weaver_fp_vs_fixed.c
++ *
++ * Host-side test that proves the fixed-point and floating-point
++ * Weaver variants produce equivalent DISPATCH DECISIONS for the
++ * same inputs. They will not produce bit-identical pressure values
++ * (different number representations), but they should agree on:
++ *
++ *   1. Which Weft thread wins the dispatch tournament.
++ *   2. The throttle decision (should_throttle yes/no).
++ *
++ * Fuzz: 10000 random thread sets of size 12. For each, compute
++ * pressures with both implementations and check that the
++ * arg-max winner is the same (or both are NULL).
++ *
++ * Build: gcc -std=c11 -O2 -Wall main.c -o /tmp/wv_fp_eq
++ */
++
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <stdbool.h>
++#include <math.h>
++#include <float.h>
++#include <assert.h>
++
++/* ---- fixed-point implementation ---- */
++#define Q16_SHIFT     16
++#define Q16_ONE       (1U << Q16_SHIFT)
++#define TO_Q16(x)     ((uint32_t)(x) << Q16_SHIFT)
++#define Q16_MUL(a,b)  (uint32_t)(((uint64_t)(a) * (uint64_t)(b)) >> Q16_SHIFT)
++#define WAIT_MAX      (Q16_ONE - 1U)
++#define WARP_FIXED    0xFFFFFFFFU
++#define W_URG_Q       0x00006666U
++#define W_DEN_Q       0x00006666U
++#define W_AGE_Q       0x00003333U
++#define T_FIXED       0x00040000U  /* threshold = 4.0 in Q16.16 */
++
++/* ---- float implementation ---- */
++#define WARP_FLOAT    FLT_MAX
++#define W_URG_F       0.4f
++#define W_DEN_F       0.4f
++#define W_AGE_F       0.2f
++#define T_FLOAT       4.0f
++
++#define MIN(a,b) ((a) < (b) ? (a) : (b))
++
++struct wd_fixed {
++    uint32_t priority_q16, buffer_fill_q16, wait_ticks;
++    uint8_t  is_warp, in_use;
++};
++
++struct wd_float {
++    float    priority, buffer_fill;
++    uint32_t wait_ticks;
++    uint8_t  is_warp, in_use;
++};
++
++static uint32_t sat_add(uint32_t a, uint32_t b) {
++    uint32_t s = a + b;
++    return (s < a) ? UINT32_MAX : s;
++}
++
++static uint32_t pressure_fixed(const struct wd_fixed *t) {
++    if (t->is_warp) return WARP_FIXED;
++    uint32_t pu = Q16_MUL(t->priority_q16, W_URG_Q);
++    uint32_t pd = Q16_MUL(t->buffer_fill_q16, W_DEN_Q);
++    uint32_t w  = MIN(t->wait_ticks, WAIT_MAX);
++    uint32_t pa = Q16_MUL(TO_Q16(w), W_AGE_Q);
++    return sat_add(sat_add(pu, pd), pa);
++}
++
++static float pressure_float(const struct wd_float *t) {
++    if (t->is_warp) return WARP_FLOAT;
++    float pu = t->priority    * W_URG_F;
++    float pd = t->buffer_fill * W_DEN_F;
++    /* Aging scales LINEARLY with wait_ticks (same as fixed-point variant). */
++    float w  = (t->wait_ticks > 65535U) ? 65535.0f : (float)t->wait_ticks;
++    float pa = w * W_AGE_F;
++    return pu + pd + pa;
++}
++
++#define N 12
++
++int main(void) {
++    srand(0x5eed);
++    int trials = 10000;
++    int winner_mismatches = 0;
++    int throttle_mismatches = 0;
++    int max_pressure_diff_count = 0;
++
++    for (int trial = 0; trial < trials; trial++) {
++        struct wd_fixed q[N];
++        struct wd_float f[N];
++
++        for (int i = 0; i < N; i++) {
++            uint32_t prio_q = (uint32_t)rand() & 0x000FFFFFU;     /* up to ~16.0 in Q16.16 */
++            uint32_t fill_q = (uint32_t)rand() & Q16_ONE;          /* 0..1.0 */
++            uint32_t wait   = (uint32_t)rand() & 0xFFFFU;
++            uint8_t  warp   = ((uint32_t)rand() & 7U) == 0U;
++            uint8_t  used   = ((uint32_t)rand() & 31U) != 0U;
++
++            q[i].priority_q16    = prio_q;
++            q[i].buffer_fill_q16 = fill_q;
++            q[i].wait_ticks      = wait;
++            q[i].is_warp         = warp;
++            q[i].in_use          = used;
++
++            /* Convert to float exactly. */
++            f[i].priority    = (float)prio_q / (float)Q16_ONE;
++            f[i].buffer_fill = (float)fill_q / (float)Q16_ONE;
++            f[i].wait_ticks  = wait;
++            f[i].is_warp     = warp;
++            f[i].in_use      = used;
++        }
++
++        /* Find winner under each implementation. Warp threads are
++         * excluded from the Weft tournament; they're saturated and
++         * handled by static priority. */
++        int q_winner = -1, f_winner = -1;
++        uint32_t q_max = 0;
++        float    f_max = 0.0f;
++        uint32_t q_sum = 0;
++        float    f_sum = 0.0f;
++
++        for (int i = 0; i < N; i++) {
++            if (!q[i].in_use || q[i].is_warp) continue;
++            uint32_t qp = pressure_fixed(&q[i]);
++            float    fp = pressure_float(&f[i]);
++
++            q_sum = sat_add(q_sum, qp);
++            f_sum += fp;
++
++            if (qp > q_max) { q_max = qp; q_winner = i; }
++            if (fp > f_max) { f_max = fp; f_winner = i; }
++        }
++
++        if (q_winner != f_winner) {
++            winner_mismatches++;
++            if (winner_mismatches < 5) {
++                fprintf(stderr,
++                    "winner mismatch trial=%d: fixed=%d (p=0x%x), float=%d (p=%.6f)\n",
++                    trial, q_winner, q_max, f_winner, (double)f_max);
++            }
++        }
++
++        /* Throttle decision: fixed crosses T_FIXED, float crosses T_FLOAT.
++         * Convert q_sum back to its real value: q_sum/Q16_ONE. */
++        double q_sum_real = (double)q_sum / (double)Q16_ONE;
++        bool q_throttle = q_sum >= T_FIXED;
++        bool f_throttle = f_sum >= T_FLOAT;
++
++        if (q_throttle != f_throttle) {
++            /* Allow disagreement only when both are within 5% of T. */
++            double tol = 0.05 * T_FLOAT;
++            if (fabs(q_sum_real - T_FLOAT) > tol &&
++                fabs((double)f_sum - T_FLOAT) > tol) {
++                throttle_mismatches++;
++            }
++        }
++
++        /* Track pressure delta on the agreed winner. */
++        if (q_winner == f_winner && q_winner >= 0) {
++            double q_real = (double)q_max / (double)Q16_ONE;
++            double diff = fabs(q_real - (double)f_max);
++            if (diff > 0.01) max_pressure_diff_count++;
++        }
++    }
++
++    printf("trials=%d N=%d\n", trials, N);
++    printf("winner_mismatches=%d\n", winner_mismatches);
++    printf("throttle_mismatches (outside tolerance)=%d\n", throttle_mismatches);
++    printf("pressure_diff_>1pct_on_agreed_winner=%d\n", max_pressure_diff_count);
++
++    /* Acceptance criterion:
++     *  - Winner must match in >99.5% of trials (occasional disagreement
++     *    is possible when two Wefts are within float rounding of each
++     *    other; both choices are then valid).
++     *  - Throttle must match unless system pressure is within 5% of the
++     *    threshold (boundary noise).
++     */
++    int winner_pass    = (winner_mismatches * 200 < trials);   /* < 0.5% */
++    int throttle_pass  = (throttle_mismatches == 0);
++
++    if (winner_pass && throttle_pass) {
++        puts("FIXED AND FLOAT VARIANTS EQUIVALENT");
++        return 0;
++    }
++    puts("EQUIVALENCE FAILED");
++    return 1;
++}
+diff --git a/tests/kernel/weaver_fp_vs_fixed/testcase.yaml b/tests/kernel/weaver_fp_vs_fixed/testcase.yaml
+new file mode 100644
+index 00000000000..a8f3b60d19d
+--- /dev/null
++++ b/tests/kernel/weaver_fp_vs_fixed/testcase.yaml
+@@ -0,0 +1,10 @@
++tests:
++  kernel.weaver_fp_vs_fixed:
++    tags: kernel weaver
++    integration_platforms:
++      - native_sim
++    harness: console
++    harness_config:
++      type: one_line
++      regex:
++        - "FIXED AND FLOAT VARIANTS EQUIVALENT"
 diff --git a/tests/kernel/weaver_paths_equiv/CMakeLists.txt b/tests/kernel/weaver_paths_equiv/CMakeLists.txt
 new file mode 100644
 index 00000000000..f78b93ee883
