@@ -7,6 +7,7 @@
 | Target | Zephyr RTOS, Apollo510 LP @ 96 MHz wearable workloads |
 | Date | 2026-05 |
 | Branch | `claude/fixed-point-scheduler-zephyr-RMdbe` |
+| Session | https://claude.ai/code/session_01DPJEf1ccrLMANdqLEtQSaS |
 
 ---
 

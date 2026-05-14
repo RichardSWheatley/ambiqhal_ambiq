@@ -1,5 +1,9 @@
 # Weaver Scheduler for Zephyr
 
+**Idea:** Richard S. Wheatley.
+**Implementation assistance:** Claude (Anthropic).
+**Session:** https://claude.ai/code/session_01DPJEf1ccrLMANdqLEtQSaS
+
 Predictive, pressure-aware fixed-point scheduling layer for Zephyr OS.
 Classifies threads as **Warp** (hard real-time, deterministic) or
 **Weft** (opportunistic, scheduled into the gaps between Warp threads
