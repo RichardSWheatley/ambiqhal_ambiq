@@ -1,0 +1,69 @@
+/*
+ * Copyright (c) 2026 Ambiq Micro, Inc.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Apollo510 Blue EVB overlay for the Weaver wearable demo.
+ *
+ * Wiring assumptions:
+ *   mikroBUS slot 1 -> 6DOF IMU 14 Click   (BMI270)  on IOM0 / I2C0
+ *   mikroBUS slot 2 -> Heart Rate 4 Click  (MAX30101) on IOM1 / I2C1
+ *
+ * If the EVB exposes a single mikroBUS slot, populate it with the
+ * BMI270 click and remove the &iom1 / max30101 block below. The
+ * scheduler logic is identical; the demo just won't drive the PPG
+ * pipeline.
+ *
+ * The display is provided by the ap510_disp shield (MIPI-DSI AMOLED
+ * + CHSC5x touch on iom2/i2c2). BLE is on iom6/spi6 from the board
+ * DTS.
+ */
+
+&iom0 {
+	cmdq-buffer-location = "SRAM_NO_CACHE";
+	cmdq-buffer-size = <256>;
+
+	i2c0: i2c {
+		pinctrl-0 = <&i2c0_default>;
+		pinctrl-names = "default";
+		clock-frequency = <I2C_BITRATE_FAST>;
+		status = "okay";
+
+		bmi270@68 {
+			compatible = "bosch,bmi270-i2c";
+			reg = <0x68>;
+			label = "BMI270";
+			status = "okay";
+		};
+	};
+};
+
+&iom1 {
+	cmdq-buffer-location = "SRAM_NO_CACHE";
+	cmdq-buffer-size = <256>;
+
+	i2c1: i2c {
+		pinctrl-0 = <&i2c1_default>;
+		pinctrl-names = "default";
+		clock-frequency = <I2C_BITRATE_FAST>;
+		status = "okay";
+
+		max30101@57 {
+			compatible = "maxim,max30101";
+			reg = <0x57>;
+			label = "MAX30101";
+			status = "okay";
+
+			/* Conservative defaults; tune for your wearable. */
+			fifo = <0x4f>;
+			smp-ave = "1";
+			fifo-rollover-en;
+			mode = "multi-led";
+			slot1 = "red";
+			slot2 = "ir";
+			adc-rge = "16384";
+			sr = "100";
+			led-pa = [02 02 00 00];
+		};
+	};
+};

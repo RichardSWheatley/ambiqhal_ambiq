@@ -27,6 +27,47 @@
 #ifdef CONFIG_WEAVER_SCHED
 #include <zephyr/kernel/weaver_sched.h>
 #endif
+#ifdef CONFIG_WEAVER_SCHED_FP
+#include <zephyr/kernel/weaver_sched_fp.h>
+#endif
+
+/* Compile-time alias so the body of this sample stays variant-agnostic. */
+#if defined(CONFIG_WEAVER_SCHED_FP)
+#  define WV_ENABLED                  1
+#  define wv_thread_data              weaver_fp_thread_data
+#  define wv_stats                    weaver_fp_stats
+#  define wv_register(wd, t, p, w)    weaver_fp_register((wd),(t),(float)(p),(w))
+#  define wv_unregister               weaver_fp_unregister
+#  define wv_set_warp_deadline        weaver_fp_set_warp_deadline
+#  define wv_set_buffer_fill_pred(wd,q) weaver_fp_set_buffer_fill_predictive((wd),(float)(q)/(float)WEAVER_Q16_ONE_LOCAL)
+#  define wv_tick                     weaver_fp_tick
+#  define wv_system_pressure          weaver_fp_system_pressure
+#  define wv_should_throttle          weaver_fp_should_throttle
+#  define wv_throttle_level           weaver_fp_throttle_level
+#  define wv_ticks_to_next_warp       weaver_fp_ticks_to_next_warp
+#  define wv_get_stats                weaver_fp_get_stats
+#  define wv_get_last_tick_cycles     weaver_fp_get_last_tick_cycles
+#  define WEAVER_Q16_ONE_LOCAL        65536U  /* shared depth_to_q16 helper unit */
+#elif defined(CONFIG_WEAVER_SCHED)
+#  define WV_ENABLED                  1
+#  define wv_thread_data              weaver_thread_data
+#  define wv_stats                    weaver_stats
+#  define wv_register(wd, t, p, w)    weaver_register((wd),(t),WEAVER_TO_Q16((uint32_t)(p)),(w))
+#  define wv_unregister               weaver_unregister
+#  define wv_set_warp_deadline        weaver_set_warp_deadline
+#  define wv_set_buffer_fill_pred(wd,q) weaver_set_buffer_fill_predictive_q16((wd),(q))
+#  define wv_tick                     weaver_tick
+#  define wv_system_pressure          weaver_system_pressure
+#  define wv_should_throttle          weaver_should_throttle
+#  define wv_throttle_level           weaver_throttle_level
+#  define wv_ticks_to_next_warp       weaver_ticks_to_next_warp
+#  define wv_get_stats                weaver_get_stats
+#  define wv_get_last_tick_cycles     weaver_get_last_tick_cycles
+#  define WEAVER_Q16_ONE_LOCAL        WEAVER_Q16_ONE
+#else
+#  define WV_ENABLED                  0
+#  define WEAVER_Q16_ONE_LOCAL        65536U
+#endif
 
 LOG_MODULE_REGISTER(weaver_bench, LOG_LEVEL_INF);
 
@@ -101,12 +142,12 @@ static inline int fifo_consume(struct fifo *f, int n)
 	return c;
 }
 
-#ifdef CONFIG_WEAVER_SCHED
+#if WV_ENABLED
 static inline uint32_t depth_to_q16(int depth)
 {
 	if (depth <= 0) return 0;
-	if (depth >= FIFO_DEPTH) return WEAVER_Q16_ONE;
-	return ((uint32_t)depth * WEAVER_Q16_ONE) / FIFO_DEPTH;
+	if (depth >= FIFO_DEPTH) return WEAVER_Q16_ONE_LOCAL;
+	return ((uint32_t)depth * WEAVER_Q16_ONE_LOCAL) / FIFO_DEPTH;
 }
 #endif
 
@@ -194,9 +235,9 @@ static atomic_t in_burst = ATOMIC_INIT(0);
 
 /* ---- Warp dummy / Weft dummy ---- */
 
-#ifdef CONFIG_WEAVER_SCHED
-static struct weaver_thread_data wd_ble, wd_imu, wd_ppg, wd_fusion, wd_hr,
-				 wd_gatt, wd_class, wd_disp, wd_nvm;
+#if WV_ENABLED
+static struct wv_thread_data wd_ble, wd_imu, wd_ppg, wd_fusion, wd_hr,
+			     wd_gatt, wd_class, wd_disp, wd_nvm;
 #endif
 
 static void ble_fn(void *a, void *b, void *c)
@@ -225,8 +266,8 @@ static void imu_fn(void *a, void *b, void *c)
 		for (int i = 0; i < n; i++) ts_push(&imu_ts, now_us);
 		fifo_produce(&imu_fifo, n);
 
-#ifdef CONFIG_WEAVER_SCHED
-		weaver_set_buffer_fill_predictive_q16(
+#if WV_ENABLED
+		wv_set_buffer_fill_pred(
 			&wd_fusion, depth_to_q16(atomic_get(&imu_fifo.depth)));
 #endif
 		k_sleep(K_MSEC(period));
@@ -241,8 +282,8 @@ static void ppg_fn(void *a, void *b, void *c)
 		uint32_t now_us = k_cyc_to_us_floor32(k_cycle_get_32());
 		ts_push(&ppg_ts, now_us);
 		fifo_produce(&ppg_fifo, 1);
-#ifdef CONFIG_WEAVER_SCHED
-		weaver_set_buffer_fill_predictive_q16(
+#if WV_ENABLED
+		wv_set_buffer_fill_pred(
 			&wd_hr, depth_to_q16(atomic_get(&ppg_fifo.depth)));
 #endif
 		k_sleep(K_MSEC(PPG_PERIOD_MS));
@@ -263,8 +304,8 @@ static void fusion_fn(void *a, void *b, void *c)
 				}
 			}
 			k_busy_wait(FUSION_WORK_US);
-#ifdef CONFIG_WEAVER_SCHED
-			weaver_set_buffer_fill_predictive_q16(
+#if WV_ENABLED
+			wv_set_buffer_fill_pred(
 				&wd_fusion,
 				depth_to_q16(atomic_get(&imu_fifo.depth)));
 #endif
@@ -287,8 +328,8 @@ static void hr_fn(void *a, void *b, void *c)
 				}
 			}
 			k_busy_wait(HR_WORK_US);
-#ifdef CONFIG_WEAVER_SCHED
-			weaver_set_buffer_fill_predictive_q16(
+#if WV_ENABLED
+			wv_set_buffer_fill_pred(
 				&wd_hr,
 				depth_to_q16(atomic_get(&ppg_fifo.depth)));
 #endif
@@ -303,14 +344,14 @@ static void gatt_fn(void *a, void *b, void *c)
 	while (1) {
 		int n = atomic_get(&in_burst) ? 6 : 1;
 		fifo_produce(&gatt_fifo, n);
-#ifdef CONFIG_WEAVER_SCHED
-		weaver_set_buffer_fill_predictive_q16(
+#if WV_ENABLED
+		wv_set_buffer_fill_pred(
 			&wd_gatt, depth_to_q16(atomic_get(&gatt_fifo.depth)));
 #endif
 		k_busy_wait(GATT_WORK_US);
 		fifo_consume(&gatt_fifo, 3);
-#ifdef CONFIG_WEAVER_SCHED
-		weaver_set_buffer_fill_predictive_q16(
+#if WV_ENABLED
+		wv_set_buffer_fill_pred(
 			&wd_gatt, depth_to_q16(atomic_get(&gatt_fifo.depth)));
 #endif
 		k_sleep(K_MSEC(15));
@@ -359,23 +400,25 @@ static K_THREAD_STACK_DEFINE(s_nvm,    STACK_SIZE);
 static struct k_thread t_ble, t_imu, t_ppg, t_fusion, t_hr, t_gatt,
 		       t_class, t_disp, t_nvm;
 
-#ifdef CONFIG_WEAVER_SCHED
-static void weaver_tick_fn(struct k_timer *t) { ARG_UNUSED(t); weaver_tick(); }
+#if WV_ENABLED
+static void weaver_tick_fn(struct k_timer *t) { ARG_UNUSED(t); wv_tick(); }
 static K_TIMER_DEFINE(weaver_timer, weaver_tick_fn, NULL);
 #endif
 
 /* ---- Build label for the metrics line ---- */
 
-#if !defined(CONFIG_WEAVER_SCHED)
-#define BUILD_LABEL "stock"
+#if defined(CONFIG_WEAVER_SCHED_FP)
+#define BUILD_LABEL "weaver-fp"
 #elif defined(CONFIG_WEAVER_BATCH_MVE)
 #define BUILD_LABEL "weaver-mve"
 #elif defined(CONFIG_WEAVER_BATCH_HYBRID)
 #define BUILD_LABEL "weaver-hybrid"
 #elif defined(CONFIG_WEAVER_BATCH_SCALAR)
 #define BUILD_LABEL "weaver-scalar"
-#else
+#elif defined(CONFIG_WEAVER_SCHED)
 #define BUILD_LABEL "weaver-?"
+#else
+#define BUILD_LABEL "stock"
 #endif
 
 int main(void)
@@ -394,22 +437,22 @@ int main(void)
 	k_thread_create(&t_disp,   s_disp,   STACK_SIZE, disp_fn,       NULL,NULL,NULL, DISP_PRIO,   0, K_NO_WAIT);
 	k_thread_create(&t_nvm,    s_nvm,    STACK_SIZE, nvm_fn,        NULL,NULL,NULL, NVM_PRIO,    0, K_NO_WAIT);
 
-#ifdef CONFIG_WEAVER_SCHED
-	weaver_register(&wd_ble,    &t_ble,    WEAVER_TO_Q16(20), true);
-	weaver_set_warp_deadline(&wd_ble, BLE_PERIOD_MS);
+#if WV_ENABLED
+	wv_register(&wd_ble,    &t_ble,    20, true);
+	wv_set_warp_deadline(&wd_ble, BLE_PERIOD_MS);
 
-	weaver_register(&wd_imu,    &t_imu,    WEAVER_TO_Q16(15), true);
-	weaver_set_warp_deadline(&wd_imu, IMU_PERIOD_MS);
+	wv_register(&wd_imu,    &t_imu,    15, true);
+	wv_set_warp_deadline(&wd_imu, IMU_PERIOD_MS);
 
-	weaver_register(&wd_ppg,    &t_ppg,    WEAVER_TO_Q16(15), true);
-	weaver_set_warp_deadline(&wd_ppg, PPG_PERIOD_MS);
+	wv_register(&wd_ppg,    &t_ppg,    15, true);
+	wv_set_warp_deadline(&wd_ppg, PPG_PERIOD_MS);
 
-	weaver_register(&wd_fusion, &t_fusion, WEAVER_TO_Q16(8), false);
-	weaver_register(&wd_hr,     &t_hr,     WEAVER_TO_Q16(8), false);
-	weaver_register(&wd_gatt,   &t_gatt,   WEAVER_TO_Q16(7), false);
-	weaver_register(&wd_class,  &t_class,  WEAVER_TO_Q16(5), false);
-	weaver_register(&wd_disp,   &t_disp,   WEAVER_TO_Q16(4), false);
-	weaver_register(&wd_nvm,    &t_nvm,    WEAVER_TO_Q16(2), false);
+	wv_register(&wd_fusion, &t_fusion, 8, false);
+	wv_register(&wd_hr,     &t_hr,     8, false);
+	wv_register(&wd_gatt,   &t_gatt,   7, false);
+	wv_register(&wd_class,  &t_class,  5, false);
+	wv_register(&wd_disp,   &t_disp,   4, false);
+	wv_register(&wd_nvm,    &t_nvm,    2, false);
 
 	k_timer_start(&weaver_timer, K_MSEC(1), K_MSEC(1));
 #endif
@@ -439,10 +482,10 @@ int main(void)
 	uint32_t fusion_max = fusion_lat.max_us;
 	uint32_t hr_max     = hr_lat.max_us;
 
-#ifdef CONFIG_WEAVER_SCHED
-	struct weaver_stats s;
-	weaver_get_stats(&s);
-	uint32_t tick_cyc   = weaver_get_last_tick_cycles();
+#if WV_ENABLED
+	struct wv_stats s;
+	wv_get_stats(&s);
+	uint32_t tick_cyc   = wv_get_last_tick_cycles();
 	uint32_t throttle   = s.throttle_events;
 	uint32_t promotions = s.weft_promotions;
 	uint32_t prewarp    = s.pre_warp_clears;

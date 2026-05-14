@@ -75,12 +75,15 @@ true, signaling non-essential producers to slow down.
 | `kernel/Kconfig.weaver` | `WEAVER_SCHED`, `WEAVER_MAX_THREADS`, `WEAVER_THROTTLE_THRESHOLD`, `WEAVER_WEARABLE_PRESET`, `WEAVER_POWER_AWARE`, `WEAVER_PREWARP_GUARD_TICKS` |
 | `samples/kernel/weaver_sched/` | Generic demo: 1 Warp + 2 Weft producers, 100-tick ramp |
 | `samples/boards/apollo510_evb/weaver_wearable/` | Apollo510 LP @ 96 MHz wearable demo: 3 Warp (BLE/IMU/PPG) + 6 Weft (fusion/HR/GATT/classifier/display/NVM), synthetic FIFOs |
-| `samples/boards/apollo510b_evb/weaver_wearable/` | Apollo510 Blue EVB demo with REAL sensors via mikroBUS: 6DOF IMU 14 Click (BMI270) + Heart Rate 4 Click (MAX30101), uses on-board BLE and ap510_disp shield |
+| `samples/boards/apollo510b_evb/weaver_wearable/` | Apollo510 Blue EVB demo with REAL sensors via mikroBUS: 6DOF IMU 14 Click (BMI270) + Heart Rate 4 Click (MAX30101), uses on-board BLE and ap510_disp shield. Fixed-point variant. |
+| `samples/boards/apollo510b_evb/weaver_wearable_fp/` | Same wearable demo using the floating-point variant (`CONFIG_WEAVER_SCHED_FP`). Pick this when your Weft threads already use the FPU. |
+| `tests/kernel/weaver_fp_vs_fixed/` | Host-buildable test proving fixed-point and floating-point variants produce identical dispatch decisions (10000 fuzz trials). |
 | `0001-weaver-scheduler.patch` | Patch to apply on top of `ambiq-stable` in `ambiqzephyr` |
 | `DECISIONS.md` | All assumptions and tuning rationale for the wearable target |
 | `FUZZY_THROTTLE.md` | TSK fuzzy + EMA throttle controller: design, math, why it's strictly an improvement |
 | `ML_AND_FUZZY_LOGIC.md` | Why we kept the dispatcher hot path linear and where heavier ML belongs |
 | `MVE_PATHS.md` | Three pressure-batch paths (scalar / hybrid / full MVE), break-even analysis, FP-save-tax explanation |
+| `FP_VS_FIXED.md` | Fixed-point vs floating-point Weaver variant comparison, when to pick each, equivalence proof |
 | `RFC.md` | **Peer-review RFC**: rationale, problem statement, goals/non-goals, alternatives considered, **measurables and acceptance criteria (M1–M7)**, risk analysis, implementation plan, ballot |
 | `tests/kernel/weaver_paths_equiv/` | Host-buildable test proving all three paths produce bit-identical results (10000 fuzz trials) |
 | `samples/boards/apollo510b_evb/weaver_benchmark/` | Canonical RFC §7.1 workload. Build with `stock.conf` / default / `hybrid.conf` / `mve.conf`. `scripts/bench.sh` automates all four runs and prints a comparison table. |

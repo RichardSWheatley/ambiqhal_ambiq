@@ -1,0 +1,85 @@
+# Weaver scheduler: single-precision floating-point variant.
+
+# Copyright (c) 2026 Ambiq Micro, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
+menuconfig WEAVER_SCHED_FP
+	bool "Weaver pressure-aware scheduler (floating-point variant)"
+	depends on MULTITHREADING && CPU_HAS_FPU
+	depends on !WEAVER_SCHED
+	help
+	  Enables the single-precision floating-point implementation of the
+	  Weaver scheduler. Same Warp/Weft semantics, same fuzzy throttle
+	  and predictive fill helpers as CONFIG_WEAVER_SCHED, just with
+	  IEEE-754 float math instead of Q16.16.
+
+	  Pick this variant when:
+	    - Your system already pays the FPU lazy-stacking tax because
+	      other threads (sensor fusion, FFT, graphics) use the FPU;
+	    - You want a code path that is easier to audit than the
+	      Q16.16 one;
+	    - Apollo510 is in HP mode (192/250 MHz) where FP cost is
+	      negligible vs available cycles.
+
+	  Pick WEAVER_SCHED (fixed-point) when:
+	    - Battery-constrained wearable in LP mode (96 MHz) where no
+	      other thread uses the FPU;
+	    - The MCU has no FPU at all;
+	    - Bit-identical reproducibility is required.
+
+	  Mutually exclusive with CONFIG_WEAVER_SCHED.
+
+if WEAVER_SCHED_FP
+
+config WEAVER_FP_MAX_THREADS
+	int "Maximum number of FP Weaver-managed threads"
+	default 12 if WEAVER_FP_WEARABLE_PRESET
+	default 8
+	range 1 64
+
+config WEAVER_FP_THROTTLE_THRESHOLD_X1000
+	int "Throttle threshold (multiply by 0.001 for the float value)"
+	default 3000 if WEAVER_FP_WEARABLE_PRESET
+	default 4000
+	help
+	  Float thresholds aren't expressible directly as Kconfig values,
+	  so we store 1000 * threshold and divide in C. Default 4000 maps
+	  to a threshold of 4.0 (four Weft threads at full pressure). The
+	  wearable preset uses 3000 (=3.0).
+
+config WEAVER_FP_DEFAULT_BOOST_LEVELS
+	int "Default Weft promotion magnitude"
+	default 2 if WEAVER_FP_WEARABLE_PRESET
+	default 1
+	range 1 4
+
+config WEAVER_FP_PREWARP_GUARD_TICKS
+	int "Pre-Warp guard window (ticks)"
+	default 1
+	range 0 16
+
+config WEAVER_FP_POWER_AWARE
+	bool "Skip dispatch passes when no Weft has pressure"
+	default y if WEAVER_FP_WEARABLE_PRESET
+	default n
+
+config WEAVER_FP_TIMING
+	bool "Measure dispatcher cycles via DWT cycle counter"
+	depends on CPU_HAS_DWT
+	default n
+
+config WEAVER_FP_WEARABLE_PRESET
+	bool "Wearable / Apollo510 preset for FP variant"
+	default n
+	help
+	  Same wearable defaults as WEAVER_WEARABLE_PRESET in the fixed-
+	  point variant: 12 thread slots, boost 2, throttle 3.0,
+	  power-aware tick skip.
+
+config WEAVER_FP_LOG_LEVEL
+	int "FP Weaver scheduler log level"
+	depends on LOG
+	default 2
+	range 0 4
+
+endif # WEAVER_SCHED_FP

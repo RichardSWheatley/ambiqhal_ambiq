@@ -1,0 +1,25 @@
+sample:
+  description: Weaver pressure-aware scheduler driving real wearable sensors
+    (BMI270 + MAX30101 Click boards) via the floating-point variant on
+    Apollo510 Blue EVB.
+  name: Weaver Wearable FP (Apollo510B + Click)
+common:
+  tags:
+    - kernel
+    - weaver
+    - weaver-fp
+    - wearable
+    - sensor
+  harness: console
+  harness_config:
+    type: one_line
+    regex:
+      - "Weaver FP Wearable Demo Complete"
+tests:
+  sample.kernel.weaver_wearable_fp.apollo510b:
+    platform_allow:
+      - apollo510b_evb
+    integration_platforms:
+      - apollo510b_evb
+    extra_args:
+      - SHIELD=ap510_disp

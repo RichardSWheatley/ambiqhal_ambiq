@@ -29,3 +29,7 @@ tests:
     platform_allow: apollo510b_evb
     integration_platforms: [apollo510b_evb]
     extra_args: EXTRA_CONF_FILE=stock.conf
+  sample.kernel.weaver_benchmark.fp:
+    platform_allow: apollo510b_evb
+    integration_platforms: [apollo510b_evb]
+    extra_args: EXTRA_CONF_FILE=fp.conf

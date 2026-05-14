@@ -33,12 +33,13 @@ run_variant stock          stock.conf
 run_variant weaver-scalar  ""
 run_variant weaver-hybrid  hybrid.conf
 run_variant weaver-mve     mve.conf
+run_variant weaver-fp      fp.conf
 
 echo
 echo "=== comparison table ==="
 printf "%-15s %-8s %-8s %-8s %-8s %-8s %-8s %-8s %-8s %-8s %-8s\n" \
        variant imu_ovr ppg_ovr gatt_ovr fus_p50 fus_p99 hr_p50 hr_p99 tick_cyc promo prewarp
-for v in stock weaver-scalar weaver-hybrid weaver-mve; do
+for v in stock weaver-scalar weaver-hybrid weaver-mve weaver-fp; do
     line=$(grep "^CSV " "$LOGDIR/$v.log" | tail -1 | sed 's/^CSV //')
     IFS=',' read -ra fields <<< "$line"
     printf "%-15s %-8s %-8s %-8s %-8s %-8s %-8s %-8s %-8s %-8s %-8s\n" "${fields[@]}"
