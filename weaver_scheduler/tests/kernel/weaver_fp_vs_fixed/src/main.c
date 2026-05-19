@@ -82,7 +82,11 @@ static float pressure_float(const struct wd_float *t) {
 
 #define N 12
 
-int main(void) {
+/* Runs the random fuzz and writes mismatch counts into out parameters.
+ * Returns 0 if both winner and throttle agree to within tolerance.
+ */
+static int run_fp_vs_fixed(int *winner_mis, int *throttle_mis)
+{
     srand(0x5eed);
     int trials = 10000;
     int winner_mismatches = 0;
@@ -167,25 +171,56 @@ int main(void) {
         }
     }
 
-    printf("trials=%d N=%d\n", trials, N);
-    printf("winner_mismatches=%d\n", winner_mismatches);
-    printf("throttle_mismatches (outside tolerance)=%d\n", throttle_mismatches);
-    printf("pressure_diff_>1pct_on_agreed_winner=%d\n", max_pressure_diff_count);
+    (void)max_pressure_diff_count;  /* informational only */
+    if (winner_mis)   *winner_mis   = winner_mismatches;
+    if (throttle_mis) *throttle_mis = throttle_mismatches;
 
-    /* Acceptance criterion:
-     *  - Winner must match in >99.5% of trials (occasional disagreement
-     *    is possible when two Wefts are within float rounding of each
-     *    other; both choices are then valid).
-     *  - Throttle must match unless system pressure is within 5% of the
-     *    threshold (boundary noise).
+    /* Acceptance:
+     *  - Winners must match in >99.5% of trials (rare disagreement
+     *    possible when two Wefts are within float rounding of each
+     *    other - both choices then valid).
+     *  - Throttle must match unless system pressure is within 5% of
+     *    the threshold (boundary noise).
      */
-    int winner_pass    = (winner_mismatches * 200 < trials);   /* < 0.5% */
+    int winner_pass    = (winner_mismatches * 200 < trials);
     int throttle_pass  = (throttle_mismatches == 0);
+    return (winner_pass && throttle_pass) ? 0 : 1;
+}
 
-    if (winner_pass && throttle_pass) {
+#ifdef __ZEPHYR__
+#include <zephyr/ztest.h>
+
+ZTEST(weaver_fp_vs_fixed, dispatch_decisions_match)
+{
+    int winner_mis = 0, throttle_mis = 0;
+    int rc = run_fp_vs_fixed(&winner_mis, &throttle_mis);
+
+    zassert_true(winner_mis * 200 < 10000,
+                 "winner mismatches %d exceed 0.5%% of trials",
+                 winner_mis);
+    zassert_equal(throttle_mis, 0,
+                  "%d throttle mismatches outside the 5%% boundary",
+                  throttle_mis);
+    zassert_equal(rc, 0, "fp-vs-fixed run returned %d", rc);
+}
+
+ZTEST_SUITE(weaver_fp_vs_fixed, NULL, NULL, NULL, NULL, NULL);
+
+#else  /* host build */
+
+int main(void)
+{
+    int winner_mis = 0, throttle_mis = 0;
+    int rc = run_fp_vs_fixed(&winner_mis, &throttle_mis);
+
+    printf("winner_mismatches=%d\n", winner_mis);
+    printf("throttle_mismatches (outside tolerance)=%d\n", throttle_mis);
+    if (rc == 0) {
         puts("FIXED AND FLOAT VARIANTS EQUIVALENT");
         return 0;
     }
     puts("EQUIVALENCE FAILED");
     return 1;
 }
+
+#endif
