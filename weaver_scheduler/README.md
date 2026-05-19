@@ -90,4 +90,5 @@ true, signaling non-essential producers to slow down.
 | `FP_VS_FIXED.md` | Fixed-point vs floating-point Weaver variant comparison, when to pick each, equivalence proof |
 | `RFC.md` | **Peer-review RFC**: rationale, problem statement, goals/non-goals, alternatives considered, **measurables and acceptance criteria (M1–M7)**, risk analysis, implementation plan, ballot |
 | `tests/kernel/weaver_paths_equiv/` | Host-buildable test proving all three paths produce bit-identical results (10000 fuzz trials) |
-| `samples/boards/apollo510b_evb/weaver_benchmark/` | Canonical RFC §7.1 workload. Build with `stock.conf` / default / `hybrid.conf` / `mve.conf`. `scripts/bench.sh` automates all four runs and prints a comparison table. |
+| `samples/boards/apollo510b_evb/weaver_benchmark/` | Canonical RFC §7.1 workload. Build with `stock.conf` / default / `hybrid.conf` / `mve.conf` / `fp.conf`. `scripts/bench.sh` automates all five runs and prints a comparison table. |
+| `samples/boards/apollo510b_evb/weaver_scenarios/` | **Five isolated behavioral tests** — one per Weaver feature (pressure boost, pre-Warp guard, predictive fill, fuzzy throttle, aging). Diff stock vs Weaver to attribute M1–M7 acceptance gates per scenario. `scripts/run.sh` automates the diff. |
