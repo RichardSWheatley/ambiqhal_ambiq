@@ -1,0 +1,24 @@
+sample:
+  description: Five isolated behavioral scenarios for the Weaver scheduler.
+    Each isolates one Weaver feature so its contribution can be measured
+    independently. Diff the default (Weaver) build against stock.conf to
+    populate the RFC M1-M7 metrics.
+  name: Weaver Scenarios
+common:
+  tags:
+    - kernel
+    - weaver
+    - scenarios
+  harness: console
+  harness_config:
+    type: one_line
+    regex:
+      - "SCENARIOS COMPLETE"
+tests:
+  sample.kernel.weaver_scenarios.weaver:
+    platform_allow: apollo510b_evb
+    integration_platforms: [apollo510b_evb]
+  sample.kernel.weaver_scenarios.stock:
+    platform_allow: apollo510b_evb
+    integration_platforms: [apollo510b_evb]
+    extra_args: EXTRA_CONF_FILE=stock.conf
