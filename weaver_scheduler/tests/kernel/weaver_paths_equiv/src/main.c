@@ -188,7 +188,11 @@ static struct weaver_thread_data make(uint32_t prio, uint32_t fill,
 
 #define N 12
 
-int main(void)
+/* Returns 0 on full equivalence; non-zero indicates mismatches and
+ * sets *static_mismatches / *fuzz_mismatches if the pointers are
+ * non-NULL. Suitable for both plain-host main() and ztest assertion.
+ */
+static int run_equivalence(int *static_mismatches, int *fuzz_mismatches)
 {
 	struct weaver_thread_data wds[N] = {
 		make(WEAVER_TO_Q16(15), 0, 0, true),                /* Warp */
@@ -213,29 +217,25 @@ int main(void)
 	hybrid_batch(snap, p_hybrid, N);
 	mve_batch(snap, p_mve, N);
 
-	printf("idx  scalar     hybrid     full-MVE   match\n");
-	int mismatches = 0;
+	int s_mis = 0;
 	for (int i = 0; i < N; i++) {
-		bool ok = (p_scalar[i] == p_hybrid[i]) &&
-			  (p_scalar[i] == p_mve[i]);
-		if (!ok) mismatches++;
-		printf("%2d  0x%08x 0x%08x 0x%08x  %s\n",
-		       i, p_scalar[i], p_hybrid[i], p_mve[i],
-		       ok ? "ok" : "MISMATCH");
+		if (p_scalar[i] != p_hybrid[i] || p_scalar[i] != p_mve[i]) {
+			s_mis++;
+		}
 	}
+	if (static_mismatches) *static_mismatches = s_mis;
 
-	/* Random fuzz: 10000 trials of 12 threads with random inputs. */
 	srand(0x5eed);
-	int fuzz_mismatches = 0;
+	int f_mis = 0;
 	for (int trial = 0; trial < 10000; trial++) {
 		struct weaver_thread_data fuzz[N];
 		const struct weaver_thread_data *fsnap[N];
 		for (int i = 0; i < N; i++) {
-			fuzz[i].priority_q16 = (uint32_t)rand() & 0x000FFFFFU;
+			fuzz[i].priority_q16    = (uint32_t)rand() & 0x000FFFFFU;
 			fuzz[i].buffer_fill_q16 = (uint32_t)rand() & (WEAVER_Q16_ONE);
-			fuzz[i].wait_ticks = (uint32_t)rand() & 0xFFFFU;
-			fuzz[i].is_warp = ((uint32_t)rand() & 7U) == 0U;
-			fuzz[i].in_use  = ((uint32_t)rand() & 31U) != 0U;
+			fuzz[i].wait_ticks      = (uint32_t)rand() & 0xFFFFU;
+			fuzz[i].is_warp         = ((uint32_t)rand() & 7U) == 0U;
+			fuzz[i].in_use          = ((uint32_t)rand() & 31U) != 0U;
 			fsnap[i] = &fuzz[i];
 		}
 		uint32_t s[N], h[N], m[N];
@@ -243,22 +243,49 @@ int main(void)
 		hybrid_batch(fsnap, h, N);
 		mve_batch(fsnap, m, N);
 		for (int i = 0; i < N; i++) {
-			if (s[i] != h[i] || s[i] != m[i]) {
-				fuzz_mismatches++;
-				if (fuzz_mismatches < 5) {
-					printf("FUZZ trial %d slot %d: "
-					       "scalar=0x%x hybrid=0x%x mve=0x%x\n",
-					       trial, i, s[i], h[i], m[i]);
-				}
-			}
+			if (s[i] != h[i] || s[i] != m[i]) f_mis++;
 		}
 	}
-	printf("Fuzz: 10000 trials x %d threads, %d mismatches\n",
-	       N, fuzz_mismatches);
+	if (fuzz_mismatches) *fuzz_mismatches = f_mis;
 
-	if (mismatches == 0 && fuzz_mismatches == 0) {
+	return (s_mis + f_mis) == 0 ? 0 : 1;
+}
+
+#ifdef __ZEPHYR__
+#include <zephyr/ztest.h>
+
+ZTEST(weaver_paths_equiv, scalar_hybrid_mve_bit_identical)
+{
+	int s_mis = 0, f_mis = 0;
+	int rc = run_equivalence(&s_mis, &f_mis);
+
+	zassert_equal(s_mis, 0,
+		      "%d static-vector mismatches between scalar/hybrid/mve",
+		      s_mis);
+	zassert_equal(f_mis, 0,
+		      "%d fuzz mismatches across 10000 trials x 12 threads",
+		      f_mis);
+	zassert_equal(rc, 0, "equivalence run returned %d", rc);
+}
+
+ZTEST_SUITE(weaver_paths_equiv, NULL, NULL, NULL, NULL, NULL);
+
+#else  /* host build: plain gcc main */
+
+int main(void)
+{
+	int s_mis = 0, f_mis = 0;
+	int rc = run_equivalence(&s_mis, &f_mis);
+
+	printf("static mismatches: %d\n", s_mis);
+	printf("fuzz mismatches  : %d (10000 trials x %d threads)\n", f_mis, N);
+	if (rc == 0) {
 		puts("ALL THREE PATHS EQUIVALENT");
 		return 0;
 	}
+	puts("EQUIVALENCE FAILED");
 	return 1;
 }
+
+#endif
+
