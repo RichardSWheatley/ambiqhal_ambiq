@@ -1,0 +1,118 @@
+# Host-side equivalence + Zephyr ztest gates for the Weaver scheduler.
+#
+# Three job tiers:
+#   1. host-equivalence - plain gcc builds of the math equivalence
+#      tests. Fast (<5 s), no Zephyr SDK required.
+#   2. patch-applies - clones ambiqzephyr@ambiq-stable and runs
+#      git apply --check. Catches patch drift.
+#   3. ztest-native_sim - sets up Zephyr SDK + west, applies the
+#      patch, runs the API/stress/equivalence ztests under
+#      native_sim via twister. Catches integration bugs.
+#   4. on-target-build - placeholder for a self-hosted runner with a
+#      connected apollo510b_evb. Disabled until such a runner exists.
+name: weaver-tests
+
+on:
+  push:
+    branches: ["**"]
+    paths:
+      - 'weaver_scheduler/**'
+      - '.github/workflows/weaver-tests.yml'
+  pull_request:
+    paths:
+      - 'weaver_scheduler/**'
+      - '.github/workflows/weaver-tests.yml'
+
+jobs:
+  host-equivalence:
+    name: Host-side equivalence (gcc, plain main)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y gcc
+
+      - name: scalar / hybrid / full-MVE bit-identity
+        working-directory: weaver_scheduler/tests/kernel/weaver_paths_equiv
+        run: |
+          gcc -std=c11 -O2 -Wall src/main.c -o /tmp/equiv
+          /tmp/equiv | tee /tmp/equiv.log
+          tail -1 /tmp/equiv.log | grep -q "ALL THREE PATHS EQUIVALENT"
+
+      - name: fixed-point vs floating-point dispatch agreement
+        working-directory: weaver_scheduler/tests/kernel/weaver_fp_vs_fixed
+        run: |
+          gcc -std=c11 -O2 -Wall src/main.c -lm -o /tmp/wv_fp_eq
+          /tmp/wv_fp_eq | tee /tmp/wv_fp_eq.log
+          tail -1 /tmp/wv_fp_eq.log | grep -q "FIXED AND FLOAT VARIANTS EQUIVALENT"
+
+  patch-applies:
+    name: Patch applies to ambiqzephyr@ambiq-stable
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: hal
+
+      - name: Clone ambiqzephyr
+        run: git clone --depth 1 --branch ambiq-stable
+             https://github.com/RichardSWheatley/ambiqzephyr.git zephyr
+
+      - name: git apply --check
+        working-directory: zephyr
+        run: git apply --check ../hal/weaver_scheduler/0001-weaver-scheduler.patch
+
+  ztest-native_sim:
+    name: ztest suites on native_sim (via twister)
+    runs-on: ubuntu-latest
+    needs: [patch-applies]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: hal
+
+      - name: Clone ambiqzephyr
+        run: git clone --depth 1 --branch ambiq-stable
+             https://github.com/RichardSWheatley/ambiqzephyr.git zephyr
+
+      - name: Apply weaver patch
+        working-directory: zephyr
+        run: git apply ../hal/weaver_scheduler/0001-weaver-scheduler.patch
+
+      - name: Install west + deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends git cmake ninja-build \
+              gperf ccache dfu-util device-tree-compiler wget python3-dev \
+              python3-pip python3-setuptools python3-venv xz-utils file make \
+              gcc gcc-multilib g++-multilib libsdl2-dev libmagic1
+          pip install --user -U west pyelftools pyyaml pykwalify
+
+      - name: west init and update (lightweight; only what twister needs)
+        working-directory: zephyr
+        run: |
+          west init -l . || true
+          west update --narrow
+
+      - name: Run twister on Weaver ztests
+        working-directory: zephyr
+        run: |
+          ./scripts/twister \
+            -p native_sim \
+            -T tests/kernel/weaver_paths_equiv \
+            -T tests/kernel/weaver_fp_vs_fixed \
+            -T tests/kernel/weaver_api \
+            -T tests/kernel/weaver_stress
+
+  on-target-build:
+    name: west build apollo510b_evb (DISABLED - needs self-hosted runner)
+    if: false
+    runs-on: [self-hosted, apollo510b_evb]
+    steps:
+      - uses: actions/checkout@v4
+      - name: west build weaver_benchmark
+        run: |
+          cd zephyr
+          west build -p -b apollo510b_evb \
+              samples/boards/apollo510b_evb/weaver_benchmark

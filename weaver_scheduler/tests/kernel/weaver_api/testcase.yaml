@@ -1,0 +1,10 @@
+tests:
+  kernel.weaver_api:
+    tags: kernel weaver
+    integration_platforms:
+      - native_sim
+      - native_sim/native/64
+      - qemu_cortex_m3
+    harness: ztest
+    harness_config:
+      fixture: weaver_api
