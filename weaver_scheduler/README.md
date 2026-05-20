@@ -81,7 +81,9 @@ true, signaling non-essential producers to slow down.
 | `samples/boards/apollo510_evb/weaver_wearable/` | Apollo510 LP @ 96 MHz wearable demo: 3 Warp (BLE/IMU/PPG) + 6 Weft (fusion/HR/GATT/classifier/display/NVM), synthetic FIFOs |
 | `samples/boards/apollo510b_evb/weaver_wearable/` | Apollo510 Blue EVB demo with REAL sensors via mikroBUS: 6DOF IMU 14 Click (BMI270) + Heart Rate 4 Click (MAX30101), uses on-board BLE and ap510_disp shield. Fixed-point variant. |
 | `samples/boards/apollo510b_evb/weaver_wearable_fp/` | Same wearable demo using the floating-point variant (`CONFIG_WEAVER_SCHED_FP`). Pick this when your Weft threads already use the FPU. |
-| `tests/kernel/weaver_fp_vs_fixed/` | Host-buildable test proving fixed-point and floating-point variants produce identical dispatch decisions (10000 fuzz trials). |
+| `tests/kernel/weaver_fp_vs_fixed/` | Host-buildable + ztest: fixed-point and floating-point variants produce identical dispatch decisions (10000 fuzz trials). |
+| `tests/kernel/weaver_api/` | ztest API contract suite: register/unregister/null-arg/full-registry/restore-priority/predictive/weights/boost-cap/tick-promotes-highest. Runs under `native_sim`. |
+| `tests/kernel/weaver_stress/` | ztest stress/soak/negative suite: 1000-iter register churn, 3-round fill+drain, runtime weight thrash, 1000-tick soak, double-unregister, empty-registry tick, zero-arg no-ops. Runs under `native_sim`. |
 | `0001-weaver-scheduler.patch` | Patch to apply on top of `ambiq-stable` in `ambiqzephyr` |
 | `DECISIONS.md` | All assumptions and tuning rationale for the wearable target |
 | `FUZZY_THROTTLE.md` | TSK fuzzy + EMA throttle controller: design, math, why it's strictly an improvement |
