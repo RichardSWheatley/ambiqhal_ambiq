@@ -1,0 +1,27 @@
+sample:
+  description: Weaver scheduler on Apollo510 EVB using on-board LEDs, buttons,
+    and the SoC's PDM0 peripheral as the audio "click" source. No external
+    Click board or shield required.
+  name: Weaver Audio (Apollo510 EVB)
+common:
+  tags:
+    - kernel
+    - weaver
+    - audio
+  harness: console
+  harness_config:
+    type: one_line
+    regex:
+      - "Weaver Audio Demo Complete"
+tests:
+  sample.kernel.weaver_audio.apollo510_evb:
+    platform_allow:
+      - apollo510_evb
+    integration_platforms:
+      - apollo510_evb
+  sample.kernel.weaver_audio.apollo510_evb.stock:
+    platform_allow:
+      - apollo510_evb
+    integration_platforms:
+      - apollo510_evb
+    extra_args: EXTRA_CONF_FILE=stock.conf
