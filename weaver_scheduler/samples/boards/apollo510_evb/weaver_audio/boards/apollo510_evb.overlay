@@ -1,0 +1,33 @@
+/*
+ * Copyright (c) 2026 Ambiq Micro, Inc.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Overlay for the Apollo510 EVB weaver_audio sample.
+ *
+ * Enables the on-SoC PDM0 peripheral as a generic DMIC source.
+ *
+ * The exact pdm0 pinctrl group lives in the board pinctrl dtsi
+ * (apollo510_evb-pinctrl.dtsi -> pdm0_default). If that node uses a
+ * different name in your tree, adjust the pinctrl-0 reference below.
+ *
+ * AUDIO ROUTING ASSUMPTION:
+ *   pdm0 is assumed to be wired to whatever DMIC is fitted on the
+ *   EVB. If your apollo510_evb has no DMIC and you intend to wire
+ *   an external mic, override the pinmux in your own product
+ *   overlay to route to GPIOs you can reach.
+ */
+
+&pdm0 {
+	pinctrl-0 = <&pdm0_default>;
+	pinctrl-names = "default";
+	status = "okay";
+
+	dmic_pdm0: dmic-pdm0 {
+		compatible = "zephyr,audio-dmic";
+		status = "okay";
+	};
+};
+
+/* The LEDs and buttons are already configured okay in the board DTS.
+ * No overlay needed for them.
+ */
