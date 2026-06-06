@@ -25,6 +25,7 @@
 #include "arb/hal/imu.h"
 #include "arb/control/pid.h"
 #include "arb/control/diff_drive.h"
+#include "arb/bridge/jaus.h"
 
 static int g_failed;
 static int g_checks;
@@ -317,6 +318,106 @@ static void test_diff_drive(void)
 	CHECK_NEAR(w, 0.8f, 1e-4f);
 }
 
+/* ---- JAUS bridge ------------------------------------------------------ */
+
+#define JAUS_CMD_VEL 200
+#define JAUS_ODOM    201
+
+static int s_jaus_cmd_count;
+static arb_twist_t s_jaus_cmd;
+
+static void on_jaus_cmd(arb_topic_id_t t, const void *m, size_t l, void *u)
+{
+	(void)t; (void)u;
+	if (l == sizeof(arb_twist_t)) {
+		s_jaus_cmd = *(const arb_twist_t *)m;
+		s_jaus_cmd_count++;
+	}
+}
+
+/* capture outbound JAUS messages from the bridge */
+static int s_jaus_sent;
+static uint16_t s_jaus_last_code;
+static int jaus_capture(void *ctx, const arb_jaus_addr_t *dest,
+			const uint8_t *msg, size_t len)
+{
+	(void)ctx; (void)dest;
+	if (len >= 2) {
+		s_jaus_last_code = (uint16_t)(msg[0] | (msg[1] << 8));
+		s_jaus_sent++;
+	}
+	return 0;
+}
+
+static void test_jaus(void)
+{
+	printf("test_jaus\n");
+
+	/* scaled-int round trip */
+	uint32_t i = arb_jaus_scale_to_uint(2.5, -327.68, 327.67, 32);
+	double back = arb_jaus_scale_from_uint(i, -327.68, 327.67, 32);
+	CHECK_NEAR(back, 2.5, 0.001);
+	/* clamping */
+	CHECK(arb_jaus_scale_to_uint(1000.0, 0.0, 100.0, 16) == 0xFFFF);
+	CHECK(arb_jaus_scale_to_uint(-1.0, 0.0, 100.0, 16) == 0);
+
+	/* bridge setup */
+	arb_topic_init();
+	s_jaus_cmd_count = 0;
+	s_jaus_sent = 0;
+	CHECK(arb_topic_advertise(JAUS_CMD_VEL, sizeof(arb_twist_t)) == ARB_OK);
+	CHECK(arb_topic_advertise(JAUS_ODOM, sizeof(arb_odom_t)) == ARB_OK);
+	CHECK(arb_topic_subscribe(JAUS_CMD_VEL, on_jaus_cmd, NULL) == ARB_OK);
+
+	arb_jaus_bridge_t br;
+	arb_jaus_cfg_t cfg;
+	memset(&cfg, 0, sizeof(cfg));
+	cfg.self.subsystem = 1;
+	cfg.send = jaus_capture;
+	cfg.cmd_vel_topic = JAUS_CMD_VEL;
+	cfg.odom_topic = JAUS_ODOM;
+	cfg.max_linear = 2.0f;
+	cfg.max_angular = 3.0f;
+	strcpy(cfg.identification, "arb-bot");
+	CHECK(arb_jaus_init(&br, &cfg) == ARB_OK);
+
+	/* inbound SetWrenchEffort -> /cmd_vel twist */
+	uint8_t wbuf[16];
+	int wn = arb_jaus_build_set_wrench_effort(50.0f, -100.0f, wbuf,
+						  sizeof(wbuf));
+	CHECK(wn > 0);
+	arb_jaus_addr_t ctrl = { .subsystem = 9, .node = 1, .component = 1 };
+	CHECK(arb_jaus_rx(&br, &ctrl, wbuf, (size_t)wn) == ARB_OK);
+	arb_platform_dispatch();
+	CHECK(s_jaus_cmd_count == 1);
+	/* 50% of max_linear=2.0 -> 1.0 m/s; -100% of max_angular=3.0 -> -3.0 */
+	CHECK_NEAR(s_jaus_cmd.linear.x, 1.0f, 0.01f);
+	CHECK_NEAR(s_jaus_cmd.angular.z, -3.0f, 0.01f);
+
+	/* publishing /odom triggers velocity + pose reports to the controller */
+	arb_odom_t odom;
+	memset(&odom, 0, sizeof(odom));
+	odom.linear_vel = 0.5f;
+	odom.angular_vel = 0.2f;
+	odom.pose.x = 1.0f;
+	CHECK(arb_topic_publish(JAUS_ODOM, &odom, sizeof(odom)) == ARB_OK);
+	s_jaus_sent = 0;
+	arb_platform_dispatch();
+	CHECK(s_jaus_sent == 2); /* ReportVelocityState + ReportLocalPose */
+
+	/* a query is answered with a report */
+	uint8_t q[2] = { ARB_JAUS_QUERY_IDENTIFICATION & 0xFF,
+			 ARB_JAUS_QUERY_IDENTIFICATION >> 8 };
+	s_jaus_sent = 0;
+	CHECK(arb_jaus_rx(&br, &ctrl, q, sizeof(q)) == ARB_OK);
+	CHECK(s_jaus_sent == 1);
+	CHECK(s_jaus_last_code == ARB_JAUS_REPORT_IDENTIFICATION);
+
+	/* unknown command code is reported as not-found */
+	uint8_t bad[2] = { 0xEF, 0xBE };
+	CHECK(arb_jaus_rx(&br, &ctrl, bad, sizeof(bad)) == ARB_ERR_NOTFOUND);
+}
+
 int main(void)
 {
 	arb_platform_init();
@@ -328,6 +429,7 @@ int main(void)
 	test_imu();
 	test_pid();
 	test_diff_drive();
+	test_jaus();
 
 	printf("\n%d checks, %d failures\n", g_checks, g_failed);
 	if (g_failed == 0) {

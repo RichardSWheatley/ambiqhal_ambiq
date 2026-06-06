@@ -21,14 +21,21 @@ ambiq-robotics/
 │   │   │   ├── motor.h    # motor_set_duty(), ...
 │   │   │   ├── encoder.h  # encoder_read() -> angle + velocity
 │   │   │   └── imu.h      # imu_sample()
-│   │   └── control/       # reusable control building blocks
-│   │       ├── pid.h      # PID w/ anti-windup
-│   │       └── diff_drive.h # twist <-> wheel kinematics
-│   └── src/               # topic.c, service.c, hal/*.c, control/*.c
-├── port/
-│   ├── ambiqsuite/        # no-OS: super-loop dispatch + direct Ambiq HAL
-│   ├── zephyr/            # Zephyr module: k_msgq dispatch, device API, bridge
-│   └── host/              # POSIX simulation port (tests / algorithm bring-up)
+│   │   ├── control/       # reusable control building blocks
+│   │   │   ├── pid.h      # PID w/ anti-windup
+│   │   │   └── diff_drive.h # twist <-> wheel kinematics
+│   │   └── bridge/        # external-network bridges
+│   │       └── jaus.h     # JAUS (SAE AS-4) codec + topic mapping
+│   └── src/               # topic.c, service.c, hal/*, control/*, bridge/*
+├── port/                  # one small platform.c per OS (the only OS-specific code)
+│   ├── ambiqsuite/        # no-OS super-loop + direct Ambiq HAL bindings
+│   ├── zephyr/            # Zephyr module: k_msgq dispatch, device API, micro-ROS
+│   ├── freertos/          # FreeRTOS (incl. the one bundled in AmbiqSuite)
+│   ├── threadx/           # Eclipse ThreadX (Azure RTOS)
+│   ├── nuttx/             # Apache NuttX
+│   ├── riot/              # RIOT OS
+│   ├── cmsis-rtos2/       # CMSIS-RTOS2 (Keil RTX5, etc.)
+│   └── host/              # POSIX simulation + JAUS/UDP + OpenJAUS adapter
 ├── samples/
 │   ├── ambiqsuite/        # closed-loop diff-drive base, super-loop
 │   └── zephyr/            # closed-loop diff-drive base, dispatcher thread
@@ -108,6 +115,48 @@ west build -b apollo510_evb samples/zephyr
 
 Enable `CONFIG_ARB_MICRO_ROS_BRIDGE=y` (with the micro-ROS module present) to
 mirror `/cmd_vel`, `/odom`, and `/imu` onto a ROS2 network.
+
+## Supported platforms (ports)
+
+The only OS-specific code is one small `platform.c` per target implementing the
+`platform.h` contract. Adding a new OS is ~50-100 lines.
+
+| Port | `post` (ISR-safe) | `dispatch` | lock | timebase |
+|------|-------------------|-----------|------|----------|
+| `ambiqsuite` (no-OS) | static ring + PRIMASK | super-loop drain | PRIMASK | STIMER (true µs) |
+| `zephyr` | `k_msgq` | thread / manual | `irq_lock` | kernel ticks |
+| `freertos` | `xQueueSendFromISR` | `xQueueReceive` | BASEPRI mask | ticks (override for µs) |
+| `threadx` | block pool + `tx_queue_send` | `tx_queue_receive` | `TX_DISABLE` | ticks (override for µs) |
+| `nuttx` | static ring + critical section | drain | `enter_critical_section` | `CLOCK_MONOTONIC` |
+| `riot` | static ring + `irq_disable` | drain | `irq_disable` | xtimer 64-bit µs |
+| `cmsis-rtos2` | `osMessageQueuePut` | `osMessageQueueGet` | PRIMASK | ticks (override for µs) |
+| `host` | array ring | drain | no-op | `CLOCK_MONOTONIC` |
+
+Tick-based ports expose a **weak** `arb_platform_time_us()`; override it with a
+hardware timer (e.g. the Apollo510 STIMER) when you need sub-millisecond stamps.
+*(Arm Mbed OS is intentionally omitted - Arm EOLs it in July 2026.)*
+
+## JAUS interoperability
+
+`core/src/bridge/jaus.c` speaks a useful subset of **JAUS (SAE AS-4)** so an ARB
+node interoperates on a JAUS network, mirroring how the micro-ROS bridge exposes
+it to ROS2:
+
+```
+JAUS SetWrenchEffort        -> ARB /cmd_vel
+ARB  /odom                  -> JAUS ReportVelocityState + ReportLocalPose
+JAUS Query{VelocityState,LocalPose,Identification,Heartbeat} -> matching Report
+```
+
+The codec is transport-agnostic (scaled-integer fields, command-code framing);
+bytes leave through a send hook. Two transports are provided under
+`port/host/bridge/`:
+
+- **`jaus_udp.c`** - a simple UDP transport for ARB-to-ARB JAUS over a network
+  or on the bench (functional, host-buildable).
+- **`open_jaus.c`** - an **OpenJAUS SDK** adapter (built only with
+  `-DARB_WITH_OPENJAUS`) that hands AS5669A transport, discovery, and node
+  management to OpenJAUS while ARB owns robot behavior.
 
 ## Tuning (compile-time)
 
