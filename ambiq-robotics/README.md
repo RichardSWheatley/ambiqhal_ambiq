@@ -37,11 +37,20 @@ ambiq-robotics/
 │   ├── riot/              # RIOT OS
 │   ├── cmsis-rtos2/       # CMSIS-RTOS2 (Keil RTX5, etc.)
 │   └── host/              # POSIX simulation + JAUS/UDP + OpenJAUS adapter
-├── samples/               # ambiqsuite, zephyr, freertos, threadx, nuttx, jaus
+├── samples/               # ambiqsuite, zephyr, freertos, threadx, nuttx,
+│                          #   riot, cmsis-rtos2, jaus
+└── docs/                  # architecture.md, porting.md
 │   ├── ambiqsuite/        # closed-loop diff-drive base, super-loop
 │   └── zephyr/            # closed-loop diff-drive base, dispatcher thread
 └── tests/                 # host unit tests (ctest)
 ```
+
+## Documentation
+
+- [docs/architecture.md](docs/architecture.md) — layers, message flow, HAL,
+  control, and bridges.
+- [docs/porting.md](docs/porting.md) — bring ARB up on a new OS (the `platform.h`
+  contract, queue patterns, build wiring, verification checklist).
 
 ## Architecture
 
