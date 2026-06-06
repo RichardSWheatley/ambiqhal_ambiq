@@ -14,10 +14,15 @@ cmake_minimum_required(VERSION 3.20)
 project(ambiq_robotics C)
 
 option(ARB_BUILD_TESTS "Build the host unit tests" OFF)
+option(ARB_BUILD_SAMPLES "Build the host-runnable samples" OFF)
 
 add_subdirectory(core)
 
 if(ARB_BUILD_TESTS)
   enable_testing()
   add_subdirectory(tests)
+endif()
+
+if(ARB_BUILD_SAMPLES)
+  add_subdirectory(samples/jaus)
 endif()
