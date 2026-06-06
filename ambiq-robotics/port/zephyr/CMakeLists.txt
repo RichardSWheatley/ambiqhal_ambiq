@@ -19,6 +19,7 @@ if(CONFIG_ARB)
     ${ARB_ROOT}/core/src/control/pid.c
     ${ARB_ROOT}/core/src/control/diff_drive.c
     ${ARB_ROOT}/core/src/bridge/jaus.c
+    ${ARB_ROOT}/core/src/bridge/serial.c
   )
 
   # Zephyr port
@@ -37,5 +38,9 @@ if(CONFIG_ARB)
 
   zephyr_library_sources_ifdef(CONFIG_ARB_MICRO_ROS_BRIDGE
     ${CMAKE_CURRENT_LIST_DIR}/bridge/micro_ros.c
+  )
+
+  zephyr_library_sources_ifdef(CONFIG_ARB_JAUS_BRIDGE
+    ${CMAKE_CURRENT_LIST_DIR}/bridge/jaus_udp.c
   )
 endif()

@@ -26,5 +26,7 @@ ARB_SRC := \
 	$(ARB_ROOT)/core/src/control/pid.c \
 	$(ARB_ROOT)/core/src/control/diff_drive.c \
 	$(ARB_ROOT)/core/src/bridge/jaus.c \
+	$(ARB_ROOT)/core/src/bridge/serial.c \
 	$(ARB_PORT_DIR)/platform.c \
-	$(ARB_PORT_DIR)/hal_bind.c
+	$(ARB_PORT_DIR)/hal_bind.c \
+	$(ARB_PORT_DIR)/transport_uart.c

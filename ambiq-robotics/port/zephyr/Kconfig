@@ -56,4 +56,15 @@ config ARB_MICRO_ROS_BRIDGE
 	  Build the micro-ROS adapter that mirrors internal ARB topics to ROS2
 	  publishers/subscribers. Requires the micro-ROS Zephyr module.
 
+config ARB_JAUS_BRIDGE
+	bool "JAUS bridge (UDP)"
+	default n
+	select NETWORKING
+	select NET_UDP
+	select NET_SOCKETS
+	help
+	  Build the JAUS (SAE AS-4) bridge with a Zephyr UDP transport, exposing
+	  the node on a JAUS network (SetWrenchEffort -> /cmd_vel; /odom ->
+	  ReportVelocityState/ReportLocalPose).
+
 endif # ARB

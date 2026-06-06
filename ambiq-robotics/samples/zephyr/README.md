@@ -37,6 +37,15 @@ Example overlay fragment:
 };
 ```
 
+## JAUS
+
+Set `CONFIG_ARB_JAUS_BRIDGE=y` to expose the node on a JAUS network over UDP
+(the option pulls in networking). The sample then opens the bridge on UDP/3794
+and a JAUS controller can drive it with `SetWrenchEffort` and receive
+`ReportVelocityState`/`ReportLocalPose` — the same behavior as the host
+`samples/jaus` node. Configure an IP for your board (DHCP or static) via the
+usual Zephyr networking Kconfig.
+
 ## micro-ROS
 
 Set `CONFIG_ARB_MICRO_ROS_BRIDGE=y` (uncomment in `prj.conf`) with the micro-ROS

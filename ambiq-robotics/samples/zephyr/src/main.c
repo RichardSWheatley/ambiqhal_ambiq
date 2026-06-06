@@ -24,6 +24,11 @@
 #include "arb/control/diff_drive.h"
 #include "hal_bind.h"
 
+#ifdef CONFIG_ARB_JAUS_BRIDGE
+#include "arb/bridge/jaus.h"
+#include "bridge/jaus_udp.h"
+#endif
+
 LOG_MODULE_REGISTER(arb_sample, LOG_LEVEL_INF);
 
 #define ARB_TOPIC_CMD_VEL 1
@@ -150,6 +155,29 @@ int main(void)
 	arb_topic_advertise(ARB_TOPIC_IMU,     sizeof(arb_imu_t));
 	arb_topic_subscribe(ARB_TOPIC_CMD_VEL, on_cmd_vel, NULL);
 
+#ifdef CONFIG_ARB_JAUS_BRIDGE
+	static arb_zjaus_udp_t jaus_udp;
+	static arb_jaus_bridge_t jaus;
+	if (arb_zjaus_udp_open(&jaus_udp, 3794, "0.0.0.0", 3795) == 0) {
+		arb_jaus_cfg_t jcfg = {0};
+		jcfg.self.subsystem = 1;
+		jcfg.self.node = 1;
+		jcfg.self.component = 1;
+		jcfg.send = arb_zjaus_udp_send;
+		jcfg.send_ctx = &jaus_udp;
+		jcfg.cmd_vel_topic = ARB_TOPIC_CMD_VEL;
+		jcfg.odom_topic = ARB_TOPIC_ODOM;
+		jcfg.max_linear = MAX_WHEEL_SPEED_MS;
+		jcfg.max_angular = 3.0f;
+		strncpy(jcfg.identification, "arb-zephyr",
+			sizeof(jcfg.identification) - 1);
+		arb_jaus_init(&jaus, &jcfg);
+		LOG_INF("JAUS bridge up on UDP/3794");
+	} else {
+		LOG_ERR("JAUS UDP open failed");
+	}
+#endif
+
 	LOG_INF("ARB diff-drive sample running (closed loop)");
 
 	/* Dispatcher thread (CONFIG_ARB_DISPATCH_THREAD) delivers messages;
@@ -158,6 +186,9 @@ int main(void)
 	for (;;) {
 		control_and_odom(dt);
 		publish_imu();
+#ifdef CONFIG_ARB_JAUS_BRIDGE
+		arb_zjaus_udp_poll(&jaus_udp, &jaus);
+#endif
 		k_msleep(CONTROL_PERIOD_MS);
 	}
 	return 0;

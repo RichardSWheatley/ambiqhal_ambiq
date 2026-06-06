@@ -1,19 +1,18 @@
-# ARB makefile fragment - FreeRTOS on Apollo (AmbiqSuite SDK projects).
+# ARB makefile fragment - Eclipse ThreadX on Apollo (AmbiqSuite SDK projects).
 #
-# Uses the FreeRTOS platform port for the broker and reuses the AmbiqSuite
-# direct-HAL bindings for motor/encoder/IMU (AmbiqSuite ships FreeRTOS, so this
-# is the common no-Zephyr RTOS combination on Apollo510).
+# Uses the ThreadX platform port for the broker and reuses the AmbiqSuite
+# direct-HAL bindings for motor/encoder/IMU.
 #
 #   ARB_ROOT := ../../path/to/ambiq-robotics
-#   include $(ARB_ROOT)/port/freertos/arb.mk
+#   include $(ARB_ROOT)/port/threadx/arb.mk
 #   INCLUDES += $(ARB_INCLUDES)
 #   SRC      += $(ARB_SRC)
 #
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 Ambiq Micro Inc. <www.ambiq.com>
 
-ARB_FREERTOS_DIR := $(dir $(lastword $(MAKEFILE_LIST)))
-ARB_ROOT         ?= $(ARB_FREERTOS_DIR)/../..
+ARB_THREADX_DIR := $(dir $(lastword $(MAKEFILE_LIST)))
+ARB_ROOT        ?= $(ARB_THREADX_DIR)/../..
 
 ARB_INCLUDES := \
 	$(ARB_ROOT)/core/include \
@@ -29,5 +28,5 @@ ARB_SRC := \
 	$(ARB_ROOT)/core/src/control/diff_drive.c \
 	$(ARB_ROOT)/core/src/bridge/jaus.c \
 	$(ARB_ROOT)/core/src/bridge/serial.c \
-	$(ARB_FREERTOS_DIR)/platform.c \
+	$(ARB_THREADX_DIR)/platform.c \
 	$(ARB_ROOT)/port/ambiqsuite/hal_bind.c

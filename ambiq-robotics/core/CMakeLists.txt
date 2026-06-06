@@ -16,6 +16,7 @@ add_library(arb_core STATIC
   src/control/pid.c
   src/control/diff_drive.c
   src/bridge/jaus.c
+  src/bridge/serial.c
 )
 
 target_include_directories(arb_core PUBLIC ${CMAKE_CURRENT_LIST_DIR}/include)

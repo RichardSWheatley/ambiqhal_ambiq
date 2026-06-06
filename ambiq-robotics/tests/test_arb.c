@@ -26,6 +26,7 @@
 #include "arb/control/pid.h"
 #include "arb/control/diff_drive.h"
 #include "arb/bridge/jaus.h"
+#include "arb/bridge/serial.h"
 
 static int g_failed;
 static int g_checks;
@@ -418,6 +419,69 @@ static void test_jaus(void)
 	CHECK(arb_jaus_rx(&br, &ctrl, bad, sizeof(bad)) == ARB_ERR_NOTFOUND);
 }
 
+/* ---- serial transport ------------------------------------------------- */
+
+#define SER_TOPIC 210
+
+/* loopback sink: feed everything written by the tx endpoint into rx */
+static arb_serial_t *s_ser_rx;
+static int ser_loopback(void *ctx, const uint8_t *buf, size_t len)
+{
+	(void)ctx;
+	arb_serial_rx(s_ser_rx, buf, len);
+	return 0;
+}
+
+static int s_ser_got;
+static arb_odom_t s_ser_last;
+static void on_ser(arb_topic_id_t t, const void *m, size_t l, void *u)
+{
+	(void)t; (void)u;
+	if (l == sizeof(arb_odom_t)) {
+		s_ser_last = *(const arb_odom_t *)m;
+		s_ser_got++;
+	}
+}
+
+static void test_serial(void)
+{
+	printf("test_serial\n");
+
+	/* CRC sanity: known-length compute is stable/non-trivial */
+	uint8_t sample[4] = { 1, 2, 3, 4 };
+	uint16_t c = arb_serial_crc16(0xFFFF, sample, sizeof(sample));
+	CHECK(c != 0 && c != 0xFFFF);
+
+	arb_topic_init();
+	s_ser_got = 0;
+	CHECK(arb_topic_advertise(SER_TOPIC, sizeof(arb_odom_t)) == ARB_OK);
+	CHECK(arb_topic_subscribe(SER_TOPIC, on_ser, NULL) == ARB_OK);
+
+	arb_serial_t tx, rx;
+	arb_serial_init(&rx, NULL, NULL);
+	rx.publish_on_rx = true;
+	s_ser_rx = &rx;
+	arb_serial_init(&tx, ser_loopback, NULL);
+
+	arb_odom_t odom;
+	memset(&odom, 0, sizeof(odom));
+	odom.pose.x = 3.14f;
+	odom.linear_vel = 1.5f;
+
+	/* frame it out; loopback feeds the parser; parser publishes locally */
+	CHECK(arb_serial_send(&tx, SER_TOPIC, &odom, sizeof(odom)) == ARB_OK);
+	arb_platform_dispatch();
+	CHECK(s_ser_got == 1);
+	CHECK_NEAR(s_ser_last.pose.x, 3.14f, 1e-6f);
+	CHECK(rx.rx_frames == 1 && rx.rx_crc_errors == 0);
+
+	/* a corrupted byte stream must not produce a frame */
+	uint8_t junk[] = { 0x7E, 0x00, 0x00, 0xFF, 0xFF, 0xDE, 0xAD };
+	arb_serial_rx(&rx, junk, sizeof(junk)); /* bogus length -> resync */
+	arb_platform_dispatch();
+	CHECK(s_ser_got == 1); /* unchanged */
+}
+
 int main(void)
 {
 	arb_platform_init();
@@ -430,6 +494,7 @@ int main(void)
 	test_pid();
 	test_diff_drive();
 	test_jaus();
+	test_serial();
 
 	printf("\n%d checks, %d failures\n", g_checks, g_failed);
 	if (g_failed == 0) {

@@ -24,8 +24,9 @@ ambiq-robotics/
 │   │   ├── control/       # reusable control building blocks
 │   │   │   ├── pid.h      # PID w/ anti-windup
 │   │   │   └── diff_drive.h # twist <-> wheel kinematics
-│   │   └── bridge/        # external-network bridges
-│   │       └── jaus.h     # JAUS (SAE AS-4) codec + topic mapping
+│   │   └── bridge/        # external-link bridges
+│   │       ├── jaus.h     # JAUS (SAE AS-4) codec + topic mapping
+│   │       └── serial.h   # framed UART/SPI transport (telemetry + commands)
 │   └── src/               # topic.c, service.c, hal/*, control/*, bridge/*
 ├── port/                  # one small platform.c per OS (the only OS-specific code)
 │   ├── ambiqsuite/        # no-OS super-loop + direct Ambiq HAL bindings
@@ -36,7 +37,7 @@ ambiq-robotics/
 │   ├── riot/              # RIOT OS
 │   ├── cmsis-rtos2/       # CMSIS-RTOS2 (Keil RTX5, etc.)
 │   └── host/              # POSIX simulation + JAUS/UDP + OpenJAUS adapter
-├── samples/
+├── samples/               # ambiqsuite, zephyr, freertos, threadx, nuttx, jaus
 │   ├── ambiqsuite/        # closed-loop diff-drive base, super-loop
 │   └── zephyr/            # closed-loop diff-drive base, dispatcher thread
 └── tests/                 # host unit tests (ctest)
@@ -157,6 +158,18 @@ bytes leave through a send hook. Two transports are provided under
 - **`open_jaus.c`** - an **OpenJAUS SDK** adapter (built only with
   `-DARB_WITH_OPENJAUS`) that hands AS5669A transport, discovery, and node
   management to OpenJAUS while ARB owns robot behavior.
+
+On Zephyr, set `CONFIG_ARB_JAUS_BRIDGE=y` to get the same bridge over a Zephyr
+UDP socket (`port/zephyr/bridge/jaus_udp.c`).
+
+## Serial (UART) link
+
+`core/src/bridge/serial.c` frames ARB topic messages over any byte stream
+(0x7E + topic + len + payload + CRC16) so a remote host can stream telemetry out
+and inject commands - the lightweight option when there is no IP network. The
+codec is OS-agnostic; the AmbiqSuite no-OS UART wiring is
+`port/ambiqsuite/transport_uart.c`. Subscribe `arb_uart_transport_stream` to the
+topics you want to emit, and call `arb_uart_transport_poll()` from the loop.
 
 ## Tuning (compile-time)
 
