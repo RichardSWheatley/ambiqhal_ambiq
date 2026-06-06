@@ -24,5 +24,6 @@ ARB_SRC := \
 	$(ARB_ROOT)/core/src/hal/encoder.c \
 	$(ARB_ROOT)/core/src/hal/imu.c \
 	$(ARB_ROOT)/core/src/control/pid.c \
+	$(ARB_ROOT)/core/src/control/diff_drive.c \
 	$(ARB_PORT_DIR)/platform.c \
 	$(ARB_PORT_DIR)/hal_bind.c

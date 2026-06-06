@@ -17,6 +17,7 @@ if(CONFIG_ARB)
     ${ARB_ROOT}/core/src/hal/encoder.c
     ${ARB_ROOT}/core/src/hal/imu.c
     ${ARB_ROOT}/core/src/control/pid.c
+    ${ARB_ROOT}/core/src/control/diff_drive.c
   )
 
   # Zephyr port

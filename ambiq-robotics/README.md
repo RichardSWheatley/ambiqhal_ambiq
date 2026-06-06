@@ -17,17 +17,22 @@ ambiq-robotics/
 │   │   ├── topic.h        # pub/sub broker API
 │   │   ├── service.h      # request/response API
 │   │   ├── platform.h     # THE port-layer contract
-│   │   └── hal/           # robotics-oriented peripheral abstractions
-│   │       ├── motor.h    # motor_set_duty(), ...
-│   │       ├── encoder.h  # encoder_read() -> angle + velocity
-│   │       └── imu.h      # imu_sample()
-│   └── src/               # topic.c, service.c, hal/*.c
+│   │   ├── hal/           # robotics-oriented peripheral abstractions
+│   │   │   ├── motor.h    # motor_set_duty(), ...
+│   │   │   ├── encoder.h  # encoder_read() -> angle + velocity
+│   │   │   └── imu.h      # imu_sample()
+│   │   └── control/       # reusable control building blocks
+│   │       ├── pid.h      # PID w/ anti-windup
+│   │       └── diff_drive.h # twist <-> wheel kinematics
+│   └── src/               # topic.c, service.c, hal/*.c, control/*.c
 ├── port/
 │   ├── ambiqsuite/        # no-OS: super-loop dispatch + direct Ambiq HAL
-│   └── zephyr/            # Zephyr module: k_msgq dispatch, device API, bridge
-└── samples/
-    ├── ambiqsuite/        # diff-drive base, super-loop
-    └── zephyr/            # diff-drive base, dispatcher thread
+│   ├── zephyr/            # Zephyr module: k_msgq dispatch, device API, bridge
+│   └── host/              # POSIX simulation port (tests / algorithm bring-up)
+├── samples/
+│   ├── ambiqsuite/        # closed-loop diff-drive base, super-loop
+│   └── zephyr/            # closed-loop diff-drive base, dispatcher thread
+└── tests/                 # host unit tests (ctest)
 ```
 
 ## Architecture
@@ -115,6 +120,17 @@ mirror `/cmd_vel`, `/odom`, and `/imu` onto a ROS2 network.
 | `ARB_QUEUE_DEPTH` | 16 | port queue depth |
 
 On Zephyr these map to `CONFIG_ARB_*` Kconfig options.
+
+## Testing
+
+The OS-agnostic core builds and runs on a host via the `port/host` simulation
+port. Build and run the unit suite (broker, services, HAL logic, PID, kinematics):
+
+```bash
+cmake -S ambiq-robotics -B build -DARB_BUILD_TESTS=ON
+cmake --build build
+ctest --test-dir build --output-on-failure
+```
 
 ## License
 

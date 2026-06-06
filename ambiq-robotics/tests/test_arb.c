@@ -24,6 +24,7 @@
 #include "arb/hal/encoder.h"
 #include "arb/hal/imu.h"
 #include "arb/control/pid.h"
+#include "arb/control/diff_drive.h"
 
 static int g_failed;
 static int g_checks;
@@ -292,6 +293,30 @@ static void test_pid(void)
 	CHECK_NEAR(x, target, 0.05f);
 }
 
+/* ---- diff-drive kinematics ------------------------------------------- */
+
+static void test_diff_drive(void)
+{
+	printf("test_diff_drive\n");
+	arb_diffdrive_t dd = { .wheel_base = 0.2f, .wheel_radius = 0.05f };
+	float wl, wr, v, w;
+
+	/* straight ahead: both wheels equal, no rotation */
+	arb_diffdrive_twist_to_wheels(&dd, 0.5f, 0.0f, &wl, &wr);
+	CHECK_NEAR(wl, wr, 1e-6f);
+	CHECK_NEAR(wl, 0.5f / 0.05f, 1e-4f);
+
+	/* spin in place: wheels equal and opposite, zero forward speed */
+	arb_diffdrive_twist_to_wheels(&dd, 0.0f, 1.0f, &wl, &wr);
+	CHECK_NEAR(wl, -wr, 1e-6f);
+
+	/* round-trip: twist -> wheels -> twist is identity */
+	arb_diffdrive_twist_to_wheels(&dd, 0.3f, 0.8f, &wl, &wr);
+	arb_diffdrive_wheels_to_twist(&dd, wl, wr, &v, &w);
+	CHECK_NEAR(v, 0.3f, 1e-4f);
+	CHECK_NEAR(w, 0.8f, 1e-4f);
+}
+
 int main(void)
 {
 	arb_platform_init();
@@ -302,6 +327,7 @@ int main(void)
 	test_encoder();
 	test_imu();
 	test_pid();
+	test_diff_drive();
 
 	printf("\n%d checks, %d failures\n", g_checks, g_failed);
 	if (g_failed == 0) {
