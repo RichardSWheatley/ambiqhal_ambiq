@@ -13,6 +13,7 @@ add_library(arb_core STATIC
   src/hal/motor.c
   src/hal/encoder.c
   src/hal/imu.c
+  src/control/pid.c
 )
 
 target_include_directories(arb_core PUBLIC ${CMAKE_CURRENT_LIST_DIR}/include)
