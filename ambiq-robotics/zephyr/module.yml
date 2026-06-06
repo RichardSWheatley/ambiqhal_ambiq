@@ -1,0 +1,12 @@
+# Zephyr module manifest for the Ambiq Robotics Broker (ARB) middleware.
+#
+# Point west/Zephyr at this directory (e.g. add it under your manifest's
+# `projects:` or as an extra module) to get the `ARB` Kconfig menu and the
+# build glue from port/zephyr.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+name: ambiq_robotics
+build:
+  cmake: ../port/zephyr
+  kconfig: ../port/zephyr/Kconfig
