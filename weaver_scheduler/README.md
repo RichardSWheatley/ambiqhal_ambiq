@@ -88,6 +88,7 @@ true, signaling non-essential producers to slow down.
 | `DECISIONS.md` | All assumptions and tuning rationale for the wearable target |
 | `FUZZY_THROTTLE.md` | TSK fuzzy + EMA throttle controller: design, math, why it's strictly an improvement |
 | `ML_AND_FUZZY_LOGIC.md` | Why we kept the dispatcher hot path linear and where heavier ML belongs |
+| `NPU_PHASE3.md` | **DRAFT design sketch** for extending Weaver to the Apollo510 NPU (Ethos-U55). Adds the "Loom" thread class. Header-only stub at `include/zephyr/kernel/weaver_sched_npu.h`. No implementation yet — pitch material for Ambiq. |
 | `MVE_PATHS.md` | Three pressure-batch paths (scalar / hybrid / full MVE), break-even analysis, FP-save-tax explanation |
 | `FP_VS_FIXED.md` | Fixed-point vs floating-point Weaver variant comparison, when to pick each, equivalence proof |
 | `RFC.md` | **Peer-review RFC**: rationale, problem statement, goals/non-goals, alternatives considered, **measurables and acceptance criteria (M1–M7)**, risk analysis, implementation plan, ballot |
