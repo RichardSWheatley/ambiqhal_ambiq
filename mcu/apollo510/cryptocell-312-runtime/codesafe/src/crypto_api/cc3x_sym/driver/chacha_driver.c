@@ -5,32 +5,35 @@
  */
 
 /*
- * Ambiq Apollo510 modification notes
- * ----------------------------------
- * This is ARM's CryptoCell-312 runtime ChaCha low-level driver, patched for
- * the Apollo510 (Cortex-M55) which places a write-back/write-allocate data
- * cache (DCACHE) in front of the buffers the CC312 symmetric DMA engine reads
- * from and writes to. Two constraints must be honored, identical to the ones
- * already applied to the AES driver (am_hal_cc312_aes.c::am_hal_cc312_aes_process):
+ * Apollo510 (Cortex-M55) DCACHE / CC312 DMA coherency
+ * ----------------------------------------------------
+ * On Apollo510 a write-back data cache (DCACHE, 32-byte line) sits
+ * in front of the system memory that the CC312 DMA reads from and
+ * writes to. Two things must be honored on the internal-DMA ChaCha
+ * path:
  *
- *   1. Any buffer transferred to/from the engine by DMA must be aligned to the
- *      DCACHE line size (AM_HAL_CC312_DMA_ALIGNMENT == 32 bytes), and its
- *      backing allocation padded to a multiple of that size. Cache maintenance
- *      operates on whole cache lines; if a DMA buffer shares a cache line with
- *      unrelated data, the clean/invalidate below will corrupt that neighbor.
+ *   1. Every system-memory buffer handed to the engine must be
+ *      aligned to the DCACHE line size (CC_DCACHE_LINE_BYTES, 32)
+ *      and its backing allocation padded to a multiple of it. Cache
+ *      maintenance works on whole lines; a buffer sharing a line
+ *      with unrelated data would have that neighbor clobbered.
  *
- *   2. Before the DMA is kicked, the input buffer must be CLEANED (so pending
- *      CPU writes reach memory for the engine to read) and the output buffer
- *      must be CLEANED+INVALIDATED (so no stale dirty line later evicts on top
- *      of the engine's result). After the DMA completes, the output buffer must
- *      be INVALIDATED so the CPU re-reads the engine's result from memory
- *      rather than a stale cached copy. A dummy DLLI read flush is performed
- *      first to guarantee the engine's last write has drained to memory.
+ *   2. Before the transfer is kicked, the input buffer is cleaned
+ *      (so CPU writes reach memory for the engine to read) and the
+ *      output buffer is clean+invalidated (so no stale dirty line
+ *      later evicts over the result), using the CMSIS SCB
+ *      DCACHE-by-address intrinsics. After CC_HalWaitInterrupt
+ *      returns, any driver state that must be stored (e.g.
+ *      StoreChachaState) should be called before cache maintenance;
+ *      not all operations require this step. A small dummy DMA read
+ *      (ChachaDmaReadFlush) then drains the engine's last write to
+ *      memory, followed by output invalidation so the CPU re-reads
+ *      the engine's result rather than a stale cached copy.
  *
- * Only the internal-DMA ChaCha path (ProcessChacha) needs this. SetDataBuffersInfo
- * (driver_common.c) is shared by all engines and only records buffer addresses,
- * and the chacha_driver_ext_dma.c path delegates DMA and coherency to the host
- * application, so neither is modified here.
+ * Only ProcessChacha (internal DMA) needs this. SetDataBuffersInfo
+ * (driver_common.c) is shared and only records addresses, and
+ * chacha_driver_ext_dma.c leaves DMA/coherency to the host
+ * application.
  */
 
 #include <stdint.h>
@@ -47,21 +50,8 @@
 #include "dx_crys_kernel.h"
 #include "cc_util_pm.h"
 
-/*
- * Apollo510 DCACHE / CC312 DMA coherency helpers.
- *
- * These are provided by the Ambiq HAL (am_hal_cc312.c). They are declared here
- * (rather than pulling in the full am_mcu_apollo.h) to keep this ARM runtime
- * source self-contained and minimally coupled to the HAL headers. The same
- * helpers back the AES driver's DMA path.
- */
-#ifndef AM_HAL_CC312_DMA_ALIGNMENT
-#define AM_HAL_CC312_DMA_ALIGNMENT  32U  /* Apollo510 DCACHE line size. */
-#endif
-
-extern void     am_hal_cc312_cache_clean_invalidate_region(const void *addr, uint32_t length);
-extern void     am_hal_cc312_cache_invalidate_region(const void *addr, uint32_t length);
-extern uint32_t am_hal_cc312_flush_dummy_dlli(uint32_t src_addr, uint32_t length);
+/* CMSIS-Core (Cortex-M55) for the SCB DCACHE maintenance intrinsics. */
+#include "apollo510.h"
 
 
 extern CC_PalMutex CCSymCryptoMutex;
@@ -69,6 +59,10 @@ extern CC_PalMutex CCSymCryptoMutex;
 /* chacha mode, poly1305 disabled, 256 bit key, 20 rounds, 64 bit iv, do not reset the block counter (overwritten by the context) */
 #define CHACHA_CONTROL_REG_VAL        (1 << DX_CHACHA_CONTROL_REG_INIT_FROM_HOST_BIT_SHIFT)
 #define CHACHA_CONTROL_REG_USE_IV_96  (1 << DX_CHACHA_CONTROL_REG_USE_IV_96BIT_BIT_SHIFT)
+
+/* Local DCACHE-line-aligned sink for the post-operation DMA-read flush. */
+static uint32_t gChachaDmaFlushSink[CC_DCACHE_LINE_BYTES / sizeof(uint32_t)]
+        __attribute__((aligned(CC_DCACHE_LINE_BYTES)));
 
 /******************************************************************************
 *               PRIVATE FUNCTIONS
@@ -185,6 +179,43 @@ static drvError_t LoadChachaKey(ChachaContext_t *chachaCtx)
         return CHACHA_DRV_OK;
 }
 
+/*
+ * Drain the engine's last DMA write to memory.
+ *
+ * After the data DMA completes, the CC312 write path may still hold
+ * the final line(s). Issuing a small dummy DMA read from the output
+ * tail into a throwaway sink forces that write to land in memory
+ * before the CPU invalidates and re-reads the result. The throwaway
+ * data itself is discarded; the ChaCha state has already been
+ * captured by StoreChachaState, so the incidental pass of the sink
+ * read through the core does not affect the operation's result.
+ */
+static drvError_t ChachaDmaReadFlush(uint32_t srcAddr)
+{
+        uint32_t irrVal = 0;
+
+        /* clear all interrupts and re-mask everything except SYM DMA completion */
+        CC_HalClearInterruptBit(0xFFFFFFFFUL);
+        irrVal = CC_HAL_READ_REGISTER(CC_REG_OFFSET(HOST_RGF, HOST_IMR));
+        CC_REG_FLD_SET(HOST_RGF, HOST_IMR, SRAM_TO_DIN_MASK, irrVal, 1);
+        CC_REG_FLD_SET(HOST_RGF, HOST_IMR, DOUT_TO_SRAM_MASK, irrVal, 1);
+        CC_REG_FLD_SET(HOST_RGF, HOST_IMR, MEM_TO_DIN_MASK, irrVal, 1);
+        CC_REG_FLD_SET(HOST_RGF, HOST_IMR, DOUT_TO_MEM_MASK, irrVal, 1);
+        CC_REG_FLD_SET(HOST_RGF, HOST_IMR, SYM_DMA_COMPLETED_MASK, irrVal, 0);
+        CC_HalMaskInterrupt(irrVal);
+
+        /* destination: throwaway sink; source: output tail; one cache line */
+        CC_HAL_WRITE_REGISTER(CC_REG_OFFSET(HOST_RGF, DST_LLI_WORD0) ,(uint32_t)(uintptr_t)gChachaDmaFlushSink);
+        CC_HAL_WRITE_REGISTER(CC_REG_OFFSET(HOST_RGF, DST_LLI_WORD1) ,CC_DCACHE_LINE_BYTES);
+        CC_HAL_WRITE_REGISTER(CC_REG_OFFSET(HOST_RGF, SRC_LLI_WORD0) ,srcAddr);
+        CC_HAL_WRITE_REGISTER(CC_REG_OFFSET(HOST_RGF, SRC_LLI_WORD1) ,CC_DCACHE_LINE_BYTES);
+
+        /* wait for the flush DMA to complete */
+        irrVal = 0;
+        CC_REG_FLD_SET(HOST_RGF, HOST_IRR, SYM_DMA_COMPLETED, irrVal, 1);
+        return CC_HalWaitInterrupt(irrVal);
+}
+
 /******************************************************************************
 *               PUBLIC FUNCTIONS
 ******************************************************************************/
@@ -269,22 +300,20 @@ drvError_t ProcessChacha(ChachaContext_t *chachaCtx, CCBuffInfo_t *pInputBuffInf
     }
 
     /*
-     * Apollo510 DCACHE coherency (concern #2: clean & invalidate before DMA).
-     *
-     * Done after the destination is programmed but before the source write
-     * below kicks the transfer, matching am_hal_cc312_aes_process(). Only DLLI
-     * (system-memory) buffers live behind the CPU DCACHE; SRAM_ADDR buffers are
-     * in CC-internal SRAM and must not be touched by CPU cache maintenance.
-     *
-     * The buffers MUST be 32-byte (AM_HAL_CC312_DMA_ALIGNMENT) aligned and
-     * padded (concern #1) - the cache helpers round the length up to a whole
-     * cache line, so an unaligned/short buffer would clobber its neighbors.
+     * DCACHE clean before the DMA is kicked (concern #2). Clean the
+     * input so the engine reads committed data; clean+invalidate the
+     * output so no stale dirty line later evicts over the result.
+     * System-memory buffers only - SRAM_ADDR buffers live in
+     * CC-internal SRAM, behind no CPU cache. Buffers must be
+     * CC_DCACHE_LINE_BYTES aligned/padded (concern #1).
      */
-    if (chachaCtx->inputDataAddrType == DLLI_ADDR) {
-        am_hal_cc312_cache_clean_invalidate_region((const void *)(uintptr_t)inputDataAddr, inDataSize);
-    }
-    if (chachaCtx->outputDataAddrType == DLLI_ADDR) {
-        am_hal_cc312_cache_clean_invalidate_region((const void *)(uintptr_t)outputDataAddr, inDataSize);
+    if (SCB->CCR & SCB_CCR_DC_Msk) {
+        if (chachaCtx->inputDataAddrType == DLLI_ADDR) {
+            SCB_CleanInvalidateDCache_by_Addr((void *)(uintptr_t)inputDataAddr, (int32_t)inDataSize);
+        }
+        if (chachaCtx->outputDataAddrType == DLLI_ADDR) {
+            SCB_CleanInvalidateDCache_by_Addr((void *)(uintptr_t)outputDataAddr, (int32_t)inDataSize);
+        }
     }
 
     /* configure source address and size */
@@ -309,18 +338,19 @@ drvError_t ProcessChacha(ChachaContext_t *chachaCtx, CCBuffInfo_t *pInputBuffInf
     }
 
     /*
-     * Apollo510 DCACHE coherency (concern #2: invalidate output after DMA).
-     *
-     * Flush the engine's last DLLI write to memory with a dummy DLLI read, then
-     * invalidate the output region so the CPU re-reads the engine's result
-     * instead of a stale cached copy. Mirrors am_hal_cc312_aes_process().
+     * DCACHE invalidate after the DMA (concern #2). Drain the
+     * engine's last write to memory with a dummy DMA read, then
+     * invalidate the output region so the CPU re-reads the engine's
+     * result instead of a stale cached copy.
      */
     if (chachaCtx->outputDataAddrType == DLLI_ADDR) {
-        if (am_hal_cc312_flush_dummy_dlli(outputDataAddr, inDataSize) != 0U) {
-            drvRc = CHACHA_DRV_ILLEGAL_OUTPUT_ADDR_MEM_ERROR;
-            goto ProcessExit;
+        drvRc = ChachaDmaReadFlush(outputDataAddr);
+        if (drvRc != CHACHA_DRV_OK) {
+                goto ProcessExit;
         }
-        am_hal_cc312_cache_invalidate_region((const void *)(uintptr_t)outputDataAddr, inDataSize);
+        if (SCB->CCR & SCB_CCR_DC_Msk) {
+            SCB_InvalidateDCache_by_Addr((void *)(uintptr_t)outputDataAddr, (int32_t)inDataSize);
+        }
     }
 
     ProcessExit:
