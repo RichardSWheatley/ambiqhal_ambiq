@@ -1,7 +1,8 @@
 sample:
-  description: Canonical Weaver benchmark workload (RFC §7.1) for Apollo510B
-    LP at 96 MHz. Builds with one of stock / scalar / hybrid / full-MVE batch
-    variants (extra_args).
+  description: Canonical Weaver benchmark workload (RFC §7.1) at Apollo510
+    LP 96 MHz. Builds with one of stock / scalar / hybrid / full-MVE batch
+    variants (extra_args). Uses synthetic FIFOs (no external Click boards);
+    builds for both apollo510_evb and apollo510b_evb.
   name: Weaver Benchmark
 common:
   tags:
@@ -15,21 +16,41 @@ common:
       - "BENCHMARK COMPLETE"
 tests:
   sample.kernel.weaver_benchmark.scalar:
-    platform_allow: apollo510b_evb
-    integration_platforms: [apollo510b_evb]
+    platform_allow:
+      - apollo510_evb
+      - apollo510b_evb
+    integration_platforms:
+      - apollo510_evb
+      - apollo510b_evb
   sample.kernel.weaver_benchmark.hybrid:
-    platform_allow: apollo510b_evb
-    integration_platforms: [apollo510b_evb]
+    platform_allow:
+      - apollo510_evb
+      - apollo510b_evb
+    integration_platforms:
+      - apollo510_evb
+      - apollo510b_evb
     extra_args: EXTRA_CONF_FILE=hybrid.conf
   sample.kernel.weaver_benchmark.mve:
-    platform_allow: apollo510b_evb
-    integration_platforms: [apollo510b_evb]
+    platform_allow:
+      - apollo510_evb
+      - apollo510b_evb
+    integration_platforms:
+      - apollo510_evb
+      - apollo510b_evb
     extra_args: EXTRA_CONF_FILE=mve.conf
   sample.kernel.weaver_benchmark.stock:
-    platform_allow: apollo510b_evb
-    integration_platforms: [apollo510b_evb]
+    platform_allow:
+      - apollo510_evb
+      - apollo510b_evb
+    integration_platforms:
+      - apollo510_evb
+      - apollo510b_evb
     extra_args: EXTRA_CONF_FILE=stock.conf
   sample.kernel.weaver_benchmark.fp:
-    platform_allow: apollo510b_evb
-    integration_platforms: [apollo510b_evb]
+    platform_allow:
+      - apollo510_evb
+      - apollo510b_evb
+    integration_platforms:
+      - apollo510_evb
+      - apollo510b_evb
     extra_args: EXTRA_CONF_FILE=fp.conf
