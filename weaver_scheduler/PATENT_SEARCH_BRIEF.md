@@ -89,10 +89,30 @@ Selectable at build time, **proven to produce bit-identical results**,
 allowing on-target measurement of the lazy floating-point context-
 save tax independently from vectorization gain.
 
-### Element E — NPU coprocessor "Loom" arbitration with energy budget
+### Element E — Asymmetric Cognitive Offload to on-die NPU
 
 Phase 3 design (header only — `weaver_sched_npu.h` —
-implementation deferred):
+implementation deferred). This element is the strongest candidate
+for a Continuation-in-Part or a new patent application separate
+from Elements A–D.
+
+**Independent-claim language (draft, for the attorney):**
+
+> 1. An asymmetric operating system architecture wherein a primary
+>    general-purpose processing unit offloads thread-telemetry
+>    metadata to an independent neural coprocessor, which
+>    asynchronously infers updated policy weights and writes them
+>    back into a running kernel-level task-priority calculation
+>    without blocking the primary processor's dispatch decision.
+>
+> 2. The dynamic modification of kernel-level task prioritization
+>    vectors executed asynchronously within a dedicated hardware
+>    accelerator to preemptively mitigate resource starvation, in
+>    which the accelerator's inference is consumed by the primary
+>    processor's scheduler at a cadence decoupled from the
+>    scheduler's dispatch tick.
+
+**Sub-elements to protect (dependent claims):**
 
 1. A new thread class ("Loom") representing one neural network
    graph offloaded to an asynchronous fixed-function NPU
@@ -110,6 +130,37 @@ implementation deferred):
 5. **Three-axis throttle vector** (CPU / NPU dispatch / DMA-IO)
    each with its own TSK fuzzy + EMA, decoupling backpressure
    signals across resource types.
+6. **Three NPU-hosted policy roles** running asynchronously and
+   asymmetrically to the CPU dispatcher:
+   (a) *Policy Adjustor* — periodic inference (1–10 Hz) reshapes
+       the Q16.16 weights used by the CPU-side pressure formula;
+   (b) *Arbiter Feeder* — CPU-side ordering of NPU inference jobs
+       queued into the accelerator;
+   (c) *Anomaly Detector* — predictive inference (10–50 Hz)
+       forecasting starvation events before the reactive CPU-side
+       throttle would trip.
+7. **Kernel-space exclusive NPU ownership** — the NPU (or one of
+   its spatial partitions) is claimed by a kernel-space driver
+   with no user-space pathway, ensuring the scheduler's policy
+   updates land deterministically and cannot be preempted by
+   user-space AI workloads.
+8. **Shared no-cache SRAM telemetry ring** with a fixed frame
+   format (dispatcher cycles, context-switch delta, cache-miss
+   surrogate from DWT LSU counter, IOM stall bits, Weft
+   promotions, throttle level, Loom dispatch count) written by
+   the CPU at the end of every dispatch tick and consumed by the
+   NPU asynchronously in batches at each inference cycle.
+
+**Why this element is worth its own CIP:**
+
+- Elements A–D are complete and defensible on their own without
+  an NPU. They ship today; they file today.
+- Element E is a durable competitive moat that anchors the IP in
+  hardware-software co-design. It distinguishes this work from
+  user-space "AI-native scheduler" wrappers by placing the
+  learnable policy loop physically inside the kernel/NPU boundary.
+- CIP retains the A–D priority date; if E is later disclosed by
+  someone else, A–D still stand.
 
 ### Element F — Whole-system gestalt
 

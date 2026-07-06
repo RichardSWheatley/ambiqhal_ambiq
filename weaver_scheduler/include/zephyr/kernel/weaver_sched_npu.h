@@ -6,7 +6,8 @@
 
 /**
  * @file
- * @brief Weaver Loom: NPU coprocessor scheduling layer (DRAFT, Phase 3)
+ * @brief Weaver Asymmetric Cognitive Offload: NPU coprocessor scheduling
+ *        layer (DRAFT, Phase 3)
  *
  * STATUS: Design sketch. **No implementation exists yet.** This header
  * is shipped now so reviewers can see how the Weaver architecture
@@ -20,14 +21,78 @@
  * breaking.
  *
  * ============================================================
- * WHY THIS LAYER EXISTS
+ * ARCHITECTURAL FRAMING: ASYMMETRIC COGNITIVE OFFLOAD
  * ============================================================
  *
- * An NPU is an asynchronous fixed-function coprocessor, not a thread.
- * Once dispatched, an inference runs uninterrupted for typically 5-50
- * milliseconds and signals completion via IRQ. This is neither hard
- * real-time (Warp) nor opportunistic-and-preemptible (Weft). It needs
- * its own class.
+ * The primary CPU is a real-time execution engine. It should not spend
+ * cycles computing heuristics that another silicon block can compute
+ * asynchronously and better. This layer offloads three distinct
+ * classes of policy work to the NPU, keeping the CPU's dispatch hot
+ * path deterministic and integer-only:
+ *
+ *   1. POLICY ADJUSTOR   - reshapes Weft scheduling weights based on
+ *                          observed workload patterns. Runs at 1-10 Hz
+ *                          on the NPU; writes to weaver_set_weights()
+ *                          on completion. The CPU dispatcher keeps
+ *                          consuming the same Q16.16 pressure formula
+ *                          - only the weights inside it change.
+ *
+ *   2. ARBITER FEEDER    - orders NPU inference jobs (Looms) queued by
+ *                          the CPU. This is the classical scheduling
+ *                          role the NPU could plausibly host: when the
+ *                          NPU is idle, pick the highest-pressure Loom.
+ *                          Runs on the CPU integer path (~50 cycles);
+ *                          NPU is the target of the dispatch, not the
+ *                          decision-maker.
+ *
+ *   3. ANOMALY DETECTOR  - watches kernel telemetry (cache miss rate
+ *                          proxy, context-switch delay, IOM stall
+ *                          bits) via a shared no-cache SRAM ring and
+ *                          predicts starvation events 10-100 ms ahead.
+ *                          Emits a graded warning that producers
+ *                          consume before pressure would spike.
+ *
+ * All three run on the NPU asynchronously. The CPU-side dispatcher
+ * (Phase 1-2 code) is unchanged: still Q16.16 fixed-point, still
+ * integer-only, still deterministic sub-microsecond decision. What
+ * changes is the QUALITY of the inputs to that dispatcher: better
+ * weights, better arbitration, earlier warning.
+ *
+ * ============================================================
+ * WHAT STAYS ON THE CPU (deliberate boundary)
+ * ============================================================
+ *
+ * The per-tick dispatch decision itself STAYS ON THE CPU integer ALU.
+ * NPU inference latency is 5-50 ms; a 1 ms scheduler tick cannot wait.
+ * The rule: NPU handles POLICY (slow, learnable), CPU handles DISPATCH
+ * (fast, deterministic).
+ *
+ * This split is what makes the layer asymmetric: two different silicon
+ * blocks handling two different classes of decision, coupled through
+ * a shared-memory mailbox rather than through a synchronous call path.
+ *
+ * ============================================================
+ * WHY NOT USE THE USER-SPACE NPU DRIVER
+ * ============================================================
+ *
+ * Vendor NPU stacks (Arm Ethos-U, AMD XDNA, Intel NPU) are designed
+ * to expose the accelerator UPWARD to user-space AI runtimes (TFLite,
+ * ONNX Runtime, DirectML). That path is unsuitable here for three
+ * reasons:
+ *
+ *   - Kernel-latency budget: user-space round-trip adds tens of
+ *     microseconds; policy updates need to complete before the next
+ *     dispatch tick observes them.
+ *   - Priority inversion risk: a user-space policy engine gets
+ *     preempted by other user work; the NPU sits idle.
+ *   - Ownership: a shared NPU means the scheduler competes with user
+ *     apps for inference slots.
+ *
+ * The Weaver Loom driver claims **exclusive kernel-space ownership**
+ * of a partition (or full instance) of the NPU. This is what the
+ * asymmetric offload architecture requires and it is the concrete
+ * hardware-software co-design claim distinguishing this work from
+ * higher-level "AI-native scheduling" software wrappers.
  *
  * The Loom class represents one NPU graph (e.g. KWS, activity
  * classifier, AFib detector). A wearable typically has 3-6 Looms
@@ -257,6 +322,110 @@ struct weaver_loom_driver_ops {
 
 /** @brief Register the platform NPU driver. Must be called once at boot. */
 int weaver_loom_set_driver_ops(const struct weaver_loom_driver_ops *ops);
+
+/* =================================================================
+ * ROLE 1: POLICY ADJUSTOR
+ *
+ * The NPU periodically consumes telemetry, runs a quantized policy
+ * model (linear bandit / lightweight RL), and emits new weights for
+ * the CPU dispatcher's Q16.16 pressure formula. The CPU keeps using
+ * the same formula; only the weights inside it change.
+ *
+ * Runs at 1-10 Hz. Latency of the update is ~milliseconds; the CPU
+ * dispatcher is never blocked waiting for it.
+ * ================================================================= */
+
+/**
+ * @brief Signature for a policy-adjustor callback the NPU invokes
+ *        after each inference cycle completes.
+ *
+ * The NPU driver calls this from ISR context with the three new
+ * Q16.16 weights it just inferred. The implementation typically
+ * forwards to weaver_set_weights().
+ */
+typedef void (*weaver_policy_apply_fn)(uint32_t w_urgency_q16,
+				       uint32_t w_density_q16,
+				       uint32_t w_aging_q16);
+
+/**
+ * @brief Register the policy graph and its apply callback.
+ *
+ * @param graph      Opaque NPU graph handle for the policy model.
+ * @param period_ms  Target inference cadence (typical: 100-1000 ms).
+ * @param apply      Called from NPU IRQ context with new weights.
+ */
+int weaver_policy_register(void *graph, uint32_t period_ms,
+			   weaver_policy_apply_fn apply);
+
+/* =================================================================
+ * ROLE 2: TELEMETRY CAPTURE
+ *
+ * Kernel-side telemetry the NPU consumes via a shared no-cache
+ * SRAM ring. Populated by the dispatcher and low-level kernel hooks;
+ * never read by CPU code, only written and then produced to NPU.
+ *
+ * The metrics are chosen so that measuring them is nearly free on
+ * Cortex-M55: DWT gives cycle count and cache miss surrogate; the
+ * scheduler already tracks context-switch delta; IOM stall bits are
+ * peripheral MMIO reads.
+ * ================================================================= */
+
+struct weaver_telemetry_frame {
+	uint64_t timestamp_cycles;
+	uint32_t dispatcher_cycles;      /**< From weaver_get_last_tick_cycles() */
+	uint32_t context_switch_delta;   /**< Kernel-tracked */
+	uint32_t cache_miss_surrogate;   /**< From DWT LSU miss counter */
+	uint32_t iom_stall_bits;         /**< MMIO snapshot */
+	uint32_t weft_promotions;
+	uint32_t throttle_level;
+	uint32_t loom_dispatched_this_epoch;
+	uint32_t reserved[8];
+};
+
+/**
+ * @brief Bind a shared-memory ring the NPU reads asynchronously.
+ *
+ * @param ring         Caller-provided ring memory (SRAM_NO_CACHE region).
+ * @param n_frames     Ring depth. Typical: 32 frames.
+ *
+ * The CPU dispatcher writes into this ring at the end of every
+ * weaver_tick(); the NPU reads a batch (~10-100 frames) per
+ * inference cycle.
+ */
+int weaver_telemetry_bind_ring(struct weaver_telemetry_frame *ring,
+			       size_t n_frames);
+
+/* =================================================================
+ * ROLE 3: ANOMALY DETECTOR
+ *
+ * The NPU inferences over recent telemetry frames and predicts
+ * upcoming starvation (thread that will miss its next window) or
+ * imminent NPU energy-budget exhaustion. The prediction is
+ * consumed by producers as an early warning, letting them
+ * downgrade or defer BEFORE the throttle threshold trips.
+ * ================================================================= */
+
+/**
+ * @brief Graded starvation-warning level (0..255) from the NPU
+ *        anomaly detector.
+ *
+ * 0 = no predicted starvation in the next window.
+ * 128 = starvation likely within the next ~50 ms.
+ * 255 = starvation predicted imminently (< 10 ms).
+ *
+ * Producers should consume this ALONGSIDE the existing CPU-side
+ * fuzzy throttle (weaver_throttle_level). The two are complementary:
+ * the CPU throttle is reactive; this one is predictive.
+ */
+uint8_t weaver_anomaly_level(void);
+
+/**
+ * @brief Register the anomaly-detector graph.
+ *
+ * @param graph      Opaque NPU graph handle.
+ * @param period_ms  Inference cadence (typical: 20-100 ms).
+ */
+int weaver_anomaly_register(void *graph, uint32_t period_ms);
 
 #ifdef __cplusplus
 }
