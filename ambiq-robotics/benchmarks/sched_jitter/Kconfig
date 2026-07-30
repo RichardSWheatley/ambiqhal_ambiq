@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: Apache-2.0
+mainmenu "ARB benchmark: scheduling jitter"
+
+config BENCH_SAMPLES
+	int "Number of periods to measure"
+	default 100000
+
+config BENCH_RATE_HZ
+	int "Periodic thread rate (Hz)"
+	default 1000
+	help
+	  Nominal wakeup rate. The actual period is quantized to kernel
+	  ticks (MAX(1, ticks_per_sec / rate)); the achieved period in ns
+	  is reported in the output so non-divisible tick rates stay honest.
+
+config BENCH_LOAD
+	bool "Run with background load (zbus traffic + logging)"
+	depends on ZBUS && LOG
+
+source "Kconfig.zephyr"

@@ -1,0 +1,17 @@
+/*
+ * TIMER0 counter (HFRC/64 = 1.5 MHz, 667 ns per tick) as the alarm source.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ * Copyright (c) 2026 Ambiq Micro Inc. <www.ambiq.com>
+ */
+/ {
+	aliases {
+		bench-counter = &counter0;
+	};
+};
+
+&timer0 {
+	counter0: counter {
+		status = "okay";
+	};
+};
