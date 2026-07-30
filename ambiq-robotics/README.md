@@ -4,7 +4,7 @@ Robotics building blocks for Zephyr, built on **zbus**. ARB does not ship its
 own pub/sub: every topic is a statically-defined zbus channel. What ARB adds is
 the part Zephyr doesn't have:
 
-1. **Message vocabulary** (`arb/msg.h`) — flat, packed robotics message structs
+1. **Message vocabulary** (`arb/msg.h`) — flat POD robotics message structs
    with type ids (twist, odom, imu, encoder, heartbeat, e-stop, …), the
    MCU-sized analog of ROS 2 `.msg` files.
 2. **Node lifecycle + e-stop** (`arb/node.h`) — JAUS / ROS 2 managed-node style
@@ -52,13 +52,16 @@ zbus_chan_pub(&arb_chan_cmd_vel, &t, K_MSEC(5));
 
 ## Sample
 
+[`samples/diff_drive/`](samples/diff_drive/README.md) — closed-loop
+differential-drive base on the Apollo510 EVB: PID per wheel from quadrature
+encoders, ICM-42688 IMU at 200 Hz, odometry at 50 Hz, everything on zbus,
+telemetry and `cmd_vel` bridged over UART1. The sample README covers the
+hardware to wire, host software, frame layouts, and what to expect on the
+link.
+
 ```
 west build -b apollo510_evb ambiq-robotics/samples/diff_drive
 ```
-
-Closed-loop differential drive: PID per wheel from quadrature encoders,
-ICM-42688 IMU at 200 Hz, odometry at 50 Hz, everything on zbus, telemetry and
-`cmd_vel` bridged over UART1.
 
 ## Tests
 
