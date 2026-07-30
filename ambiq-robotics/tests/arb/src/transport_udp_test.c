@@ -16,11 +16,23 @@
 #include "arb/time.h"
 #include "arb/transport.h"
 
+/* counts pose2d publications: local publish + loopback republication */
+static volatile uint32_t pose_pubs;
+
+static void pose_count_cb(const struct zbus_channel *chan)
+{
+	ARG_UNUSED(chan);
+	pose_pubs++;
+}
+ZBUS_LISTENER_DEFINE(pose_count_listener, pose_count_cb);
+ZBUS_CHAN_ADD_OBS(arb_chan_pose2d, pose_count_listener, 4);
+
 ZTEST(arb_transport_udp, test_udp_loopback)
 {
-	uint32_t frames = 0, crc = 0;
+	uint32_t crc = 0, frames = 0;
 
 	zassert_ok(arb_transport_export(&arb_chan_pose2d));
+	pose_pubs = 0;
 
 	arb_pose2d_t p = { 0 };
 
@@ -30,21 +42,24 @@ ZTEST(arb_transport_udp, test_udp_loopback)
 	p.pose.theta = 0.5f;
 	zassert_ok(zbus_chan_pub(&arb_chan_pose2d, &p, K_MSEC(10)));
 
-	/* wait for the datagram to loop back through the host stack */
-	for (int i = 0; i < 100; i++) {
-		arb_transport_stats(&frames, &crc);
-		if (frames >= 1) {
-			break;
-		}
+	/*
+	 * Expect exactly 2 publications: ours, plus the republication of
+	 * the frame after it loops back through the host stack. (Transport
+	 * stats can't be used here - timesync traffic also counts frames.)
+	 */
+	for (int i = 0; i < 100 && pose_pubs < 2; i++) {
 		k_sleep(K_MSEC(20));
 	}
-	zassert_equal(frames, 1, "expected 1 looped frame, got %u", frames);
-	zassert_equal(crc, 0, "crc errors on loopback");
+	zassert_equal(pose_pubs, 2, "expected 2 pose2d pubs, got %u",
+		      pose_pubs);
 
 	/* the republication must not have been re-exported (echo loop) */
-	k_sleep(K_MSEC(300));
+	k_sleep(K_MSEC(500));
+	zassert_equal(pose_pubs, 2, "echo loop: pub count grew to %u",
+		      pose_pubs);
+
 	arb_transport_stats(&frames, &crc);
-	zassert_equal(frames, 1, "echo loop: frame count grew to %u", frames);
+	zassert_equal(crc, 0, "crc errors on loopback");
 
 	/* the loopback republished our message onto the channel */
 	arb_pose2d_t r;
@@ -55,5 +70,33 @@ ZTEST(arb_transport_udp, test_udp_loopback)
 
 	zassert_ok(arb_transport_unexport(&arb_chan_pose2d));
 }
+
+#ifdef CONFIG_ARB_TIME_LINK
+/*
+ * Self-sync: the client's REQ loops back, this board answers as server,
+ * the RESP loops back again and feeds the filter. Both ends are the same
+ * clock, so the disciplined offset must converge to ~0 and the LINK time
+ * source must report synced.
+ */
+ZTEST(arb_transport_udp, test_udp_self_timesync)
+{
+	bool synced = false;
+
+	for (int i = 0; i < 100; i++) {
+		if (arb_time_synced()) {
+			synced = true;
+			break;
+		}
+		k_sleep(K_MSEC(100));
+	}
+	zassert_true(synced, "timesync never reached synced state");
+
+	int64_t skew = (int64_t)arb_time_now_us() -
+		       (int64_t)k_ticks_to_us_floor64(k_uptime_ticks());
+
+	zassert_true(skew > -1000 && skew < 1000,
+		     "self-sync offset %lld us, expected ~0", (long long)skew);
+}
+#endif /* CONFIG_ARB_TIME_LINK */
 
 ZTEST_SUITE(arb_transport_udp, NULL, NULL, NULL, NULL, NULL);

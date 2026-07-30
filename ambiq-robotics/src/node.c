@@ -181,6 +181,13 @@ static void hb_tick(struct k_work *work)
 				arb_time_now_us(), hb_seq++);
 		hb.node      = n->id;
 		hb.state     = (uint8_t)n->state;
+		hb.flags     = (arb_time_synced() ? ARB_HB_FLAG_TIME_SYNCED
+						  : 0) |
+			       (IS_ENABLED(CONFIG_ARB_TIME_LINK)
+					? ARB_HB_TIME_SOURCE_LINK
+					: IS_ENABLED(CONFIG_ARB_TIME_PTP)
+					? ARB_HB_TIME_SOURCE_PTP
+					: ARB_HB_TIME_SOURCE_UPTIME);
 		hb.uptime_ms = (uint32_t)(now - n->start_ms);
 
 		(void)zbus_chan_pub(&arb_chan_heartbeat, &hb, K_NO_WAIT);

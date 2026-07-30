@@ -3,5 +3,5 @@ cmake_minimum_required(VERSION 3.20.0)
 find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
 project(arb_tests)
 
-target_sources(app PRIVATE src/main.c)
+target_sources(app PRIVATE src/main.c src/timesync_test.c)
 target_sources_ifdef(CONFIG_ARB_TRANSPORT_UDP app PRIVATE src/transport_udp_test.c)
