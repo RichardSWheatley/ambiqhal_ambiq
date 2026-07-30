@@ -9,10 +9,10 @@
  *   IMU (ICM-42688-P): SCL P5 (M0SCL), SDA P6 (M0SDAWIR3) - IOM0 I2C
  *   ARB link: UART1 TX P41, RX P43, 921600 8N1
  *
- * The pwms phandles below must match the TIMER PWM node labels in your
- * SoC/board devicetree; the pinctrl groups route the CTn outputs. Any
- * free UARTnTX/UARTnRX pin pair from the pinmux header works for the
- * link if these pins are taken on your EVB revision.
+ * PWM outputs use TIMER3/TIMER4 (TIMER2's pwm is claimed by the board dts
+ * as pwm2, TIMER0's counter is used by the ARB benchmarks). The CT12/CT18
+ * pad-to-timer-output routing follows the same mechanism the board uses
+ * for pwm2/CT165 but has not been validated on hardware yet.
  *
  * SPDX-License-Identifier: Apache-2.0
  * Copyright (c) 2026 Ambiq Micro Inc. <www.ambiq.com>
@@ -27,8 +27,8 @@
 
 	zephyr,user {
 		/* index 0 = left, 1 = right */
-		pwms = <&pwm0 0 PWM_HZ(20000) PWM_POLARITY_NORMAL>,
-		       <&pwm1 0 PWM_HZ(20000) PWM_POLARITY_NORMAL>;
+		pwms = <&pwm3 0 PWM_HZ(20000) PWM_POLARITY_NORMAL>,
+		       <&pwm4 0 PWM_HZ(20000) PWM_POLARITY_NORMAL>;
 		dir-gpios = <&gpio0 13 GPIO_ACTIVE_HIGH>,
 			    <&gpio0 19 GPIO_ACTIVE_HIGH>;
 		/* left A, left B, right A, right B */
@@ -53,6 +53,22 @@
 	pinctrl-names = "default";
 };
 
+&timer3 {
+	pwm3: pwm {
+		status = "okay";
+		pinctrl-0 = <&pwm3_default>;
+		pinctrl-names = "default";
+	};
+};
+
+&timer4 {
+	pwm4: pwm {
+		status = "okay";
+		pinctrl-0 = <&pwm4_default>;
+		pinctrl-names = "default";
+	};
+};
+
 &pinctrl {
 	i2c0_default: i2c0_default {
 		group1 {
@@ -72,13 +88,13 @@
 		};
 	};
 
-	pwm0_default: pwm0_default {
+	pwm3_default: pwm3_default {
 		group1 {
 			pinmux = <CT12_P12>;
 		};
 	};
 
-	pwm1_default: pwm1_default {
+	pwm4_default: pwm4_default {
 		group1 {
 			pinmux = <CT18_P18>;
 		};
