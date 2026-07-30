@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: Apache-2.0
+mainmenu "ARB benchmark: end-to-end cmd_vel latency"
+
+config BENCH_SAMPLES
+	int "Number of samples"
+	default 100000
+
+config BENCH_LOAD
+	bool "Run with background load (zbus traffic + logging)"
+	depends on ZBUS && LOG
+
+config ARB_BENCH_E2E_ECHO
+	bool "Host echo RTT mode (instead of the on-board path)"
+	depends on SERIAL && UART_INTERRUPT_DRIVEN
+	help
+	  Send framed cmd_vel over the chosen arb,uart and measure the
+	  round trip against benchmarks/scripts/e2e_echo.py running on the
+	  host. Needs the hardware link; CI skips it via a twister fixture.
+
+source "Kconfig.zephyr"

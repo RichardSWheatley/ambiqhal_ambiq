@@ -1,0 +1,49 @@
+common:
+  tags:
+    - arb
+    - benchmark
+  harness: console
+  timeout: 300
+  harness_config:
+    type: one_line
+    regex:
+      - "BENCH DONE"
+    record:
+      regex:
+        - "RECORD:(?P<metrics>.*)"
+      as_json: ["metrics"]
+tests:
+  arb.bench.e2e_cmd_vel:
+    platform_allow:
+      - apollo510_evb
+      - native_sim
+      - native_sim/native/64
+    integration_platforms:
+      - native_sim
+  arb.bench.e2e_cmd_vel.loaded:
+    extra_configs:
+      - CONFIG_ZBUS=y
+      - CONFIG_LOG=y
+      - CONFIG_BENCH_LOAD=y
+    platform_allow:
+      - apollo510_evb
+      - native_sim
+      - native_sim/native/64
+    integration_platforms:
+      - native_sim
+  arb.bench.e2e_cmd_vel.echo:
+    extra_configs:
+      - CONFIG_SERIAL=y
+      - CONFIG_UART_INTERRUPT_DRIVEN=y
+      - CONFIG_ARB_BENCH_E2E_ECHO=y
+    platform_allow:
+      - apollo510_evb
+    harness_config:
+      fixture: fixture_arb_echo
+      type: one_line
+      regex:
+        - "BENCH DONE"
+      record:
+        regex:
+          - "RECORD:(?P<metrics>.*)"
+        as_json: ["metrics"]
