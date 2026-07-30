@@ -4,3 +4,4 @@ find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
 project(arb_tests)
 
 target_sources(app PRIVATE src/main.c)
+target_sources_ifdef(CONFIG_ARB_TRANSPORT_UDP app PRIVATE src/transport_udp_test.c)

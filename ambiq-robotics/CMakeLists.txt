@@ -16,6 +16,8 @@ zephyr_library_sources(
   src/control/pid.c
   src/control/diff_drive.c
 )
-zephyr_library_sources_ifdef(CONFIG_ARB_TRANSPORT src/transport.c)
+zephyr_library_sources_ifdef(CONFIG_ARB_TRANSPORT src/transport_core.c)
+zephyr_library_sources_ifdef(CONFIG_ARB_TRANSPORT_SERIAL src/transport_serial.c)
+zephyr_library_sources_ifdef(CONFIG_ARB_TRANSPORT_UDP src/transport_udp.c)
 
 endif()
