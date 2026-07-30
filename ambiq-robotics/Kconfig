@@ -40,6 +40,15 @@ config ARB_TIME_UPTIME
 	help
 	  Monotonic local time; meaningless across the link.
 
+config ARB_TIME_LINK
+	bool "Link time (uptime disciplined by serial timesync)"
+	depends on ARB_TRANSPORT
+	select ARB_TIMESYNC
+	help
+	  Local uptime plus a slewed offset learned from the NTP-style
+	  timesync exchange with the transport peer. Stamps become
+	  meaningful across the link; strictly monotonic once synced.
+
 config ARB_TIME_PTP
 	bool "PTP clock device"
 	depends on PTP_CLOCK
@@ -97,6 +106,44 @@ config ARB_TRANSPORT_UDP_PEER_PORT
 	int "UDP peer port"
 	depends on ARB_TRANSPORT_UDP
 	default 17447
+
+config ARB_TIMESYNC
+	bool "Timesync exchange (NTP-style, over the transport)"
+	help
+	  Answer ARB_TOPIC_TIMESYNC requests from the peer (server role,
+	  always on when enabled) and optionally send periodic requests to
+	  discipline a link-time offset (client role). Additive wire
+	  message; the frozen 16-byte header is untouched.
+
+if ARB_TIMESYNC
+
+config ARB_TIMESYNC_CLIENT
+	bool "Act as timesync client"
+	default y if ARB_TIME_LINK
+	help
+	  Periodically exchange timestamps with the peer and discipline the
+	  offset the ARB_TIME_LINK source applies to stamps. The peer is
+	  the time authority.
+
+config ARB_TIMESYNC_INTERVAL_MS
+	int "Exchange interval (ms)"
+	depends on ARB_TIMESYNC_CLIENT
+	default 1000
+
+config ARB_TIMESYNC_WINDOW
+	int "Median filter window (samples)"
+	range 3 15
+	default 8
+
+config ARB_TIMESYNC_MAX_SLEW_PPM
+	int "Maximum offset slew rate (ppm)"
+	default 1000
+	help
+	  Bound on how fast the applied offset moves toward the filtered
+	  target. Keeping it far below 1000000 ppm guarantees link time
+	  never runs backward.
+
+endif # ARB_TIMESYNC
 
 endif # ARB_TRANSPORT
 

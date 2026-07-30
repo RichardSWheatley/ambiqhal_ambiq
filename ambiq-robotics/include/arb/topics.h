@@ -42,6 +42,12 @@ enum arb_topic_id {
 	ARB_TOPIC_LOG       = 9,  /**< arb_log_t         */
 	ARB_TOPIC_HEARTBEAT = 10, /**< arb_heartbeat_t   */
 	ARB_TOPIC_ESTOP     = 11, /**< arb_estop_t       */
+	/**
+	 * arb_timesync_t. Transport-reserved: has no zbus channel - the
+	 * transport core consumes these frames directly (arb/timesync.h), so
+	 * sync traffic never round-trips through the channel layer.
+	 */
+	ARB_TOPIC_TIMESYNC  = 12,
 
 	ARB_TOPIC_USER_BASE = 0x1000,
 };

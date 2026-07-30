@@ -205,6 +205,8 @@ BUILD_ASSERT(offsetof(arb_header_t, seq) == 8);
 BUILD_ASSERT(offsetof(arb_header_t, type) == 12);
 BUILD_ASSERT(offsetof(arb_header_t, source) == 14);
 BUILD_ASSERT(sizeof(arb_heartbeat_t) == 24);
+BUILD_ASSERT(offsetof(arb_heartbeat_t, flags) == 19); /* the old pad byte */
+BUILD_ASSERT(sizeof(arb_timesync_t) == 48);
 BUILD_ASSERT(sizeof(arb_twist_t) <= ARB_MSG_MAX_SIZE);
 BUILD_ASSERT(sizeof(arb_odom_t) <= ARB_MSG_MAX_SIZE);
 BUILD_ASSERT(sizeof(arb_imu_t) <= ARB_MSG_MAX_SIZE);

@@ -39,6 +39,7 @@ typedef enum {
 	ARB_MSG_LOG        = 9,  /**< @ref arb_log_t     - text log line               */
 	ARB_MSG_HEARTBEAT  = 10, /**< @ref arb_heartbeat_t - node liveness             */
 	ARB_MSG_ESTOP      = 11, /**< @ref arb_estop_t   - emergency stop              */
+	ARB_MSG_TIMESYNC   = 12, /**< @ref arb_timesync_t - link time sync exchange    */
 
 	ARB_MSG_USER_BASE  = 0x1000,
 } arb_msg_type_t;
@@ -145,11 +146,27 @@ typedef struct {
 	char         text[40];
 } arb_log_t;
 
-/** @brief Node liveness beacon, published on @c arb_chan_heartbeat. */
+/** @name Heartbeat flags / time source advertisement
+ * @{
+ */
+#define ARB_HB_FLAG_TIME_SYNCED   0x01u /**< arb_time_synced() was true      */
+#define ARB_HB_TIME_SOURCE_MASK   0x06u /**< bits 1-2: time source           */
+#define ARB_HB_TIME_SOURCE_UPTIME (0u << 1)
+#define ARB_HB_TIME_SOURCE_LINK   (1u << 1)
+#define ARB_HB_TIME_SOURCE_PTP    (2u << 1)
+/** @} */
+
+/**
+ * @brief Node liveness beacon, published on @c arb_chan_heartbeat.
+ *
+ * @c flags occupies what used to be a padding byte, so the wire layout is
+ * unchanged; peers that predate it always see 0 there.
+ */
 typedef struct {
 	arb_header_t header;
 	uint16_t     node;      /**< node id                          */
 	uint8_t      state;     /**< @ref arb_node_state_t (node.h)   */
+	uint8_t      flags;     /**< ARB_HB_FLAG_* | time source bits */
 	uint32_t     uptime_ms; /**< node uptime                      */
 } arb_heartbeat_t;
 
@@ -159,6 +176,29 @@ typedef struct {
 	uint16_t     source; /**< node id that raised the stop (0 = external) */
 	uint8_t      reason; /**< application-defined                          */
 } arb_estop_t;
+
+/** @name Timesync exchange phases (@ref arb_timesync_t) @{ */
+#define ARB_TIMESYNC_REQ  0u
+#define ARB_TIMESYNC_RESP 1u
+/** @} */
+
+/**
+ * @brief NTP-style four-timestamp exchange (wire id ARB_TOPIC_TIMESYNC).
+ *
+ * Client sends REQ with t1 (client clock, captured immediately before
+ * transmission); server replies RESP echoing t1, with t2 = its receive
+ * stamp and t3 captured immediately before the reply is transmitted (both
+ * server clock). The client's receive stamp is t4. Offset to the server's
+ * clock: ((t2-t1)+(t3-t4))/2. REQ and RESP frames are the same length, so
+ * the serialization delay is symmetric and cancels in that math.
+ */
+typedef struct {
+	arb_header_t header;
+	uint64_t     t1_us; /**< client TX time (client clock)      */
+	uint64_t     t2_us; /**< server RX time (server clock)      */
+	uint64_t     t3_us; /**< server TX time (server clock)      */
+	uint8_t      phase; /**< ARB_TIMESYNC_REQ / ARB_TIMESYNC_RESP */
+} arb_timesync_t;
 
 /**
  * @brief Largest payload the transport must be able to frame.
