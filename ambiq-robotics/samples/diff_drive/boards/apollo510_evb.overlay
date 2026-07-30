@@ -36,6 +36,8 @@
 			    <&gpio0 25 GPIO_ACTIVE_HIGH>,
 			    <&gpio0 26 GPIO_ACTIVE_HIGH>,
 			    <&gpio0 27 GPIO_ACTIVE_HIGH>;
+		/* ICM-42688 INT1 -> P28 (verify wiring on the EVB rig) */
+		imu-int-gpios = <&gpio0 28 GPIO_ACTIVE_HIGH>;
 	};
 };
 

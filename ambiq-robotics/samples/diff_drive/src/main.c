@@ -8,9 +8,14 @@
  * Dataflow:
  *   cmd_vel (zbus, local or via transport) -> PID per wheel -> PWM
  *   encoders (GPIO IRQ quadrature)  -> arb_chan_encoder @ 50 Hz
- *   ICM-42688 (I2C)                 -> arb_chan_imu     @ 200 Hz
+ *   ICM-42688 (I2C, INT1 data-ready) -> arb_chan_imu    @ 200 Hz
  *   wheel odometry                  -> arb_chan_odom    @ 50 Hz
  *   arb_chan_estop                  -> motors brake
+ *
+ * Timestamps (CONFIG_ARB_STAMP_AT_ISR, default y): every stamp is
+ * acquisition time captured in the interrupt - the IMU DRDY edge and the
+ * encoder edges - not the later processing/publish time. The control loop
+ * runs on absolute deadlines (no period drift) with measured dt.
  *
  * Hardware (see boards/apollo510_evb.overlay):
  *   motors:   PWM P12/P18 (CT12/CT18), DIR P13/P19 -> DRV8833/TB6612
@@ -72,6 +77,10 @@ static const struct device *const i2c_dev =
 #define ENC_CPR         360u          /* lines; x4 decode -> 1440 counts/rev */
 #define MAX_WHEEL_RADPS 25.0f
 
+#define CTRL_PERIOD_MS 10
+#define CTRL_PERIOD_TICKS \
+	MAX(1, (CONFIG_SYS_CLOCK_TICKS_PER_SEC * CTRL_PERIOD_MS) / 1000)
+
 /* ---- encoders (x4 quadrature in GPIO ISR) ------------------------------- */
 
 static const int8_t quad[4][4] = {
@@ -84,10 +93,12 @@ static const int8_t quad[4][4] = {
 struct enc {
 	struct gpio_callback cb;
 	volatile int32_t     count;
+	volatile uint64_t    last_edge_us; /* acquisition stamp (ISR)    */
 	uint8_t              prev;
 	uint8_t              base; /* index of channel A in enc_gpio[] */
 	int32_t              last_count;
-	int64_t              last_ms;
+	uint64_t             seen_edge_us;  /* edge used by last velocity */
+	int64_t              last_ms;       /* fallback path only         */
 	float                vel_radps;
 };
 static struct enc enc[2] = { { .base = 0 }, { .base = 2 } };
@@ -103,13 +114,49 @@ static void enc_isr(const struct device *dev, struct gpio_callback *cb,
 
 	e->count += quad[e->prev][st];
 	e->prev = st;
+	if (IS_ENABLED(CONFIG_ARB_STAMP_AT_ISR)) {
+		e->last_edge_us = arb_time_now_us();
+	}
 }
 
-static float enc_velocity(struct enc *e)
+/*
+ * Wheel velocity. With ARB_STAMP_AT_ISR the finite difference runs on
+ * edge timestamps (microseconds, taken in the ISR), so the value is exact
+ * for the counts observed and *stamp_us reports acquisition time - the
+ * time of the newest edge folded in. Without it, the pre-existing
+ * millisecond wall-clock difference is used and the stamp is "now".
+ */
+static float enc_velocity(struct enc *e, uint64_t now_us, uint64_t *stamp_us)
 {
+	if (IS_ENABLED(CONFIG_ARB_STAMP_AT_ISR)) {
+		unsigned int key = irq_lock();
+		int32_t c = e->count;
+		uint64_t edge = e->last_edge_us;
+
+		irq_unlock(key);
+
+		int32_t dc = c - e->last_count;
+
+		if (dc != 0 && edge > e->seen_edge_us) {
+			uint64_t dt_us = edge - e->seen_edge_us;
+
+			e->vel_radps = ((float)dc / (float)(ENC_CPR * 4)) *
+				       2.0f * 3.14159265f * 1000000.0f /
+				       (float)dt_us;
+			e->last_count   = c;
+			e->seen_edge_us = edge;
+		} else if (now_us - e->seen_edge_us > 2000ULL * CTRL_PERIOD_MS) {
+			/* no edges for two control periods: wheel stopped */
+			e->vel_radps = 0.0f;
+		}
+		*stamp_us = (e->seen_edge_us != 0) ? e->seen_edge_us : now_us;
+		return e->vel_radps;
+	}
+
 	int64_t now = k_uptime_get();
 	int64_t dt  = now - e->last_ms;
 
+	*stamp_us = now_us;
 	if (dt <= 0) {
 		return e->vel_radps;
 	}
@@ -207,19 +254,36 @@ static const arb_node_ops_t drive_ops = {
 
 /* ---- 100 Hz control loop + 50 Hz telemetry ------------------------------ */
 
-#define CTRL_PERIOD_MS 10
-
 static void control_fn(struct k_work *work);
 static K_WORK_DELAYABLE_DEFINE(control_work, control_fn);
+static int64_t ctrl_next_ticks;
 
 static void control_fn(struct k_work *work)
 {
 	ARG_UNUSED(work);
 	static unsigned int tick;
-	const float dt = CTRL_PERIOD_MS / 1000.0f;
+	static uint64_t last_us;
 
-	float wl = enc_velocity(&enc[0]);
-	float wr = enc_velocity(&enc[1]);
+	/*
+	 * Reschedule first, against the absolute deadline: the period does
+	 * not accumulate handler execution time (the old tail reschedule
+	 * drifted by it every cycle).
+	 */
+	ctrl_next_ticks += CTRL_PERIOD_TICKS;
+	k_work_schedule(&control_work, K_TIMEOUT_ABS_TICKS(ctrl_next_ticks));
+
+	uint64_t now_us = arb_time_now_us();
+	/* measured dt, clamped so a hiccup cannot blow up the integrators */
+	float dt = (last_us == 0)
+			   ? CTRL_PERIOD_MS / 1000.0f
+			   : CLAMP((float)(now_us - last_us) * 1e-6f,
+				   0.5f * CTRL_PERIOD_MS / 1000.0f,
+				   2.0f * CTRL_PERIOD_MS / 1000.0f);
+	last_us = now_us;
+
+	uint64_t enc_stamp[2];
+	float wl = enc_velocity(&enc[0], now_us, &enc_stamp[0]);
+	float wr = enc_velocity(&enc[1], now_us, &enc_stamp[1]);
 
 	if (drive_enabled) {
 		motor_out(0, arb_pid_update(&pid_l, sp_wl, wl, dt));
@@ -238,8 +302,9 @@ static void control_fn(struct k_work *work)
 		arb_encoder_msg_t em = { 0 };
 
 		for (int i = 0; i < 2; i++) {
+			/* stamped with the newest edge, not publish time */
 			arb_header_init(&em.header, ARB_MSG_ENCODER,
-					drive_node->id, arb_time_now_us(),
+					drive_node->id, enc_stamp[i],
 					(uint32_t)atomic_inc(&seq));
 			em.encoder_id     = (uint8_t)i;
 			em.count          = enc[i].count;
@@ -251,8 +316,9 @@ static void control_fn(struct k_work *work)
 
 		arb_odom_t od = { 0 };
 
+		/* stamped with this cycle's acquisition instant */
 		arb_header_init(&od.header, ARB_MSG_ODOM, drive_node->id,
-				arb_time_now_us(), (uint32_t)atomic_inc(&seq));
+				now_us, (uint32_t)atomic_inc(&seq));
 		od.pose.x      = odom_pose.x;
 		od.pose.y      = odom_pose.y;
 		od.pose.theta  = odom_pose.th;
@@ -260,21 +326,47 @@ static void control_fn(struct k_work *work)
 		od.angular_vel = w;
 		(void)zbus_chan_pub(&arb_chan_odom, &od, K_NO_WAIT);
 	}
-
-	k_work_schedule(&control_work, K_MSEC(CTRL_PERIOD_MS));
 }
 
 /* ---- ICM-42688 over Zephyr I2C ------------------------------------------ */
 
 #define ICM_WHO_AM_I      0x75
 #define ICM_WHO_AM_I_VAL  0x47
+#define ICM_INT_CONFIG    0x14
+#define ICM_INT_STATUS    0x2D
 #define ICM_PWR_MGMT0     0x4E
 #define ICM_GYRO_CONFIG0  0x4F
 #define ICM_ACCEL_CONFIG0 0x50
+#define ICM_INT_CONFIG1   0x64
+#define ICM_INT_SOURCE0   0x65
 #define ICM_TEMP_DATA1    0x1D
 
 #define ACCEL_SCALE (9.80665f / 4096.0f)   /* +/-8g          */
 #define GYRO_SCALE  (0.0174533f / 32.8f)   /* +/-1000 dps    */
+
+/*
+ * Data-ready stamping: INT1 fires per sample at the configured ODR; the
+ * GPIO callback captures the time and wakes the thread, which then does
+ * the I2C burst read. The stamp is the interrupt edge, not the (later,
+ * jittery) end of the bus transaction. Falls back to 200 Hz polling when
+ * the INT line is absent or ARB_STAMP_AT_ISR=n.
+ */
+#if DT_NODE_HAS_PROP(ZUSER, imu_int_gpios) && defined(CONFIG_ARB_STAMP_AT_ISR)
+#define IMU_HAS_INT 1
+static const struct gpio_dt_spec imu_int =
+	GPIO_DT_SPEC_GET(ZUSER, imu_int_gpios);
+static struct gpio_callback imu_int_cb;
+static K_SEM_DEFINE(imu_drdy, 0, 1);
+static volatile uint64_t imu_isr_stamp_us;
+
+static void imu_int_isr(const struct device *dev, struct gpio_callback *cb,
+			uint32_t pins)
+{
+	ARG_UNUSED(dev); ARG_UNUSED(cb); ARG_UNUSED(pins);
+	imu_isr_stamp_us = arb_time_now_us();
+	k_sem_give(&imu_drdy);
+}
+#endif
 
 static int imu_init(void)
 {
@@ -290,6 +382,26 @@ static int imu_init(void)
 	i2c_reg_write_byte(i2c_dev, IMU_ADDR, ICM_GYRO_CONFIG0,  0x47);
 	i2c_reg_write_byte(i2c_dev, IMU_ADDR, ICM_PWR_MGMT0,     0x0F);
 	k_msleep(50);
+
+#ifdef IMU_HAS_INT
+	/*
+	 * INT1: pulsed, push-pull, active high; UI data-ready -> INT1.
+	 * INT_ASYNC_RESET (INT_CONFIG1 bit 4) must be 0 for proper INT
+	 * operation per datasheet. Register values to verify on hardware.
+	 */
+	i2c_reg_write_byte(i2c_dev, IMU_ADDR, ICM_INT_CONFIG, 0x03);
+	i2c_reg_update_byte(i2c_dev, IMU_ADDR, ICM_INT_CONFIG1, BIT(4), 0);
+	i2c_reg_write_byte(i2c_dev, IMU_ADDR, ICM_INT_SOURCE0, 0x08);
+
+	if (!gpio_is_ready_dt(&imu_int)) {
+		LOG_WRN("imu int gpio not ready; polling");
+		return 0;
+	}
+	gpio_pin_configure_dt(&imu_int, GPIO_INPUT);
+	gpio_init_callback(&imu_int_cb, imu_int_isr, BIT(imu_int.pin));
+	gpio_add_callback(imu_int.port, &imu_int_cb);
+	gpio_pin_interrupt_configure_dt(&imu_int, GPIO_INT_EDGE_TO_ACTIVE);
+#endif
 	return 0;
 }
 
@@ -303,6 +415,23 @@ static void imu_thread(void *a, void *b, void *c)
 
 	while (1) {
 		uint8_t raw[14];
+		uint64_t stamp;
+
+#ifdef IMU_HAS_INT
+		if (k_sem_take(&imu_drdy, K_MSEC(10)) == 0) {
+			uint8_t st;
+
+			stamp = imu_isr_stamp_us;
+			/* clear the pulsed interrupt status */
+			(void)i2c_reg_read_byte(i2c_dev, IMU_ADDR,
+						ICM_INT_STATUS, &st);
+		} else {
+			/* INT missing/misconfigured: degrade to polling */
+			stamp = arb_time_now_us();
+		}
+#else
+		stamp = arb_time_now_us();
+#endif
 
 		if (i2c_burst_read(i2c_dev, IMU_ADDR, ICM_TEMP_DATA1, raw,
 				   sizeof(raw)) == 0) {
@@ -315,8 +444,8 @@ static void imu_thread(void *a, void *b, void *c)
 			int16_t gy = (int16_t)((raw[10] << 8) | raw[11]);
 			int16_t gz = (int16_t)((raw[12] << 8) | raw[13]);
 
-			arb_header_init(&m.header, ARB_MSG_IMU, 0,
-					arb_time_now_us(),
+			/* stamp = acquisition (DRDY edge), not read time */
+			arb_header_init(&m.header, ARB_MSG_IMU, 0, stamp,
 					(uint32_t)atomic_inc(&seq));
 			m.accel.x = ax * ACCEL_SCALE;
 			m.accel.y = ay * ACCEL_SCALE;
@@ -328,7 +457,9 @@ static void imu_thread(void *a, void *b, void *c)
 
 			(void)zbus_chan_pub(&arb_chan_imu, &m, K_NO_WAIT);
 		}
-		k_msleep(5); /* 200 Hz */
+#ifndef IMU_HAS_INT
+		k_msleep(5); /* 200 Hz polling pace */
+#endif
 	}
 }
 K_THREAD_DEFINE(imu_tid, 2048, imu_thread, NULL, NULL, NULL, 6, 0, 200);
@@ -358,7 +489,8 @@ int main(void)
 			(uint8_t)gpio_pin_get_dt(&enc_gpio[enc[e].base + 1]);
 
 		enc[e].prev    = (uint8_t)((a << 1) | b);
-		enc[e].last_ms = k_uptime_get();
+		enc[e].last_ms      = k_uptime_get();
+		enc[e].seen_edge_us = arb_time_now_us();
 		gpio_init_callback(&enc[e].cb, enc_isr,
 				   BIT(enc_gpio[enc[e].base].pin) |
 				   BIT(enc_gpio[enc[e].base + 1].pin));
@@ -385,6 +517,7 @@ int main(void)
 		arb_transport_export(&arb_chan_estop);
 	))
 
-	k_work_schedule(&control_work, K_MSEC(CTRL_PERIOD_MS));
+	ctrl_next_ticks = k_uptime_ticks() + CTRL_PERIOD_TICKS;
+	k_work_schedule(&control_work, K_TIMEOUT_ABS_TICKS(ctrl_next_ticks));
 	return 0;
 }

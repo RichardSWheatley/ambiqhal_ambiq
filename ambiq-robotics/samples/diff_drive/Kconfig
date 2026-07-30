@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: Apache-2.0
+mainmenu "ARB diff-drive sample"
+
+config ARB_STAMP_AT_ISR
+	bool "Timestamp sensor data at interrupt time"
+	default y
+	help
+	  Capture arb_time_now_us() in the IMU data-ready GPIO callback and
+	  in the encoder edge ISRs, so message stamps carry acquisition
+	  time instead of processing time. When disabled, the sample falls
+	  back to thread-timed polling and control-rate stamps (the
+	  pre-ISR-stamping behavior), which is useful for measuring the
+	  difference with the e2e benchmark.
+
+source "Kconfig.zephyr"

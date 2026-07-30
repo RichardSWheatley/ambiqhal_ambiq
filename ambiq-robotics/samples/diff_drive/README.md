@@ -98,6 +98,34 @@ ARB link (UART1), immediately and unprompted:
 With motors idle, odom stays ~0 and encoder counts are static. Spin a wheel by
 hand: its `count`/`velocity_rad_s` move and odom integrates.
 
+## Timestamps
+
+With `CONFIG_ARB_STAMP_AT_ISR=y` (the default) every stamp is **acquisition
+time**, captured in interrupt context via `arb_time_now_us()`:
+
+- **IMU**: the ICM-42688's INT1 data-ready line (`imu-int-gpios`, P28 on the
+  EVB overlay) fires per sample at the 200 Hz ODR; the GPIO callback records
+  the stamp and wakes the reader thread. The stamp is the interrupt edge —
+  the later I2C burst read no longer pollutes it. If INT1 is not wired the
+  thread degrades to 200 Hz polling automatically.
+- **Encoders**: each quadrature edge records its time in the ISR. Wheel
+  velocity is finite-differenced on **edge timestamps** (µs) instead of
+  millisecond wall time, and encoder messages carry the newest edge's stamp.
+- **Odometry**: stamped with the control cycle's acquisition instant.
+
+The control loop reschedules itself against an **absolute deadline** at
+handler entry (`K_TIMEOUT_ABS_TICKS`), so its period no longer drifts by the
+handler's execution time, and PID/odometry integrate a measured `dt` (clamped
+to 0.5×–2× nominal) instead of assuming 10 ms.
+
+Set `CONFIG_ARB_STAMP_AT_ISR=n` to restore thread-timed stamps — useful as
+the baseline when measuring the improvement with
+[`benchmarks/e2e_cmd_vel`](../../benchmarks/README.md).
+
+The time base behind the stamps is selectable (`arb/time.h`): local uptime by
+default, or `CONFIG_ARB_TIME_LINK` to discipline stamps against the link peer
+via the built-in timesync exchange.
+
 ## Wire format
 
 ```
