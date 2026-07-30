@@ -35,6 +35,7 @@
 
 #include "arb/topics.h"
 #include "arb/node.h"
+#include "arb/time.h"
 #include "arb/transport.h"
 #include "arb/control/pid.h"
 #include "arb/control/diff_drive.h"
@@ -154,11 +155,6 @@ static struct { float x, y, th; } odom_pose;
 static atomic_t seq;
 static arb_node_t *drive_node;
 
-static uint64_t stamp_us(void)
-{
-	return k_ticks_to_us_floor64(k_uptime_ticks());
-}
-
 /* ---- zbus observers ----------------------------------------------------- */
 
 static void cmd_vel_cb(const struct zbus_channel *chan)
@@ -243,7 +239,7 @@ static void control_fn(struct k_work *work)
 
 		for (int i = 0; i < 2; i++) {
 			arb_header_init(&em.header, ARB_MSG_ENCODER,
-					drive_node->id, stamp_us(),
+					drive_node->id, arb_time_now_us(),
 					(uint32_t)atomic_inc(&seq));
 			em.encoder_id     = (uint8_t)i;
 			em.count          = enc[i].count;
@@ -256,7 +252,7 @@ static void control_fn(struct k_work *work)
 		arb_odom_t od = { 0 };
 
 		arb_header_init(&od.header, ARB_MSG_ODOM, drive_node->id,
-				stamp_us(), (uint32_t)atomic_inc(&seq));
+				arb_time_now_us(), (uint32_t)atomic_inc(&seq));
 		od.pose.x      = odom_pose.x;
 		od.pose.y      = odom_pose.y;
 		od.pose.theta  = odom_pose.th;
@@ -319,7 +315,8 @@ static void imu_thread(void *a, void *b, void *c)
 			int16_t gy = (int16_t)((raw[10] << 8) | raw[11]);
 			int16_t gz = (int16_t)((raw[12] << 8) | raw[13]);
 
-			arb_header_init(&m.header, ARB_MSG_IMU, 0, stamp_us(),
+			arb_header_init(&m.header, ARB_MSG_IMU, 0,
+					arb_time_now_us(),
 					(uint32_t)atomic_inc(&seq));
 			m.accel.x = ax * ACCEL_SCALE;
 			m.accel.y = ay * ACCEL_SCALE;

@@ -12,6 +12,7 @@ zephyr_library_sources(
   src/topics.c
   src/node.c
   src/serial.c
+  src/time.c
   src/control/pid.c
   src/control/diff_drive.c
 )

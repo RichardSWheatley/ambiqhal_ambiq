@@ -12,6 +12,7 @@
 #include <zephyr/zbus/zbus.h>
 
 #include "arb/node.h"
+#include "arb/time.h"
 #include "arb/topics.h"
 
 LOG_MODULE_REGISTER(arb, CONFIG_ARB_LOG_LEVEL);
@@ -19,11 +20,6 @@ LOG_MODULE_REGISTER(arb, CONFIG_ARB_LOG_LEVEL);
 static arb_node_t nodes[CONFIG_ARB_MAX_NODES];
 static uint16_t   node_count;
 static struct k_spinlock lock;
-
-static uint64_t stamp_us(void)
-{
-	return k_ticks_to_us_floor64(k_uptime_ticks());
-}
 
 arb_node_t *arb_node_create(const char *name, const arb_node_ops_t *ops,
 			    void *ctx)
@@ -145,7 +141,8 @@ int arb_node_estop_all(uint16_t source, uint8_t reason)
 	}
 
 	arb_estop_t msg = { 0 };
-	arb_header_init(&msg.header, ARB_MSG_ESTOP, source, stamp_us(), 0);
+	arb_header_init(&msg.header, ARB_MSG_ESTOP, source, arb_time_now_us(),
+			0);
 	msg.source = source;
 	msg.reason = reason;
 
@@ -181,7 +178,7 @@ static void hb_tick(struct k_work *work)
 
 		arb_heartbeat_t hb = { 0 };
 		arb_header_init(&hb.header, ARB_MSG_HEARTBEAT, n->id,
-				stamp_us(), hb_seq++);
+				arb_time_now_us(), hb_seq++);
 		hb.node      = n->id;
 		hb.state     = (uint8_t)n->state;
 		hb.uptime_ms = (uint32_t)(now - n->start_ms);
