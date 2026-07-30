@@ -17,12 +17,19 @@ arb_chan_estop (UART frame in)     ──► motors brake, node → ESTOP
 | Item | Notes |
 |---|---|
 | Apollo510 EVB | the target |
-| DRV8833 or TB6612FNG breakout | dual H-bridge |
+| DRV8833 or TB6612FNG carrier (Pololu #2130 / #713) | dual H-bridge, jumpered. MikroE DC Motor Click is single-motor (muxed DRV8833) — wrong topology for two wheels |
 | 2× N20 gear motor with quadrature encoder | 6 V, 360 CPR line count assumed (`ENC_CPR`) |
-| ICM-42688-P breakout | I2C, AD0→GND (addr 0x68); most breakouts include pull-ups |
+| MikroE 6DOF IMU 14 Click (MIKROE-4237) | ICM-42688-P; drops into the EVB mikroBUS socket (J14/J15). COMM SEL jumpers to I2C, ADDR SEL low → 0x68. Any other ICM-42688-P breakout on I2C works too |
 | USB-UART adapter, 3.3 V (CP2102/FTDI) | the ARB link to the host |
 | Motor supply | 2S LiPo or 4×AA to H-bridge VM |
 | Jumper wires, breadboard | |
+
+Chassis alternative: a Pololu Romi kit (chassis + 120:1 gearmotors), the Romi
+Motor Driver and Power Distribution Board (#3543, dual DRV8838 — same PWM+DIR
+control as this sample), and the Romi Encoder Pair Kit (#3542, 1440
+counts/wheel-rev at x4, matching `ENC_CPR 360`) replaces the H-bridge, motors,
+encoders, and battery wiring in one stack — leaving just the IMU Click and the
+USB-UART adapter.
 
 ### Wiring
 
@@ -34,10 +41,12 @@ arb_chan_estop (UART frame in)     ──► motors brake, node → ESTOP
 | Motor R DIR | 19 | BIN2 |
 | Encoder L A / B | 24 / 25 | encoder outputs (3.3 V) |
 | Encoder R A / B | 26 / 27 | encoder outputs (3.3 V) |
-| IMU SDA / SCL | 5 / 6 (IOM0) | breakout SDA / SCL |
+| IMU SDA / SCL | 5 / 6 (IOM0) | jumpered breakout; for the Click in the mikroBUS socket, match the overlay's I2C node to the IOM the socket routes (QSG Fig. 6) |
 | ARB link TX / RX | 48 / 49 (UART1) | adapter RX / TX, 921600 8N1 |
 | Console | EVB USB (UART0) | Zephyr log output |
 
+The overlay assumes IOM0 on GPIO5/6 for I2C; if the mikroBUS socket routes a
+different IOM, point the overlay's I2C node and pinctrl at that instance.
 Pin changes go in [`boards/apollo510_evb.overlay`](boards/apollo510_evb.overlay);
 geometry and limits (`WHEEL_BASE_M`, `WHEEL_RADIUS_M`, `ENC_CPR`,
 `MAX_WHEEL_RADPS`) at the top of [`src/main.c`](src/main.c).
