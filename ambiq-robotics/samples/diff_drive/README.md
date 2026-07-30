@@ -62,10 +62,12 @@ geometry and limits (`WHEEL_BASE_M`, `WHEEL_RADIUS_M`, `ENC_CPR`,
 - Python 3 + `pyserial` for the ARB link (UART1) — the frames are binary, a
   plain terminal shows garbage
 
-Build and flash:
+Build and flash (ARB must be registered as an extra module — nothing in the
+parent repository does it for you; see the top-level ARB README):
 
 ```
-west build -b apollo510_evb ambiq-robotics/samples/diff_drive
+west build -b apollo510_evb ambiqhal_ambiq/ambiq-robotics/samples/diff_drive -- \
+    -DZEPHYR_EXTRA_MODULES=$PWD/ambiqhal_ambiq/ambiq-robotics
 west flash
 ```
 

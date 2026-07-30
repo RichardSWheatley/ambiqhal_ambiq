@@ -32,7 +32,32 @@ zephyr/module.yml
 
 ## Use
 
-Add as a Zephyr module and enable:
+### Building as a Zephyr module
+
+Nothing in the parent repository registers ARB with the Zephyr build — the
+module must be added explicitly. In a west workspace:
+
+```
+west build -b <board> <app> -- \
+    -DZEPHYR_EXTRA_MODULES=$PWD/ambiqhal_ambiq/ambiq-robotics
+```
+
+or persistently via `west config build.cmake-args -- -DZEPHYR_EXTRA_MODULES=...`,
+or with a `west.yml` manifest entry pointing at this directory once it lives in
+its own repository.
+
+Without a west workspace (plain CMake), pass the module list directly:
+
+```
+cmake -GNinja -Bbuild -DBOARD=<board> \
+    -DZEPHYR_MODULES=<path>/ambiq-robotics <app>
+```
+
+ARB is HAL-independent (no `am_*` references) and must be added as an *extra*
+module — do not substitute this repository for the `hal_ambiq` module pinned in
+the Zephyr manifest; Ambiq SoC drivers expect the pinned HAL revision.
+
+Then enable:
 
 ```
 CONFIG_ARB=y
@@ -60,11 +85,22 @@ hardware to wire, host software, frame layouts, and what to expect on the
 link.
 
 ```
-west build -b apollo510_evb ambiq-robotics/samples/diff_drive
+west build -b apollo510_evb ambiqhal_ambiq/ambiq-robotics/samples/diff_drive -- \
+    -DZEPHYR_EXTRA_MODULES=$PWD/ambiqhal_ambiq/ambiq-robotics
 ```
 
-## Tests
+## Tests and benchmarks
 
 ```
-west twister -p native_sim -T ambiq-robotics/tests
+west twister -p native_sim -T ambiq-robotics/tests \
+    -x=ZEPHYR_EXTRA_MODULES=$PWD/ambiq-robotics
+```
+
+The module also registers its `samples/` and `tests/` directories with
+twister's module discovery, so a workspace that lists ARB in its manifest can
+run everything via:
+
+```
+./zephyr/scripts/zephyr_module.py --twister-out module.args
+./zephyr/scripts/twister +module.args -p native_sim
 ```
