@@ -11,7 +11,7 @@ across three tasks to show cross-task pub/sub:
 
 Peripheral bindings reuse the AmbiqSuite direct-HAL bindings
 (`port/ambiqsuite/hal_bind.c`) — AmbiqSuite ships FreeRTOS, so this is the
-common no-Zephyr RTOS setup on Apollo510.
+common RTOS setup on Apollo510.
 
 ## Build
 

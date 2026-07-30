@@ -41,7 +41,6 @@ and JAUS networks.
    +-------------------------------------------+
                  |
                  v
-        AmbiqSuite HAL / Zephyr / FreeRTOS / ...
 ```
 
 ## Message flow
@@ -66,7 +65,6 @@ The portable core implements the *logic* (clamping/deadband/inversion for
 motors, tick→angle/velocity for encoders, axis remap + message packing for IMUs);
 the port fills in the ops with real peripheral calls. The same `arb_motor_t`
 behaves identically whether it is driven by an Ambiq TIMER (bare-metal) or a
-Zephyr PWM device.
 
 ## Control
 
@@ -81,10 +79,8 @@ measured wheel velocities → `/odom`.
 Bridges connect ARB topics to the outside world and are transport-agnostic where
 possible:
 
-- **micro-ROS** (`port/zephyr/bridge/micro_ros.c`) — mirrors topics onto a ROS2
   graph.
 - **JAUS** (`core/src/bridge/jaus.c`) — SAE AS-4 codec + topic mapping, with UDP
-  transports for host and Zephyr and an OpenJAUS SDK adapter.
 - **Serial** (`core/src/bridge/serial.c`) — framed UART/SPI link for telemetry
   and commands when there is no IP network.
 

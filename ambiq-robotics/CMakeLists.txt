@@ -1,7 +1,7 @@
 # Ambiq Robotics Broker (ARB) - top-level CMake (host / standalone builds).
 #
 # This drives host builds and the unit tests; firmware integrations use the
-# per-target glue instead (port/zephyr/CMakeLists.txt, port/ambiqsuite/arb.mk).
+# per-target glue instead (port/ambiqsuite/arb.mk, port/freertos/arb.mk, ...).
 #
 #   cmake -S ambiq-robotics -B build -DARB_BUILD_TESTS=ON
 #   cmake --build build

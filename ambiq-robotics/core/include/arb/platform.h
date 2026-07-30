@@ -2,7 +2,6 @@
  * Ambiq Robotics Broker (ARB) - port layer interface
  *
  * This header is THE seam between the OS-agnostic core and a concrete platform
- * (bare-metal AmbiqSuite, Zephyr, host test, ...). A port must implement every
  * function declared here. The core never calls an OS primitive directly; it only
  * calls through this contract.
  *
@@ -59,7 +58,6 @@ int arb_platform_post(arb_topic_id_t topic, const void *msg, size_t len);
 /**
  * @brief Drain the platform queue, delivering messages to subscribers.
  *
- * Call from the main loop (no-OS) or a dispatcher thread/work item (Zephyr).
  * Invokes arb_topic_deliver() for each queued message in FIFO order.
  */
 void arb_platform_dispatch(void);

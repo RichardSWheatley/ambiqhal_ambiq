@@ -11,7 +11,7 @@
  *                           (replace with your UART / JAUS / micro-ROS input).
  *
  * Peripheral bindings reuse the AmbiqSuite direct-HAL bindings (AmbiqSuite ships
- * FreeRTOS, so this is the common no-Zephyr RTOS setup on Apollo510). Build with
+ * FreeRTOS, so this is a common RTOS setup on Apollo510). Build with
  * port/freertos/arb.mk inside an AmbiqSuite + FreeRTOS example.
  *
  * SPDX-License-Identifier: Apache-2.0

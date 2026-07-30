@@ -30,7 +30,6 @@ Requirements:
 
 Two queue patterns are used by the existing ports:
 
-- **Whole-message queue** (FreeRTOS, CMSIS-RTOS2, Zephyr `k_msgq`): the queue
   item is the message slot.
 - **Static ring + critical section** (bare-metal, NuttX, RIOT, host): a small
   array guarded by the lock.
@@ -47,7 +46,6 @@ Provide an `arb_*_ops_t` for each device class you need (`motor`, `encoder`,
 matching `arb_*_init()`. You can:
 
 - call your chip vendor's HAL directly (see `port/ambiqsuite/hal_bind.c`), or
-- wrap the OS's device model (see `port/zephyr/hal_bind.c`).
 
 On Apollo510 you can simply reuse `port/ambiqsuite/hal_bind.c` from any RTOS that
 runs there (FreeRTOS, ThreadX, NuttX, RIOT, CMSIS-RTOS2 all do this).
@@ -58,7 +56,6 @@ Compile the core sources + your `platform.c` (+ HAL bindings). Reuse an existing
 fragment as a template:
 
 - Make-based (AmbiqSuite SDK): `port/<os>/arb.mk` (see `freertos`, `threadx`).
-- CMake / Zephyr: `port/zephyr/CMakeLists.txt`.
 - NuttX apps: `samples/nuttx/{Makefile,Kconfig,Make.defs}`.
 
 The core source list is:

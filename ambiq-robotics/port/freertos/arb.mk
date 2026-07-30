@@ -2,7 +2,7 @@
 #
 # Uses the FreeRTOS platform port for the broker and reuses the AmbiqSuite
 # direct-HAL bindings for motor/encoder/IMU (AmbiqSuite ships FreeRTOS, so this
-# is the common no-Zephyr RTOS combination on Apollo510).
+# is a common RTOS combination on Apollo510).
 #
 #   ARB_ROOT := ../../path/to/ambiq-robotics
 #   include $(ARB_ROOT)/port/freertos/arb.mk

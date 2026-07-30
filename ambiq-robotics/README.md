@@ -1,10 +1,8 @@
 # Ambiq Robotics Broker (ARB)
 
 A lightweight robotics middleware for the **Apollo510** that abstracts the
-AmbiqSuite HAL and runs both on **bare-metal AmbiqSuite** and under **Zephyr**.
 It borrows architectural DNA from ROS2/JAUS — publish/subscribe, request/response
 services, a node-like presence on the network — but is sized for an MCU: static
-allocation only, no IDL codegen, no heap. On Zephyr it can bridge upstream to
 **micro-ROS** so the Apollo510 shows up as a ROS2 node.
 
 ## Layout
@@ -30,18 +28,15 @@ ambiq-robotics/
 │   └── src/               # topic.c, service.c, hal/*, control/*, bridge/*
 ├── port/                  # one small platform.c per OS (the only OS-specific code)
 │   ├── ambiqsuite/        # no-OS super-loop + direct Ambiq HAL bindings
-│   ├── zephyr/            # Zephyr module: k_msgq dispatch, device API, micro-ROS
 │   ├── freertos/          # FreeRTOS (incl. the one bundled in AmbiqSuite)
 │   ├── threadx/           # Eclipse ThreadX (Azure RTOS)
 │   ├── nuttx/             # Apache NuttX
 │   ├── riot/              # RIOT OS
 │   ├── cmsis-rtos2/       # CMSIS-RTOS2 (Keil RTX5, etc.)
 │   └── host/              # POSIX simulation + JAUS/UDP + OpenJAUS adapter
-├── samples/               # ambiqsuite, zephyr, freertos, threadx, nuttx,
 │                          #   riot, cmsis-rtos2, jaus
 └── docs/                  # architecture.md, porting.md
 │   ├── ambiqsuite/        # closed-loop diff-drive base, super-loop
-│   └── zephyr/            # closed-loop diff-drive base, dispatcher thread
 └── tests/                 # host unit tests (ctest)
 ```
 
@@ -63,7 +58,6 @@ Three layers, two seams:
    implements the timebase, an ISR-safe `post`, a `dispatch` drain, and a lock.
 3. **HAL bindings (`hal_bind.c`).** Per-port glue that fills in the motor /
    encoder / IMU backend ops with real peripheral calls (direct Ambiq HAL on
-   bare-metal; Zephyr PWM/GPIO/sensor — or direct Ambiq HAL — on Zephyr).
 
 ### The port contract (`platform.h`)
 
@@ -79,7 +73,6 @@ void     arb_platform_unlock(arb_lock_t);
 `arb_topic_publish()` copies the message into the port queue via `post` (safe
 from an ISR). Later, from a normal context, `dispatch` pulls each message and
 calls `arb_topic_deliver()`, which fans it out to subscribers. That decoupling is
-what lets the same code run on a bare-metal super-loop and on a Zephyr thread.
 
 ## Data flow
 
@@ -104,28 +97,6 @@ SRC      += $(ARB_SRC)
 
 See `samples/ambiqsuite/main.c` for a complete differential-drive node.
 
-### Zephyr
-
-Add this directory as a Zephyr module (it ships `zephyr/module.yml`) and enable
-it in your `prj.conf`:
-
-```
-CONFIG_ARB=y
-CONFIG_PWM=y
-CONFIG_GPIO=y
-CONFIG_SENSOR=y
-```
-
-Build the sample (provide a board overlay defining the `pwm-motor-l/r`,
-`qdec-l/r`, and `robot-imu` aliases):
-
-```
-west build -b apollo510_evb samples/zephyr
-```
-
-Enable `CONFIG_ARB_MICRO_ROS_BRIDGE=y` (with the micro-ROS module present) to
-mirror `/cmd_vel`, `/odom`, and `/imu` onto a ROS2 network.
-
 ## Supported platforms (ports)
 
 The only OS-specific code is one small `platform.c` per target implementing the
@@ -134,7 +105,6 @@ The only OS-specific code is one small `platform.c` per target implementing the
 | Port | `post` (ISR-safe) | `dispatch` | lock | timebase |
 |------|-------------------|-----------|------|----------|
 | `ambiqsuite` (no-OS) | static ring + PRIMASK | super-loop drain | PRIMASK | STIMER (true µs) |
-| `zephyr` | `k_msgq` | thread / manual | `irq_lock` | kernel ticks |
 | `freertos` | `xQueueSendFromISR` | `xQueueReceive` | BASEPRI mask | ticks (override for µs) |
 | `threadx` | block pool + `tx_queue_send` | `tx_queue_receive` | `TX_DISABLE` | ticks (override for µs) |
 | `nuttx` | static ring + critical section | drain | `enter_critical_section` | `CLOCK_MONOTONIC` |
@@ -168,8 +138,6 @@ bytes leave through a send hook. Two transports are provided under
   `-DARB_WITH_OPENJAUS`) that hands AS5669A transport, discovery, and node
   management to OpenJAUS while ARB owns robot behavior.
 
-On Zephyr, set `CONFIG_ARB_JAUS_BRIDGE=y` to get the same bridge over a Zephyr
-UDP socket (`port/zephyr/bridge/jaus_udp.c`).
 
 ## Serial (UART) link
 
@@ -190,7 +158,6 @@ topics you want to emit, and call `arb_uart_transport_poll()` from the loop.
 | `ARB_MSG_MAX_SIZE` | 64 | largest message (bytes) |
 | `ARB_QUEUE_DEPTH` | 16 | port queue depth |
 
-On Zephyr these map to `CONFIG_ARB_*` Kconfig options.
 
 ## Testing
 
