@@ -29,6 +29,27 @@ config ARB_HEARTBEAT_TICK_MS
 	  Node heartbeats are published from a delayable work item that runs at
 	  this period; individual node periods round up to it.
 
+choice ARB_TIME_SOURCE
+	prompt "Time base for message stamps"
+	default ARB_TIME_UPTIME
+	help
+	  Source behind arb_time_now_us(), used for every message stamp.
+
+config ARB_TIME_UPTIME
+	bool "Local kernel uptime"
+	help
+	  Monotonic local time; meaningless across the link.
+
+config ARB_TIME_PTP
+	bool "PTP clock device"
+	depends on PTP_CLOCK
+	help
+	  Read the ptp_clock device named by the devicetree chosen node
+	  "arb,ptp-clock" - the backend for boards disciplined by gPTP.
+	  Falls back to local uptime while the device is not ready.
+
+endchoice
+
 config ARB_TRANSPORT
 	bool "Serial transport (bridge channels over a UART)"
 	depends on SERIAL

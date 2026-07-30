@@ -58,7 +58,7 @@ typedef enum {
  * knowing the concrete type.
  */
 typedef struct {
-	uint64_t stamp_us; /**< Source timestamp (Zephyr uptime, microseconds). */
+	uint64_t stamp_us; /**< Source timestamp in us (arb_time_now_us()).    */
 	uint32_t seq;      /**< Per-publisher monotonic sequence number.        */
 	uint16_t type;     /**< One of @ref arb_msg_type_t.                     */
 	uint16_t source;   /**< Node / source identifier (0 = unspecified).     */
@@ -174,7 +174,7 @@ typedef struct {
  * @param h        Header to fill (must be the first member of the message).
  * @param type     @ref arb_msg_type_t value.
  * @param source   Source/node id (0 if unused).
- * @param stamp_us Timestamp (typically k_ticks_to_us_floor64(k_uptime_ticks())).
+ * @param stamp_us Timestamp (typically arb_time_now_us(), see arb/time.h).
  * @param seq      Sequence number (caller-managed per publisher).
  */
 static inline void arb_header_init(arb_header_t *h, uint16_t type,
