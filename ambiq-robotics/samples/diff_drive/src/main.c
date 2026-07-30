@@ -13,10 +13,10 @@
  *   arb_chan_estop                  -> motors brake
  *
  * Hardware (see boards/apollo510_evb.overlay):
- *   motors:   PWM GPIO12/18 (CTIMER0/1), DIR GPIO13/19 -> DRV8833/TB6612
- *   encoders: GPIO24/25 (left A/B), GPIO26/27 (right A/B), x4 decode
- *   IMU:      ICM-42688-P on IOM0 I2C (SDA GPIO5, SCL GPIO6), addr 0x68
- *   link:     UART1 (TX GPIO48, RX GPIO49) via chosen "arb,uart"
+ *   motors:   PWM P12/P18 (CT12/CT18), DIR P13/P19 -> DRV8833/TB6612
+ *   encoders: P24/P25 (left A/B), P26/P27 (right A/B), x4 decode
+ *   IMU:      ICM-42688-P on IOM0 I2C (SCL P5, SDA P6), addr 0x68
+ *   link:     UART1 (TX P41, RX P43) via chosen "arb,uart"
  *
  * SPDX-License-Identifier: Apache-2.0
  * Copyright (c) 2026 Ambiq Micro Inc. <www.ambiq.com>

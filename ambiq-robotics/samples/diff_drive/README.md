@@ -35,18 +35,21 @@ USB-UART adapter.
 
 | Signal | Apollo510 GPIO | Goes to |
 |---|---|---|
-| Motor L PWM | 12 (CTIMER0 out0) | AIN1 |
+| Motor L PWM | 12 (CT12) | AIN1 |
 | Motor L DIR | 13 | AIN2 |
-| Motor R PWM | 18 (CTIMER1 out0) | BIN1 |
+| Motor R PWM | 18 (CT18) | BIN1 |
 | Motor R DIR | 19 | BIN2 |
 | Encoder L A / B | 24 / 25 | encoder outputs (3.3 V) |
 | Encoder R A / B | 26 / 27 | encoder outputs (3.3 V) |
-| IMU SDA / SCL | 5 / 6 (IOM0) | jumpered breakout; for the Click in the mikroBUS socket, match the overlay's I2C node to the IOM the socket routes (QSG Fig. 6) |
-| ARB link TX / RX | 48 / 49 (UART1) | adapter RX / TX, 921600 8N1 |
+| IMU SCL / SDA | 5 / 6 (IOM0: M0SCL_P5, M0SDAWIR3_P6) | jumpered breakout; for the Click in the mikroBUS socket, match the overlay's I2C node to the IOM the socket routes (QSG Fig. 6) |
+| ARB link TX / RX | 41 / 43 (UART1TX_P41 / UART1RX_P43) | adapter RX / TX, 921600 8N1 |
 | Console | EVB USB (UART0) | Zephyr log output |
 
-The overlay assumes IOM0 on GPIO5/6 for I2C; if the mikroBUS socket routes a
-different IOM, point the overlay's I2C node and pinctrl at that instance.
+The overlay uses the function macros from
+`dts/apollo510/ambiq-apollo510-pinmux.h`; every pin choice above is a real
+mux option there. If the mikroBUS socket routes a different IOM for I2C,
+point the overlay's I2C node and pinctrl at that instance; any free
+UARTnTX/UARTnRX pair works for the link.
 Pin changes go in [`boards/apollo510_evb.overlay`](boards/apollo510_evb.overlay);
 geometry and limits (`WHEEL_BASE_M`, `WHEEL_RADIUS_M`, `ENC_CPR`,
 `MAX_WHEEL_RADPS`) at the top of [`src/main.c`](src/main.c).
