@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: Apache-2.0
+mainmenu "ARB benchmark: IRQ latency"
+
+config BENCH_SAMPLES
+	int "Number of samples"
+	default 100000
+	help
+	  Alarm/ISR round trips to measure. The RFC asks for N >= 100k.
+
+config BENCH_LOAD
+	bool "Run with background load (zbus traffic + logging)"
+	depends on ZBUS && LOG
+	help
+	  Start a 1 kHz zbus publisher with a listener, periodic log output
+	  and a low-priority memory-churn thread before measuring. The
+	  loaded numbers are the mixed-criticality figures the Robotics WG
+	  benchmarking deliverable asks for.
+
+source "Kconfig.zephyr"
