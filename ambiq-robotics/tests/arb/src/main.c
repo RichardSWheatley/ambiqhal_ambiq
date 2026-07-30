@@ -193,4 +193,38 @@ ZTEST(arb, test_zbus_pub_read)
 	zassert_equal(r.header.seq, 9);
 }
 
+/* ---- wire layout --------------------------------------------------------- */
+
+/*
+ * The 16-byte header and the framing are shared with peers built from the
+ * multi-OS ARB tree; these are the wire-compatibility invariants.
+ */
+BUILD_ASSERT(sizeof(arb_header_t) == 16);
+BUILD_ASSERT(offsetof(arb_header_t, stamp_us) == 0);
+BUILD_ASSERT(offsetof(arb_header_t, seq) == 8);
+BUILD_ASSERT(offsetof(arb_header_t, type) == 12);
+BUILD_ASSERT(offsetof(arb_header_t, source) == 14);
+BUILD_ASSERT(sizeof(arb_heartbeat_t) == 24);
+BUILD_ASSERT(sizeof(arb_twist_t) <= ARB_MSG_MAX_SIZE);
+BUILD_ASSERT(sizeof(arb_odom_t) <= ARB_MSG_MAX_SIZE);
+BUILD_ASSERT(sizeof(arb_imu_t) <= ARB_MSG_MAX_SIZE);
+BUILD_ASSERT(sizeof(arb_motor_cmd_t) <= ARB_MSG_MAX_SIZE);
+BUILD_ASSERT(sizeof(arb_encoder_msg_t) <= ARB_MSG_MAX_SIZE);
+BUILD_ASSERT(sizeof(arb_battery_t) <= ARB_MSG_MAX_SIZE);
+BUILD_ASSERT(sizeof(arb_range_t) <= ARB_MSG_MAX_SIZE);
+BUILD_ASSERT(sizeof(arb_pose2d_t) <= ARB_MSG_MAX_SIZE);
+BUILD_ASSERT(sizeof(arb_log_t) <= ARB_MSG_MAX_SIZE);
+BUILD_ASSERT(sizeof(arb_estop_t) <= ARB_MSG_MAX_SIZE);
+
+ZTEST(arb, test_wire_layout)
+{
+	/* runtime mirrors of the key compile-time guards, for visibility */
+	zassert_equal(sizeof(arb_header_t), 16);
+	zassert_equal(offsetof(arb_header_t, seq), 8);
+	zassert_equal(offsetof(arb_header_t, type), 12);
+	zassert_equal(offsetof(arb_header_t, source), 14);
+	zassert_equal(sizeof(arb_heartbeat_t), 24);
+	zassert_true(sizeof(arb_log_t) <= ARB_MSG_MAX_SIZE);
+}
+
 ZTEST_SUITE(arb, NULL, NULL, NULL, NULL, NULL);

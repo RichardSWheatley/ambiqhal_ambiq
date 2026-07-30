@@ -133,11 +133,16 @@ typedef struct {
 	arb_pose2d_data_t pose;
 } arb_pose2d_t;
 
-/** @brief Short text log line, fixed capacity (no heap). */
+/**
+ * @brief Short text log line, fixed capacity (no heap).
+ *
+ * text is sized so the whole struct (with alignment padding) fits inside
+ * ARB_MSG_MAX_SIZE and can be framed onto the wire.
+ */
 typedef struct {
 	arb_header_t header;
 	uint8_t      level;    /**< @ref arb_log_level_t */
-	char         text[48];
+	char         text[40];
 } arb_log_t;
 
 /** @brief Node liveness beacon, published on @c arb_chan_heartbeat. */

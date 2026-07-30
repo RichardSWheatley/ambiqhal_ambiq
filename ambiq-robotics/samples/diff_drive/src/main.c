@@ -21,6 +21,8 @@
  * SPDX-License-Identifier: Apache-2.0
  * Copyright (c) 2026 Ambiq Micro Inc. <www.ambiq.com>
  */
+#include <math.h>
+
 #include <zephyr/kernel.h>
 #include <zephyr/device.h>
 #include <zephyr/devicetree.h>
@@ -28,6 +30,7 @@
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/i2c.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/sys/atomic.h>
 #include <zephyr/zbus/zbus.h>
 
 #include "arb/topics.h"
@@ -147,7 +150,8 @@ static arb_pid_t pid_l, pid_r;
 static float sp_wl, sp_wr;        /* wheel setpoints, rad/s */
 static bool  drive_enabled;
 static struct { float x, y, th; } odom_pose;
-static uint32_t seq;
+/* shared by the control workqueue and the IMU thread */
+static atomic_t seq;
 static arb_node_t *drive_node;
 
 static uint64_t stamp_us(void)
@@ -239,7 +243,8 @@ static void control_fn(struct k_work *work)
 
 		for (int i = 0; i < 2; i++) {
 			arb_header_init(&em.header, ARB_MSG_ENCODER,
-					drive_node->id, stamp_us(), seq++);
+					drive_node->id, stamp_us(),
+					(uint32_t)atomic_inc(&seq));
 			em.encoder_id     = (uint8_t)i;
 			em.count          = enc[i].count;
 			em.position_rad   = (float)enc[i].count * 2.0f *
@@ -251,7 +256,7 @@ static void control_fn(struct k_work *work)
 		arb_odom_t od = { 0 };
 
 		arb_header_init(&od.header, ARB_MSG_ODOM, drive_node->id,
-				stamp_us(), seq++);
+				stamp_us(), (uint32_t)atomic_inc(&seq));
 		od.pose.x      = odom_pose.x;
 		od.pose.y      = odom_pose.y;
 		od.pose.theta  = odom_pose.th;
@@ -315,7 +320,7 @@ static void imu_thread(void *a, void *b, void *c)
 			int16_t gz = (int16_t)((raw[12] << 8) | raw[13]);
 
 			arb_header_init(&m.header, ARB_MSG_IMU, 0, stamp_us(),
-					seq++);
+					(uint32_t)atomic_inc(&seq));
 			m.accel.x = ax * ACCEL_SCALE;
 			m.accel.y = ay * ACCEL_SCALE;
 			m.accel.z = az * ACCEL_SCALE;
