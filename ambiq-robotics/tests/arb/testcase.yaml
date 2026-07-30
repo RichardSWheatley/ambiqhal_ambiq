@@ -3,6 +3,23 @@ tests:
     tags: arb
     platform_allow:
       - native_sim
+      - native_sim/native/64
       - qemu_cortex_m3
     integration_platforms:
       - native_sim
+  arb.transport.udp_loopback:
+    tags: arb
+    platform_allow:
+      - native_sim
+      - native_sim/native/64
+    integration_platforms:
+      - native_sim
+    extra_configs:
+      - CONFIG_ARB_TRANSPORT=y
+      - CONFIG_ARB_TRANSPORT_UDP=y
+      - CONFIG_NETWORKING=y
+      - CONFIG_NET_DRIVERS=y
+      - CONFIG_NET_SOCKETS=y
+      - CONFIG_NET_SOCKETS_OFFLOAD=y
+      - CONFIG_NET_NATIVE_OFFLOADED_SOCKETS=y
+      - CONFIG_ETH_NATIVE_TAP=n

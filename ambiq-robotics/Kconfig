@@ -51,13 +51,53 @@ config ARB_TIME_PTP
 endchoice
 
 config ARB_TRANSPORT
-	bool "Serial transport (bridge channels over a UART)"
-	depends on SERIAL
-	depends on UART_INTERRUPT_DRIVEN
+	bool "Channel transport (bridge exported channels to a peer)"
 	select ZBUS_RUNTIME_OBSERVERS
 	help
-	  Frame exported zbus channels over the UART named by the devicetree
-	  chosen node "arb,uart" and publish received frames onto the matching
-	  channels. Wire format: 0x7E | topic(2) | len(2) | payload | crc16.
+	  Frame exported zbus channels toward a peer and publish received
+	  frames onto the matching channels. Wire format:
+	  0x7E | topic(2) | len(2) | payload | crc16, independent of the
+	  backend carrying the bytes.
+
+if ARB_TRANSPORT
+
+choice ARB_TRANSPORT_BACKEND
+	prompt "Transport backend"
+	default ARB_TRANSPORT_SERIAL
+
+config ARB_TRANSPORT_SERIAL
+	bool "Serial (UART)"
+	depends on SERIAL
+	depends on UART_INTERRUPT_DRIVEN
+	help
+	  Bridge over the UART named by the devicetree chosen node
+	  "arb,uart".
+
+config ARB_TRANSPORT_UDP
+	bool "UDP socket"
+	depends on NET_SOCKETS
+	help
+	  Bridge over a UDP socket (whole frames inside datagrams). On
+	  native_sim, combine with NSOS offloaded sockets
+	  (CONFIG_NET_NATIVE_OFFLOADED_SOCKETS) for zero host setup.
+
+endchoice
+
+config ARB_TRANSPORT_UDP_LOCAL_PORT
+	int "UDP local port"
+	depends on ARB_TRANSPORT_UDP
+	default 17447
+
+config ARB_TRANSPORT_UDP_PEER_ADDR
+	string "UDP peer IPv4 address"
+	depends on ARB_TRANSPORT_UDP
+	default "127.0.0.1"
+
+config ARB_TRANSPORT_UDP_PEER_PORT
+	int "UDP peer port"
+	depends on ARB_TRANSPORT_UDP
+	default 17447
+
+endif # ARB_TRANSPORT
 
 endif # ARB
