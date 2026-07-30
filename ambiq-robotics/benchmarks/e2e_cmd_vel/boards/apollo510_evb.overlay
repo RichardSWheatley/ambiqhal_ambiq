@@ -1,0 +1,71 @@
+/*
+ * Mirrors the diff_drive sample wiring: PWM on TIMER3/TIMER4 (CT12/CT18),
+ * the echo link on UART1, and two spare pins for scope cross-checks of
+ * the measured interval (publish edge on P14, actuation edge on P15 -
+ * verify they are free on your rig).
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ * Copyright (c) 2026 Ambiq Micro Inc. <www.ambiq.com>
+ */
+
+#include <zephyr/dt-bindings/pwm/pwm.h>
+
+/ {
+	chosen {
+		arb,uart = &uart1;
+	};
+
+	zephyr,user {
+		pwms = <&pwm3 0 PWM_HZ(20000) PWM_POLARITY_NORMAL>,
+		       <&pwm4 0 PWM_HZ(20000) PWM_POLARITY_NORMAL>;
+		bench-gpios = <&gpio0 14 GPIO_ACTIVE_HIGH>,
+			      <&gpio0 15 GPIO_ACTIVE_HIGH>;
+	};
+};
+
+&uart1 {
+	status = "okay";
+	current-speed = <921600>;
+	pinctrl-0 = <&uart1_default>;
+	pinctrl-names = "default";
+};
+
+&timer3 {
+	pwm3: pwm {
+		status = "okay";
+		pinctrl-0 = <&pwm3_default>;
+		pinctrl-names = "default";
+	};
+};
+
+&timer4 {
+	pwm4: pwm {
+		status = "okay";
+		pinctrl-0 = <&pwm4_default>;
+		pinctrl-names = "default";
+	};
+};
+
+&pinctrl {
+	uart1_default: uart1_default {
+		group1 {
+			pinmux = <UART1TX_P41>;
+		};
+		group2 {
+			pinmux = <UART1RX_P43>;
+			input-enable;
+		};
+	};
+
+	pwm3_default: pwm3_default {
+		group1 {
+			pinmux = <CT12_P12>;
+		};
+	};
+
+	pwm4_default: pwm4_default {
+		group1 {
+			pinmux = <CT18_P18>;
+		};
+	};
+};
