@@ -1,7 +1,0 @@
-# ARB NuttX sample - registration
-#
-# SPDX-License-Identifier: Apache-2.0
-
-ifneq ($(CONFIG_ARB_DIFFDRIVE),)
-CONFIGURED_APPS += $(APPDIR)/examples/arb_diffdrive
-endif

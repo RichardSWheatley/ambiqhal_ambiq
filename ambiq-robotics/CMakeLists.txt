@@ -1,28 +1,21 @@
-# Ambiq Robotics Broker (ARB) - top-level CMake (host / standalone builds).
-#
-# This drives host builds and the unit tests; firmware integrations use the
-# per-target glue instead (port/zephyr/CMakeLists.txt, port/ambiqsuite/arb.mk).
-#
-#   cmake -S ambiq-robotics -B build -DARB_BUILD_TESTS=ON
-#   cmake --build build
-#   ctest --test-dir build --output-on-failure
+# Ambiq Robotics Broker (ARB) - Zephyr module
 #
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 Ambiq Micro Inc. <www.ambiq.com>
 
-cmake_minimum_required(VERSION 3.20)
-project(ambiq_robotics C)
+if(CONFIG_ARB)
 
-option(ARB_BUILD_TESTS "Build the host unit tests" OFF)
-option(ARB_BUILD_SAMPLES "Build the host-runnable samples" OFF)
+zephyr_include_directories(include)
 
-add_subdirectory(core)
+zephyr_library_named(arb)
+zephyr_library_sources(
+  src/topics.c
+  src/node.c
+  src/serial.c
+  src/control/pid.c
+  src/control/diff_drive.c
+)
+zephyr_library_sources_ifdef(CONFIG_ARB_TRANSPORT src/transport.c)
+zephyr_library_sources_ifdef(CONFIG_ARB_MICRO_ROS_BRIDGE bridge/micro_ros.c)
 
-if(ARB_BUILD_TESTS)
-  enable_testing()
-  add_subdirectory(tests)
-endif()
-
-if(ARB_BUILD_SAMPLES)
-  add_subdirectory(samples/jaus)
 endif()

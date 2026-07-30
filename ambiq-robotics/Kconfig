@@ -1,0 +1,60 @@
+# Ambiq Robotics Broker (ARB) - Zephyr module
+#
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Ambiq Micro Inc. <www.ambiq.com>
+
+menuconfig ARB
+	bool "Ambiq Robotics Broker (ARB)"
+	select ZBUS
+	help
+	  Robotics building blocks on top of zbus: a shared message vocabulary
+	  (arb/msg.h), well-known channels (arb/topics.h), JAUS/ROS2-style node
+	  lifecycle with emergency stop (arb/node.h), and control helpers
+	  (PID, differential-drive kinematics). Messaging is plain zbus.
+
+if ARB
+
+module = ARB
+module-str = arb
+source "subsys/logging/Kconfig.template.log_config"
+
+config ARB_MAX_NODES
+	int "Maximum number of lifecycle nodes"
+	default 8
+
+config ARB_HEARTBEAT_TICK_MS
+	int "Heartbeat scheduler resolution (ms)"
+	default 100
+	help
+	  Node heartbeats are published from a delayable work item that runs at
+	  this period; individual node periods round up to it.
+
+config ARB_TRANSPORT
+	bool "Serial transport (bridge channels over a UART)"
+	depends on SERIAL
+	depends on UART_INTERRUPT_DRIVEN
+	select ZBUS_RUNTIME_OBSERVERS
+	help
+	  Frame exported zbus channels over the UART named by the devicetree
+	  chosen node "arb,uart" and publish received frames onto the matching
+	  channels. Wire format: 0x7E | topic(2) | len(2) | payload | crc16.
+
+config ARB_MICRO_ROS_BRIDGE
+	bool "micro-ROS bridge"
+	help
+	  Mirror ARB channels into a ROS 2 graph via micro-ROS. Requires the
+	  micro_ros_zephyr module and a configured micro-ROS transport.
+
+if ARB_MICRO_ROS_BRIDGE
+
+config ARB_MICRO_ROS_STACK_SIZE
+	int "micro-ROS executor thread stack size"
+	default 4096
+
+config ARB_MICRO_ROS_PRIORITY
+	int "micro-ROS executor thread priority"
+	default 7
+
+endif # ARB_MICRO_ROS_BRIDGE
+
+endif # ARB

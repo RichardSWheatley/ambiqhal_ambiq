@@ -1,0 +1,8 @@
+tests:
+  arb.core:
+    tags: arb
+    platform_allow:
+      - native_sim
+      - qemu_cortex_m3
+    integration_platforms:
+      - native_sim
