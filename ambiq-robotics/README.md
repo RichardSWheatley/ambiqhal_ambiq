@@ -16,8 +16,6 @@ the part Zephyr doesn't have:
    UART (`0x7E | topic | len | payload | crc16`, wire-compatible with the
    multi-OS ARB tree on `wheatley-robotics-updates`), so two boards — or a
    board and a host — share one topic space.
-4. **micro-ROS bridge** (`bridge/micro_ros.c`, optional) — mirrors the
-   channels into a ROS 2 graph.
 
 Plus small pure-math control helpers (`arb/control/`): PID and diff-drive
 kinematics.
@@ -27,7 +25,6 @@ kinematics.
 ```
 include/arb/        msg.h topics.h node.h serial.h transport.h err.h control/
 src/                topics.c node.c serial.c transport.c control/
-bridge/             micro_ros.c
 samples/diff_drive/ closed-loop base on the Apollo510 EVB
 tests/arb/          ztest suite (native_sim)
 zephyr/module.yml
@@ -40,7 +37,6 @@ Add as a Zephyr module and enable:
 ```
 CONFIG_ARB=y
 CONFIG_ARB_TRANSPORT=y          # needs: chosen { arb,uart = &uartX; }
-CONFIG_ARB_MICRO_ROS_BRIDGE=y   # needs micro_ros_zephyr
 ```
 
 Publish/observe with plain zbus:

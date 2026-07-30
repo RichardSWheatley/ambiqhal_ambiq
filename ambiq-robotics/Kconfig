@@ -39,22 +39,4 @@ config ARB_TRANSPORT
 	  chosen node "arb,uart" and publish received frames onto the matching
 	  channels. Wire format: 0x7E | topic(2) | len(2) | payload | crc16.
 
-config ARB_MICRO_ROS_BRIDGE
-	bool "micro-ROS bridge"
-	help
-	  Mirror ARB channels into a ROS 2 graph via micro-ROS. Requires the
-	  micro_ros_zephyr module and a configured micro-ROS transport.
-
-if ARB_MICRO_ROS_BRIDGE
-
-config ARB_MICRO_ROS_STACK_SIZE
-	int "micro-ROS executor thread stack size"
-	default 4096
-
-config ARB_MICRO_ROS_PRIORITY
-	int "micro-ROS executor thread priority"
-	default 7
-
-endif # ARB_MICRO_ROS_BRIDGE
-
 endif # ARB

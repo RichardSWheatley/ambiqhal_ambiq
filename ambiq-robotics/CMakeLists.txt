@@ -16,6 +16,5 @@ zephyr_library_sources(
   src/control/diff_drive.c
 )
 zephyr_library_sources_ifdef(CONFIG_ARB_TRANSPORT src/transport.c)
-zephyr_library_sources_ifdef(CONFIG_ARB_MICRO_ROS_BRIDGE bridge/micro_ros.c)
 
 endif()
