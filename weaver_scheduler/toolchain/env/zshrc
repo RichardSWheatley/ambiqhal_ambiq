@@ -1,0 +1,5 @@
+# Interactive shell for the Desktop shortcut: load the user's normal setup, then Zephyr.
+export ZDOTDIR="$HOME"
+[[ -f "$HOME/.zprofile" ]] && source "$HOME/.zprofile"
+[[ -f "$HOME/.zshrc" ]] && source "$HOME/.zshrc"
+source "$HOME/zephyrproject/zephyr-env.sh"
