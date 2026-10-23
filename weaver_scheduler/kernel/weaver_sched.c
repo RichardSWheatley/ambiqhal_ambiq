@@ -157,7 +157,7 @@ uint32_t weaver_calculate_pressure(const struct weaver_thread_data *t)
  * WEAVER_PRESSURE_WARP. NULL or !in_use slots also get zero inputs and
  * a zero output, which is correct (no pressure, never wins dispatch).
  */
-static inline void gather_inputs(const struct weaver_thread_data *wd,
+static inline __maybe_unused void gather_inputs(const struct weaver_thread_data *wd,
 				 uint32_t *prio, uint32_t *fill, uint32_t *aged)
 {
 	if (wd == NULL || !wd->in_use || wd->is_warp) {
@@ -199,7 +199,7 @@ static void scalar_pressure_batch(const struct weaver_thread_data * const snap[]
  * Warp-thread lanes with WEAVER_PRESSURE_WARP. Shared by hybrid and
  * full-MVE paths.
  */
-static inline void fixup_warp_and_empty(const struct weaver_thread_data * const snap[],
+static inline __maybe_unused void fixup_warp_and_empty(const struct weaver_thread_data * const snap[],
 					uint32_t pressures[],
 					size_t base, size_t count)
 {
@@ -405,7 +405,7 @@ void weaver_set_buffer_fill_q16(struct weaver_thread_data *wd, uint32_t fill_q16
 	if (fill_q16 > WEAVER_Q16_ONE) {
 		fill_q16 = WEAVER_Q16_ONE;
 	}
-	wd->last_fill_q16 = wd->buffer_fill_q16;
+	wd->last_fill_q16 = fill_q16;
 	wd->buffer_fill_q16 = fill_q16;
 }
 
@@ -419,8 +419,9 @@ void weaver_set_buffer_fill_predictive_q16(struct weaver_thread_data *wd,
 		fill_q16 = WEAVER_Q16_ONE;
 	}
 
-	uint32_t prev = wd->buffer_fill_q16;
-	wd->last_fill_q16 = prev;
+	/* Extrapolate from the last raw sample, not the last projection. */
+	uint32_t prev = wd->last_fill_q16;
+	wd->last_fill_q16 = fill_q16;
 
 	/* One-step linear extrapolation: fill_next ~= fill + (fill - prev). */
 	uint32_t projected;

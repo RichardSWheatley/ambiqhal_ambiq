@@ -56,7 +56,7 @@ static void cleanup(void *fixture)
 
 /* -------- stress -------- */
 
-ZTEST(weaver_stress, rapid_register_unregister_churn)
+ZTEST(weaver_stress, test_rapid_register_unregister_churn)
 {
 	for (int iter = 0; iter < 1000; iter++) {
 		int rc = weaver_register(&stress_wd[0], &stress_threads[0],
@@ -67,7 +67,7 @@ ZTEST(weaver_stress, rapid_register_unregister_churn)
 	}
 }
 
-ZTEST(weaver_stress, fill_registry_then_drain_then_refill)
+ZTEST(weaver_stress, test_fill_registry_then_drain_then_refill)
 {
 	for (int round = 0; round < 3; round++) {
 		for (int i = 0; i < CONFIG_WEAVER_MAX_THREADS; i++) {
@@ -89,7 +89,7 @@ ZTEST(weaver_stress, fill_registry_then_drain_then_refill)
 	}
 }
 
-ZTEST(weaver_stress, runtime_weights_dont_corrupt)
+ZTEST(weaver_stress, test_runtime_weights_dont_corrupt)
 {
 	weaver_register(&stress_wd[0], &stress_threads[0],
 			WEAVER_TO_Q16(8), false);
@@ -115,7 +115,7 @@ ZTEST(weaver_stress, runtime_weights_dont_corrupt)
 
 /* -------- soak -------- */
 
-ZTEST(weaver_stress, soak_2s_tick_with_active_producers)
+ZTEST(weaver_stress, test_soak_2s_tick_with_active_producers)
 {
 	/* Light registry with 3 threads, drive weaver_tick() ~2000 times
 	 * (2 ms cadence) while flipping buffer fills. Verify no stat
@@ -152,7 +152,7 @@ ZTEST(weaver_stress, soak_2s_tick_with_active_producers)
 
 /* -------- negative -------- */
 
-ZTEST(weaver_stress, double_unregister_returns_enoent)
+ZTEST(weaver_stress, test_double_unregister_returns_enoent)
 {
 	weaver_register(&stress_wd[0], &stress_threads[0],
 			WEAVER_TO_Q16(5), false);
@@ -162,7 +162,7 @@ ZTEST(weaver_stress, double_unregister_returns_enoent)
 	zassert_equal(rc, -ENOENT, "double unregister should be -ENOENT got %d", rc);
 }
 
-ZTEST(weaver_stress, unregister_foreign_wd)
+ZTEST(weaver_stress, test_unregister_foreign_wd)
 {
 	struct weaver_thread_data foreign;
 	memset(&foreign, 0, sizeof(foreign));
@@ -172,7 +172,7 @@ ZTEST(weaver_stress, unregister_foreign_wd)
 		      "foreign wd unregister should be -ENOENT got %d", rc);
 }
 
-ZTEST(weaver_stress, weaver_tick_with_empty_registry_safe)
+ZTEST(weaver_stress, test_weaver_tick_with_empty_registry_safe)
 {
 	for (int i = 0; i < 100; i++) {
 		weaver_tick();  /* must not crash */
@@ -180,7 +180,7 @@ ZTEST(weaver_stress, weaver_tick_with_empty_registry_safe)
 	zassert_true(true, "should have completed");
 }
 
-ZTEST(weaver_stress, set_boost_levels_zero_no_op)
+ZTEST(weaver_stress, test_set_boost_levels_zero_no_op)
 {
 	weaver_register(&stress_wd[0], &stress_threads[0],
 			WEAVER_TO_Q16(5), false);
@@ -190,7 +190,7 @@ ZTEST(weaver_stress, set_boost_levels_zero_no_op)
 		      "zero boost should be no-op, got %d", stress_wd[0].boost_levels);
 }
 
-ZTEST(weaver_stress, deadline_zero_disables_countdown)
+ZTEST(weaver_stress, test_deadline_zero_disables_countdown)
 {
 	weaver_register(&stress_wd[0], &stress_threads[0],
 			WEAVER_TO_Q16(15), true);

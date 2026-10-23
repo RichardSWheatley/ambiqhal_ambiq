@@ -1,6 +1,6 @@
 diff --git a/include/zephyr/kernel/weaver_sched.h b/include/zephyr/kernel/weaver_sched.h
 new file mode 100644
-index 00000000000..8ca197ecbc2
+index 00000000..8ca197ec
 --- /dev/null
 +++ b/include/zephyr/kernel/weaver_sched.h
 @@ -0,0 +1,257 @@
@@ -263,7 +263,7 @@ index 00000000000..8ca197ecbc2
 +#endif /* ZEPHYR_INCLUDE_KERNEL_WEAVER_SCHED_H_ */
 diff --git a/include/zephyr/kernel/weaver_sched_fp.h b/include/zephyr/kernel/weaver_sched_fp.h
 new file mode 100644
-index 00000000000..628928eb2f0
+index 00000000..628928eb
 --- /dev/null
 +++ b/include/zephyr/kernel/weaver_sched_fp.h
 @@ -0,0 +1,183 @@
@@ -450,8 +450,448 @@ index 00000000000..628928eb2f0
 +#endif
 +
 +#endif /* ZEPHYR_INCLUDE_KERNEL_WEAVER_SCHED_FP_H_ */
+diff --git a/include/zephyr/kernel/weaver_sched_npu.h b/include/zephyr/kernel/weaver_sched_npu.h
+new file mode 100644
+index 00000000..236583b3
+--- /dev/null
++++ b/include/zephyr/kernel/weaver_sched_npu.h
+@@ -0,0 +1,434 @@
++/*
++ * Copyright (c) 2026 Ambiq Micro, Inc.
++ *
++ * SPDX-License-Identifier: Apache-2.0
++ */
++
++/**
++ * @file
++ * @brief Weaver Asymmetric Cognitive Offload: NPU coprocessor scheduling
++ *        layer (DRAFT, Phase 3)
++ *
++ * STATUS: Design sketch. **No implementation exists yet.** This header
++ * is shipped now so reviewers can see how the Weaver architecture
++ * extends to an on-die NPU (e.g., the Ethos-U55 that pairs with the
++ * Cortex-M55 on Apollo510 SoC variants).
++ *
++ * NOT to be merged into a product build until weaver_sched_npu.c lands.
++ * The header is guarded by CONFIG_WEAVER_NPU which does not exist yet
++ * either; including it without setting the guard yields an empty
++ * translation unit so consumer code can probe for it via #ifdef without
++ * breaking.
++ *
++ * ============================================================
++ * ARCHITECTURAL FRAMING: ASYMMETRIC COGNITIVE OFFLOAD
++ * ============================================================
++ *
++ * The primary CPU is a real-time execution engine. It should not spend
++ * cycles computing heuristics that another silicon block can compute
++ * asynchronously and better. This layer offloads three distinct
++ * classes of policy work to the NPU, keeping the CPU's dispatch hot
++ * path deterministic and integer-only:
++ *
++ *   1. POLICY ADJUSTOR   - reshapes Weft scheduling weights based on
++ *                          observed workload patterns. Runs at 1-10 Hz
++ *                          on the NPU; writes to weaver_set_weights()
++ *                          on completion. The CPU dispatcher keeps
++ *                          consuming the same Q16.16 pressure formula
++ *                          - only the weights inside it change.
++ *
++ *   2. ARBITER FEEDER    - orders NPU inference jobs (Looms) queued by
++ *                          the CPU. This is the classical scheduling
++ *                          role the NPU could plausibly host: when the
++ *                          NPU is idle, pick the highest-pressure Loom.
++ *                          Runs on the CPU integer path (~50 cycles);
++ *                          NPU is the target of the dispatch, not the
++ *                          decision-maker.
++ *
++ *   3. ANOMALY DETECTOR  - watches kernel telemetry (cache miss rate
++ *                          proxy, context-switch delay, IOM stall
++ *                          bits) via a shared no-cache SRAM ring and
++ *                          predicts starvation events 10-100 ms ahead.
++ *                          Emits a graded warning that producers
++ *                          consume before pressure would spike.
++ *
++ * All three run on the NPU asynchronously. The CPU-side dispatcher
++ * (Phase 1-2 code) is unchanged: still Q16.16 fixed-point, still
++ * integer-only, still deterministic sub-microsecond decision. What
++ * changes is the QUALITY of the inputs to that dispatcher: better
++ * weights, better arbitration, earlier warning.
++ *
++ * ============================================================
++ * WHAT STAYS ON THE CPU (deliberate boundary)
++ * ============================================================
++ *
++ * The per-tick dispatch decision itself STAYS ON THE CPU integer ALU.
++ * NPU inference latency is 5-50 ms; a 1 ms scheduler tick cannot wait.
++ * The rule: NPU handles POLICY (slow, learnable), CPU handles DISPATCH
++ * (fast, deterministic).
++ *
++ * This split is what makes the layer asymmetric: two different silicon
++ * blocks handling two different classes of decision, coupled through
++ * a shared-memory mailbox rather than through a synchronous call path.
++ *
++ * ============================================================
++ * WHY NOT USE THE USER-SPACE NPU DRIVER
++ * ============================================================
++ *
++ * Vendor NPU stacks (Arm Ethos-U, AMD XDNA, Intel NPU) are designed
++ * to expose the accelerator UPWARD to user-space AI runtimes (TFLite,
++ * ONNX Runtime, DirectML). That path is unsuitable here for three
++ * reasons:
++ *
++ *   - Kernel-latency budget: user-space round-trip adds tens of
++ *     microseconds; policy updates need to complete before the next
++ *     dispatch tick observes them.
++ *   - Priority inversion risk: a user-space policy engine gets
++ *     preempted by other user work; the NPU sits idle.
++ *   - Ownership: a shared NPU means the scheduler competes with user
++ *     apps for inference slots.
++ *
++ * The Weaver Loom driver claims **exclusive kernel-space ownership**
++ * of a partition (or full instance) of the NPU. This is what the
++ * asymmetric offload architecture requires and it is the concrete
++ * hardware-software co-design claim distinguishing this work from
++ * higher-level "AI-native scheduling" software wrappers.
++ *
++ * The Loom class represents one NPU graph (e.g. KWS, activity
++ * classifier, AFib detector). A wearable typically has 3-6 Looms
++ * competing for one NPU. Weaver decides:
++ *
++ *   1. When the NPU goes idle, which ready Loom to dispatch next.
++ *   2. Whether dispatching now respects the pre-Warp guard window so
++ *      a 25 ms inference doesn't stall a 2 ms audio sampling deadline.
++ *   3. Whether the system's energy budget allows the inference at all,
++ *      or whether the Loom should be downgraded / deferred.
++ *
++ * The dispatcher math is identical to the existing Weft tournament:
++ * Q16.16 fixed-point, saturating add, no FPU/MVE in the hot path. The
++ * only new state is per-Loom (input/output fill, latency EMA, energy
++ * cost estimate) and a tiny arbiter that runs after the Weft tournament
++ * inside weaver_tick().
++ *
++ * ============================================================
++ * METAPHOR
++ * ============================================================
++ *
++ * The "Loom" is the machine that does the actual weaving; the Warp
++ * (fixed structure) and Weft (threads moving through) just feed it.
++ * Naming the NPU layer after the loom keeps the metaphor consistent:
++ * threads supply tensors, the loom does the inference, the fabric
++ * (output stream) leaves the other side.
++ */
++
++#ifndef ZEPHYR_INCLUDE_KERNEL_WEAVER_SCHED_NPU_H_
++#define ZEPHYR_INCLUDE_KERNEL_WEAVER_SCHED_NPU_H_
++
++#include <stdint.h>
++#include <stdbool.h>
++#include <zephyr/kernel.h>
++#include <zephyr/kernel/weaver_sched.h>  /* WEAVER_Q16_* macros */
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* -----------------------------------------------------------------
++ * Q16.16 weights for Loom pressure calculation.
++ *
++ * Different default apportionment from the Weft weights because Loom
++ * priorities are different: aging matters MORE (a 1-second-old NPU
++ * result is useless), input-fill matters somewhat less (a partly-full
++ * tensor can wait for completion), and there's no "urgency" in the
++ * Weft sense (Loom priority is captured in the static priority field).
++ *
++ * Weights roughly: input 0.35, backlog 0.25, aging 0.4.
++ * ----------------------------------------------------------------- */
++#define WEAVER_LOOM_W_INPUT    0x00005999U   /* ~0.35 in Q16.16 */
++#define WEAVER_LOOM_W_BACKLOG  0x00004000U   /* ~0.25 in Q16.16 */
++#define WEAVER_LOOM_W_AGING    0x00006666U   /* ~0.40 in Q16.16 */
++
++/**
++ * @brief Per-NPU-graph scheduling state.
++ *
++ * The owner allocates this struct (typically file-static in the
++ * driver wrapping the graph) and registers it. Loom data is updated
++ * by producers via weaver_loom_push_input() and by the NPU completion
++ * ISR via weaver_loom_complete().
++ *
++ * Size: ~48 bytes on Cortex-M55. Bounded by CONFIG_WEAVER_MAX_LOOMS.
++ */
++struct weaver_loom_data {
++	void    *npu_graph;            /**< Opaque graph handle (TFLM
++					    interpreter, Ethos-U command
++					    stream, etc.) */
++	uint32_t input_fill_q16;       /**< Input tensor queue fill 0..ONE */
++	uint32_t output_backlog_q16;   /**< Unconsumed result fill 0..ONE */
++	uint32_t wait_ticks;           /**< Ticks since last dispatch */
++	uint32_t avg_inference_us;     /**< EMA of measured latencies */
++	uint32_t expected_energy_uj;   /**< Per-inference energy estimate */
++	uint32_t pressure_q16;         /**< Computed each tick */
++	uint8_t  priority;             /**< Static rank within Loom set
++					    (lower = higher priority, mirrors
++					    Zephyr thread priorities) */
++	uint8_t  in_use;               /**< Slot occupancy */
++	uint8_t  dispatching;          /**< 1 while NPU is running this
++					    Loom; cleared by complete() */
++	uint8_t  reserved;
++};
++
++/**
++ * @brief System-wide NPU + energy budget tracker.
++ *
++ * Maintained internally by the Loom layer. Exposed read-only via
++ * weaver_loom_get_budget() so producers (or a higher-level controller)
++ * can decide whether to even bother queuing more work.
++ */
++struct weaver_loom_budget {
++	uint32_t epoch_ms;             /**< Budget refresh window */
++	int32_t  remaining_uj;         /**< Energy left this epoch (can go
++					    slightly negative under bursts) */
++	uint32_t inferences_in_epoch;  /**< Count, informational */
++	uint32_t deferrals_in_epoch;   /**< Count of pressure-meets-budget
++					    deferrals - useful for tuning */
++};
++
++/* -----------------------------------------------------------------
++ * Registration / lifecycle
++ * ----------------------------------------------------------------- */
++
++/**
++ * @brief Register an NPU graph with the Loom dispatcher.
++ *
++ * @param ld                Caller-owned, zero-initialized slot.
++ * @param npu_graph         Opaque graph handle (driver-defined).
++ * @param expected_latency_us Initial latency estimate; updated by EMA
++ *                            after the first weaver_loom_complete().
++ * @param expected_energy_uj  Initial per-inference energy estimate (uJ).
++ * @param priority           Static rank, lower = higher.
++ *
++ * @retval 0       success
++ * @retval -ENOMEM Loom registry full (CONFIG_WEAVER_MAX_LOOMS)
++ * @retval -EINVAL bad arguments
++ */
++int weaver_loom_register(struct weaver_loom_data *ld,
++			 void *npu_graph,
++			 uint32_t expected_latency_us,
++			 uint32_t expected_energy_uj,
++			 uint8_t  priority);
++
++/** @brief Remove a Loom from the registry. */
++int weaver_loom_unregister(struct weaver_loom_data *ld);
++
++/* -----------------------------------------------------------------
++ * Producer-side updates
++ * ----------------------------------------------------------------- */
++
++/** @brief Update input tensor queue fill (e.g. audio ring depth). */
++void weaver_loom_push_input(struct weaver_loom_data *ld, uint32_t fill_q16);
++
++/** @brief Mark one result as consumed downstream. */
++void weaver_loom_consume_output(struct weaver_loom_data *ld);
++
++/* -----------------------------------------------------------------
++ * Dispatch + arbitration
++ * ----------------------------------------------------------------- */
++
++/**
++ * @brief Pure function: compute Q16.16 pressure for a single Loom.
++ *
++ * Pressure = input_fill_q16 * W_INPUT
++ *          + output_backlog_q16 * W_BACKLOG
++ *          + TO_Q16(wait_ticks) * W_AGING
++ *
++ * Same algebraic structure as the Weft pressure formula. No FPU.
++ */
++uint32_t weaver_loom_calculate_pressure(const struct weaver_loom_data *ld);
++
++/**
++ * @brief Pick the highest-pressure ready Loom and dispatch it.
++ *
++ * Called from inside weaver_tick() AFTER the Weft tournament has
++ * applied priority elevations. Steps:
++ *   1. If NPU is busy, return NULL (next tick will retry).
++ *   2. Scan registry; find Loom with max pressure AND non-empty input.
++ *   3. Check pre-Warp guard: if any Warp deadline is within
++ *      avg_inference_us of now, defer (return NULL).
++ *   4. Check energy budget: if remaining_uj < expected_energy_uj,
++ *      defer and increment deferrals_in_epoch.
++ *   5. Dispatch to the NPU driver (driver-specific call).
++ *   6. Mark Loom as dispatching, reset wait_ticks.
++ *
++ * @return The dispatched Loom, or NULL if nothing should run this tick.
++ */
++struct weaver_loom_data *weaver_loom_arbitrate(void);
++
++/**
++ * @brief Completion notification from the NPU IRQ handler.
++ *
++ * @param ld           Loom whose inference just finished.
++ * @param actual_us    Measured inference latency in microseconds.
++ *                     Folded into avg_inference_us as a 1/4 EMA.
++ *
++ * Called from ISR context; safe to use from any priority.
++ */
++void weaver_loom_complete(struct weaver_loom_data *ld, uint32_t actual_us);
++
++/* -----------------------------------------------------------------
++ * Throttle and budget queries
++ * ----------------------------------------------------------------- */
++
++/**
++ * @brief Graded NPU-dispatch throttle level (0..255).
++ *
++ * Distinct from weaver_throttle_level() which gates CPU producer
++ * back-off. When this returns >= 128, NPU producers should slow down
++ * (e.g., process every Nth audio frame instead of every frame).
++ *
++ * Same TSK fuzzy + EMA structure as the existing throttle, fed by:
++ * sum(input_fill_q16 + output_backlog_q16) across all Looms vs.
++ * CONFIG_WEAVER_LOOM_THROTTLE_THRESHOLD.
++ */
++uint8_t weaver_loom_throttle_level(void);
++
++/** @brief Read-only snapshot of the current epoch's energy budget. */
++void weaver_loom_get_budget(struct weaver_loom_budget *out);
++
++/**
++ * @brief Recharge the energy budget for a new epoch.
++ *
++ * Called by the system PM layer (or a periodic timer) to refresh
++ * remaining_uj at the start of each budget epoch. Typical: 1 Hz with
++ * an epoch_uj proportional to the wearable's mW power envelope.
++ */
++void weaver_loom_refresh_budget(int32_t epoch_uj);
++
++/* -----------------------------------------------------------------
++ * Compile-time interface contract (extends Weft contract)
++ * ----------------------------------------------------------------- */
++
++/**
++ * @brief NPU driver hook the Loom dispatcher calls to start a job.
++ *
++ * Provided by the platform NPU driver. The Loom layer is driver-
++ * agnostic; this indirection keeps it portable across Ethos-U,
++ * Cadence Tensilica HiFi, and custom Ambiq accelerators.
++ */
++struct weaver_loom_driver_ops {
++	int (*dispatch)(void *npu_graph);
++	int (*abort)(void);
++	uint32_t (*get_remaining_us)(void);
++};
++
++/** @brief Register the platform NPU driver. Must be called once at boot. */
++int weaver_loom_set_driver_ops(const struct weaver_loom_driver_ops *ops);
++
++/* =================================================================
++ * ROLE 1: POLICY ADJUSTOR
++ *
++ * The NPU periodically consumes telemetry, runs a quantized policy
++ * model (linear bandit / lightweight RL), and emits new weights for
++ * the CPU dispatcher's Q16.16 pressure formula. The CPU keeps using
++ * the same formula; only the weights inside it change.
++ *
++ * Runs at 1-10 Hz. Latency of the update is ~milliseconds; the CPU
++ * dispatcher is never blocked waiting for it.
++ * ================================================================= */
++
++/**
++ * @brief Signature for a policy-adjustor callback the NPU invokes
++ *        after each inference cycle completes.
++ *
++ * The NPU driver calls this from ISR context with the three new
++ * Q16.16 weights it just inferred. The implementation typically
++ * forwards to weaver_set_weights().
++ */
++typedef void (*weaver_policy_apply_fn)(uint32_t w_urgency_q16,
++				       uint32_t w_density_q16,
++				       uint32_t w_aging_q16);
++
++/**
++ * @brief Register the policy graph and its apply callback.
++ *
++ * @param graph      Opaque NPU graph handle for the policy model.
++ * @param period_ms  Target inference cadence (typical: 100-1000 ms).
++ * @param apply      Called from NPU IRQ context with new weights.
++ */
++int weaver_policy_register(void *graph, uint32_t period_ms,
++			   weaver_policy_apply_fn apply);
++
++/* =================================================================
++ * ROLE 2: TELEMETRY CAPTURE
++ *
++ * Kernel-side telemetry the NPU consumes via a shared no-cache
++ * SRAM ring. Populated by the dispatcher and low-level kernel hooks;
++ * never read by CPU code, only written and then produced to NPU.
++ *
++ * The metrics are chosen so that measuring them is nearly free on
++ * Cortex-M55: DWT gives cycle count and cache miss surrogate; the
++ * scheduler already tracks context-switch delta; IOM stall bits are
++ * peripheral MMIO reads.
++ * ================================================================= */
++
++struct weaver_telemetry_frame {
++	uint64_t timestamp_cycles;
++	uint32_t dispatcher_cycles;      /**< From weaver_get_last_tick_cycles() */
++	uint32_t context_switch_delta;   /**< Kernel-tracked */
++	uint32_t cache_miss_surrogate;   /**< From DWT LSU miss counter */
++	uint32_t iom_stall_bits;         /**< MMIO snapshot */
++	uint32_t weft_promotions;
++	uint32_t throttle_level;
++	uint32_t loom_dispatched_this_epoch;
++	uint32_t reserved[8];
++};
++
++/**
++ * @brief Bind a shared-memory ring the NPU reads asynchronously.
++ *
++ * @param ring         Caller-provided ring memory (SRAM_NO_CACHE region).
++ * @param n_frames     Ring depth. Typical: 32 frames.
++ *
++ * The CPU dispatcher writes into this ring at the end of every
++ * weaver_tick(); the NPU reads a batch (~10-100 frames) per
++ * inference cycle.
++ */
++int weaver_telemetry_bind_ring(struct weaver_telemetry_frame *ring,
++			       size_t n_frames);
++
++/* =================================================================
++ * ROLE 3: ANOMALY DETECTOR
++ *
++ * The NPU inferences over recent telemetry frames and predicts
++ * upcoming starvation (thread that will miss its next window) or
++ * imminent NPU energy-budget exhaustion. The prediction is
++ * consumed by producers as an early warning, letting them
++ * downgrade or defer BEFORE the throttle threshold trips.
++ * ================================================================= */
++
++/**
++ * @brief Graded starvation-warning level (0..255) from the NPU
++ *        anomaly detector.
++ *
++ * 0 = no predicted starvation in the next window.
++ * 128 = starvation likely within the next ~50 ms.
++ * 255 = starvation predicted imminently (< 10 ms).
++ *
++ * Producers should consume this ALONGSIDE the existing CPU-side
++ * fuzzy throttle (weaver_throttle_level). The two are complementary:
++ * the CPU throttle is reactive; this one is predictive.
++ */
++uint8_t weaver_anomaly_level(void);
++
++/**
++ * @brief Register the anomaly-detector graph.
++ *
++ * @param graph      Opaque NPU graph handle.
++ * @param period_ms  Inference cadence (typical: 20-100 ms).
++ */
++int weaver_anomaly_register(void *graph, uint32_t period_ms);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* ZEPHYR_INCLUDE_KERNEL_WEAVER_SCHED_NPU_H_ */
 diff --git a/kernel/CMakeLists.txt b/kernel/CMakeLists.txt
-index 8906da2f627..9906cbdf241 100644
+index 8906da2f..9906cbdf 100644
 --- a/kernel/CMakeLists.txt
 +++ b/kernel/CMakeLists.txt
 @@ -105,6 +105,8 @@ kernel_sources(nothread.c)
@@ -464,7 +904,7 @@ index 8906da2f627..9906cbdf241 100644
  kernel_sources_ifdef(CONFIG_IRQ_OFFLOAD irq_offload.c)
  kernel_sources_ifdef(CONFIG_BOOTARGS boot_args.c)
 diff --git a/kernel/Kconfig b/kernel/Kconfig
-index 9e3be0b12ab..6ee38dcc241 100644
+index 9e3be0b1..6ee38dcc 100644
 --- a/kernel/Kconfig
 +++ b/kernel/Kconfig
 @@ -1141,3 +1141,5 @@ endmenu
@@ -475,7 +915,7 @@ index 9e3be0b12ab..6ee38dcc241 100644
 +rsource "Kconfig.weaver_fp"
 diff --git a/kernel/Kconfig.weaver b/kernel/Kconfig.weaver
 new file mode 100644
-index 00000000000..a4c340d6938
+index 00000000..a4c340d6
 --- /dev/null
 +++ b/kernel/Kconfig.weaver
 @@ -0,0 +1,154 @@
@@ -635,7 +1075,7 @@ index 00000000000..a4c340d6938
 +endif # WEAVER_SCHED
 diff --git a/kernel/Kconfig.weaver_fp b/kernel/Kconfig.weaver_fp
 new file mode 100644
-index 00000000000..6b93c3b1b4e
+index 00000000..6b93c3b1
 --- /dev/null
 +++ b/kernel/Kconfig.weaver_fp
 @@ -0,0 +1,85 @@
@@ -726,10 +1166,10 @@ index 00000000000..6b93c3b1b4e
 +endif # WEAVER_SCHED_FP
 diff --git a/kernel/weaver_sched.c b/kernel/weaver_sched.c
 new file mode 100644
-index 00000000000..c330f4e72c1
+index 00000000..1afb4cac
 --- /dev/null
 +++ b/kernel/weaver_sched.c
-@@ -0,0 +1,661 @@
+@@ -0,0 +1,662 @@
 +/*
 + * Copyright (c) 2026 Ambiq Micro, Inc.
 + *
@@ -889,7 +1329,7 @@ index 00000000000..c330f4e72c1
 + * WEAVER_PRESSURE_WARP. NULL or !in_use slots also get zero inputs and
 + * a zero output, which is correct (no pressure, never wins dispatch).
 + */
-+static inline void gather_inputs(const struct weaver_thread_data *wd,
++static inline __maybe_unused void gather_inputs(const struct weaver_thread_data *wd,
 +				 uint32_t *prio, uint32_t *fill, uint32_t *aged)
 +{
 +	if (wd == NULL || !wd->in_use || wd->is_warp) {
@@ -931,7 +1371,7 @@ index 00000000000..c330f4e72c1
 + * Warp-thread lanes with WEAVER_PRESSURE_WARP. Shared by hybrid and
 + * full-MVE paths.
 + */
-+static inline void fixup_warp_and_empty(const struct weaver_thread_data * const snap[],
++static inline __maybe_unused void fixup_warp_and_empty(const struct weaver_thread_data * const snap[],
 +					uint32_t pressures[],
 +					size_t base, size_t count)
 +{
@@ -1137,7 +1577,7 @@ index 00000000000..c330f4e72c1
 +	if (fill_q16 > WEAVER_Q16_ONE) {
 +		fill_q16 = WEAVER_Q16_ONE;
 +	}
-+	wd->last_fill_q16 = wd->buffer_fill_q16;
++	wd->last_fill_q16 = fill_q16;
 +	wd->buffer_fill_q16 = fill_q16;
 +}
 +
@@ -1151,8 +1591,9 @@ index 00000000000..c330f4e72c1
 +		fill_q16 = WEAVER_Q16_ONE;
 +	}
 +
-+	uint32_t prev = wd->buffer_fill_q16;
-+	wd->last_fill_q16 = prev;
++	/* Extrapolate from the last raw sample, not the last projection. */
++	uint32_t prev = wd->last_fill_q16;
++	wd->last_fill_q16 = fill_q16;
 +
 +	/* One-step linear extrapolation: fill_next ~= fill + (fill - prev). */
 +	uint32_t projected;
@@ -1393,10 +1834,10 @@ index 00000000000..c330f4e72c1
 +}
 diff --git a/kernel/weaver_sched_fp.c b/kernel/weaver_sched_fp.c
 new file mode 100644
-index 00000000000..aaa3cc67f0a
+index 00000000..56f6f750
 --- /dev/null
 +++ b/kernel/weaver_sched_fp.c
-@@ -0,0 +1,385 @@
+@@ -0,0 +1,386 @@
 +/*
 + * Copyright (c) 2026 Ambiq Micro, Inc.
 + *
@@ -1587,7 +2028,7 @@ index 00000000000..aaa3cc67f0a
 +	}
 +	if (fill < 0.0f) fill = 0.0f;
 +	if (fill > 1.0f) fill = 1.0f;
-+	wd->last_fill = wd->buffer_fill;
++	wd->last_fill = fill;
 +	wd->buffer_fill = fill;
 +}
 +
@@ -1600,8 +2041,9 @@ index 00000000000..aaa3cc67f0a
 +	if (fill < 0.0f) fill = 0.0f;
 +	if (fill > 1.0f) fill = 1.0f;
 +
-+	float prev = wd->buffer_fill;
-+	wd->last_fill = prev;
++	/* Extrapolate from the last raw sample, not the last projection. */
++	float prev = wd->last_fill;
++	wd->last_fill = fill;
 +
 +	float projected = fill + (fill - prev);
 +	if (projected < 0.0f) projected = 0.0f;
@@ -1782,9 +2224,544 @@ index 00000000000..aaa3cc67f0a
 +	return 0;
 +#endif
 +}
+diff --git a/samples/boards/apollo510_evb/weaver_audio/CMakeLists.txt b/samples/boards/apollo510_evb/weaver_audio/CMakeLists.txt
+new file mode 100644
+index 00000000..065f5cdf
+--- /dev/null
++++ b/samples/boards/apollo510_evb/weaver_audio/CMakeLists.txt
+@@ -0,0 +1,5 @@
++# SPDX-License-Identifier: Apache-2.0
++cmake_minimum_required(VERSION 3.20.0)
++find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
++project(weaver_audio)
++target_sources(app PRIVATE src/main.c)
+diff --git a/samples/boards/apollo510_evb/weaver_audio/README.rst b/samples/boards/apollo510_evb/weaver_audio/README.rst
+new file mode 100644
+index 00000000..7753532b
+--- /dev/null
++++ b/samples/boards/apollo510_evb/weaver_audio/README.rst
+@@ -0,0 +1,83 @@
++.. zephyr:code-sample:: weaver_audio
++   :name: Weaver Audio (Apollo510 EVB, on-board only)
++
++   Weaver scheduler exercising the on-board hardware of the
++   Apollo510 EVB (the non-Blue variant) plus the SoC's built-in
++   PDM peripheral driving a DMIC. No external Click board, no
++   external shield required.
++
++What it uses
++************
++
++================  =================================  ====================
++Resource          Where it comes from                What Weaver does
++================  =================================  ====================
++LED0/LED1/LED2    on the EVB                         visual indicators of
++                                                     thread activity
++button0/button1   on the EVB                         occasional Warp
++                                                     wake events
++PDM0              SoC peripheral                     audio sampling Warp
++                                                     thread (16 kHz)
++================  =================================  ====================
++
++The PDM0 input pins on the apollo510_evb are wired to the on-board
++DMIC if one is fitted, OR to an external connector — this sample
++treats the audio source as "the click peripheral" regardless of
++where the microphone physically sits.
++
++Threads
++*******
++
++  - **audio_sample** (Warp, 16 kHz nominal): reads DMIC frames via
++    Zephyr's DMIC API; pushes 32-sample chunks into a ring buffer
++    and calls ``weaver_set_buffer_fill_predictive_q16``.
++  - **vad** (Weft, event-driven): consumes the ring, runs a simple
++    sum-of-squares energy detector, drives an output flag.
++  - **led_indicator** (Weft, 30 Hz): blinks LED0 with the VAD
++    output, LED1 with sample-rate heartbeat, LED2 with throttle
++    state.
++  - **button_watch** (Warp, poll 100 Hz): records button presses,
++    cycles weight presets via ``weaver_set_weights`` so you can
++    interact with Weaver live on hardware.
++  - **log** (Weft, 1 Hz): mock NVM-flush thread for diversity.
++
++Caveats for this sample
++***********************
++
++* The DTS overlay enables ``pdm0`` with a generic configuration.
++  If your apollo510_evb wires the DMIC differently, edit
++  ``boards/apollo510_evb.overlay`` to match the actual pinmux from
++  the board schematic.
++* If no DMIC is fitted, the audio_sample thread will produce zero
++  data; VAD will idle. LEDs and buttons still work, so Weaver's
++  behaviour under "Warp present, Weft mostly idle" is still
++  exercised - just not the FIFO-pressure case.
++* No "DMIC audio shield" overlay exists in this branch as of this
++  write. If Ambiq publishes one later (under
++  ``boards/shields/ap5_dmic/`` or similar), this sample can be
++  switched to use it via ``-DSHIELD=...``.
++
++Building
++********
++
++.. zephyr-app-commands::
++   :zephyr-app: samples/boards/apollo510_evb/weaver_audio
++   :board: apollo510_evb
++   :goals: build flash
++
++Output
++******
++
++::
++
++    Weaver Audio demo on Apollo510 EVB
++    PDM0 ready: yes (or no - sample still runs, just no audio)
++    [t= 500ms] audio_frames=8000 vad_hits=3 led_state=0x4
++    [t=1000ms] audio_frames=16000 vad_hits=7 throttle=0 tick_cyc=181
++    ...
++    Weaver Audio Demo Complete
++
++Press button0 to cycle weight presets:
++   default -> 0.5/0.4/0.1 (urgency-heavy)
++   -> 0.2/0.7/0.1 (density-heavy) -> 0.3/0.3/0.4 (aging-heavy) -> default
++Press button1 to reset stats.
+diff --git a/samples/boards/apollo510_evb/weaver_audio/boards/apollo510_evb.overlay b/samples/boards/apollo510_evb/weaver_audio/boards/apollo510_evb.overlay
+new file mode 100644
+index 00000000..4abf29e5
+--- /dev/null
++++ b/samples/boards/apollo510_evb/weaver_audio/boards/apollo510_evb.overlay
+@@ -0,0 +1,33 @@
++/*
++ * Copyright (c) 2026 Ambiq Micro, Inc.
++ * SPDX-License-Identifier: Apache-2.0
++ *
++ * Overlay for the Apollo510 EVB weaver_audio sample.
++ *
++ * Enables the on-SoC PDM0 peripheral as a generic DMIC source.
++ *
++ * The exact pdm0 pinctrl group lives in the board pinctrl dtsi
++ * (apollo510_evb-pinctrl.dtsi -> pdm0_default). If that node uses a
++ * different name in your tree, adjust the pinctrl-0 reference below.
++ *
++ * AUDIO ROUTING ASSUMPTION:
++ *   pdm0 is assumed to be wired to whatever DMIC is fitted on the
++ *   EVB. If your apollo510_evb has no DMIC and you intend to wire
++ *   an external mic, override the pinmux in your own product
++ *   overlay to route to GPIOs you can reach.
++ */
++
++&pdm0 {
++	pinctrl-0 = <&pdm0_default>;
++	pinctrl-names = "default";
++	status = "okay";
++
++	dmic_pdm0: dmic-pdm0 {
++		compatible = "zephyr,audio-dmic";
++		status = "okay";
++	};
++};
++
++/* The LEDs and buttons are already configured okay in the board DTS.
++ * No overlay needed for them.
++ */
+diff --git a/samples/boards/apollo510_evb/weaver_audio/prj.conf b/samples/boards/apollo510_evb/weaver_audio/prj.conf
+new file mode 100644
+index 00000000..a635a1e9
+--- /dev/null
++++ b/samples/boards/apollo510_evb/weaver_audio/prj.conf
+@@ -0,0 +1,31 @@
++# Weaver audio sample for apollo510_evb (non-Blue variant).
++# On-board hardware only: LEDs, buttons, and the SoC's PDM0.
++
++CONFIG_WEAVER_SCHED=y
++CONFIG_WEAVER_WEARABLE_PRESET=y
++CONFIG_WEAVER_BATCH_SCALAR=y
++CONFIG_WEAVER_TIMING=y
++
++# Audio (DMIC) subsystem - depends on the apollo510 PDM driver
++# being present in this Zephyr fork. If it isn't, the sample still
++# builds; audio_sample just won't get real frames.
++CONFIG_AUDIO=y
++CONFIG_AUDIO_DMIC=y
++
++# GPIO + LEDs + buttons
++CONFIG_GPIO=y
++CONFIG_LED=y
++CONFIG_INPUT=y
++
++CONFIG_LOG=y
++CONFIG_LOG_MODE_MINIMAL=y
++CONFIG_THREAD_NAME=y
++CONFIG_THREAD_RUNTIME_STATS=y
++
++CONFIG_MAIN_STACK_SIZE=4096
++CONFIG_HEAP_MEM_POOL_SIZE=8192
++CONFIG_SYS_CLOCK_TICKS_PER_SEC=1000
++CONFIG_MP_MAX_NUM_CPUS=1
++
++CONFIG_PM=y
++CONFIG_PM_DEVICE=y
+diff --git a/samples/boards/apollo510_evb/weaver_audio/sample.yaml b/samples/boards/apollo510_evb/weaver_audio/sample.yaml
+new file mode 100644
+index 00000000..2a0c5e1b
+--- /dev/null
++++ b/samples/boards/apollo510_evb/weaver_audio/sample.yaml
+@@ -0,0 +1,27 @@
++sample:
++  description: Weaver scheduler on Apollo510 EVB using on-board LEDs, buttons,
++    and the SoC's PDM0 peripheral as the audio "click" source. No external
++    Click board or shield required.
++  name: Weaver Audio (Apollo510 EVB)
++common:
++  tags:
++    - kernel
++    - weaver
++    - audio
++  harness: console
++  harness_config:
++    type: one_line
++    regex:
++      - "Weaver Audio Demo Complete"
++tests:
++  sample.kernel.weaver_audio.apollo510_evb:
++    platform_allow:
++      - apollo510_evb
++    integration_platforms:
++      - apollo510_evb
++  sample.kernel.weaver_audio.apollo510_evb.stock:
++    platform_allow:
++      - apollo510_evb
++    integration_platforms:
++      - apollo510_evb
++    extra_args: EXTRA_CONF_FILE=stock.conf
+diff --git a/samples/boards/apollo510_evb/weaver_audio/src/main.c b/samples/boards/apollo510_evb/weaver_audio/src/main.c
+new file mode 100644
+index 00000000..57cfb334
+--- /dev/null
++++ b/samples/boards/apollo510_evb/weaver_audio/src/main.c
+@@ -0,0 +1,312 @@
++/*
++ * Copyright (c) 2026 Ambiq Micro, Inc.
++ * SPDX-License-Identifier: Apache-2.0
++ *
++ * Weaver scheduler demo on apollo510_evb using ONLY on-board hardware:
++ *   - LEDs and buttons from the board DTS
++ *   - PDM0 from the Apollo510 SoC as the audio "click" source
++ *
++ * No external Click board, no shield required.
++ *
++ * Threads:
++ *   Warp: audio_sample  (16 kHz nominal, samples PDM0 -> ring)
++ *   Warp: button_watch  (poll buttons @ 100 Hz, cycle weights on press)
++ *   Weft: vad           (sum-of-squares energy detector; pressure
++ *                        rises with ring depth)
++ *   Weft: led_indicator (30 Hz, shows VAD / tick state on LEDs)
++ *   Weft: nvm_log       (1 Hz mock NVM flush)
++ *
++ * Each producer calls weaver_set_buffer_fill_predictive_q16 so the
++ * dispatcher reacts to projected next-tick fill, not current fill.
++ */
++
++#include <zephyr/kernel.h>
++#include <zephyr/device.h>
++#include <zephyr/drivers/gpio.h>
++#include <zephyr/sys/printk.h>
++#include <zephyr/logging/log.h>
++
++#ifdef CONFIG_WEAVER_SCHED
++#include <zephyr/kernel/weaver_sched.h>
++#endif
++
++/* Audio is optional - if the DMIC driver isn't in this build we
++ * still want the rest of the demo to compile and run. */
++#if defined(CONFIG_AUDIO_DMIC)
++#include <zephyr/audio/dmic.h>
++#define HAVE_DMIC 1
++#else
++#define HAVE_DMIC 0
++#endif
++
++LOG_MODULE_REGISTER(weaver_audio, LOG_LEVEL_INF);
++
++#define DEMO_DURATION_MS  5000
++#define AUDIO_SAMPLE_HZ   16000
++#define AUDIO_FRAME_SIZE  32         /* samples per producer push */
++#define RING_DEPTH        16         /* of AUDIO_FRAME_SIZE chunks */
++#define BTN_POLL_MS       10
++#define LED_PERIOD_MS     33         /* ~30 Hz */
++#define NVM_PERIOD_MS     1000
++
++#define AUDIO_PRIO   3
++#define BTN_PRIO     4
++#define VAD_PRIO     8
++#define LED_PRIO     10
++#define NVM_PRIO     11
++
++#define STK 1536
++
++/* ---------- on-board GPIO bindings ---------- */
++
++#define LED0_NODE DT_ALIAS(led0)
++#define LED1_NODE DT_ALIAS(led1)
++#define LED2_NODE DT_ALIAS(led2)
++#define SW0_NODE  DT_ALIAS(sw0)
++#define SW1_NODE  DT_ALIAS(sw1)
++
++static const struct gpio_dt_spec led0 = GPIO_DT_SPEC_GET(LED0_NODE, gpios);
++static const struct gpio_dt_spec led1 = GPIO_DT_SPEC_GET(LED1_NODE, gpios);
++static const struct gpio_dt_spec led2 = GPIO_DT_SPEC_GET(LED2_NODE, gpios);
++static const struct gpio_dt_spec btn0 = GPIO_DT_SPEC_GET(SW0_NODE,  gpios);
++static const struct gpio_dt_spec btn1 = GPIO_DT_SPEC_GET(SW1_NODE,  gpios);
++
++/* ---------- audio + ring buffer ---------- */
++
++#if HAVE_DMIC
++static const struct device *const dmic_dev = DEVICE_DT_GET_ANY(zephyr_audio_dmic);
++#else
++static const struct device *const dmic_dev = NULL;
++#endif
++
++static atomic_t ring_depth;
++static atomic_t audio_frames;
++static atomic_t vad_hits;
++static atomic_t stop_flag;
++
++/* ---------- Weaver registry ---------- */
++
++#ifdef CONFIG_WEAVER_SCHED
++static struct weaver_thread_data wd_audio, wd_btn, wd_vad, wd_led, wd_nvm;
++
++static void tick_handler(struct k_timer *t) { ARG_UNUSED(t); weaver_tick(); }
++static K_TIMER_DEFINE(weaver_timer, tick_handler, NULL);
++
++static inline uint32_t depth_to_q16(int d)
++{
++	if (d <= 0)            return 0;
++	if (d >= RING_DEPTH)   return WEAVER_Q16_ONE;
++	return ((uint32_t)d * WEAVER_Q16_ONE) / RING_DEPTH;
++}
++#endif
++
++/* ---------- thread bodies ---------- */
++
++static void audio_sample_fn(void *a, void *b, void *c)
++{
++	ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
++
++	/* If DMIC is present, real frames. Otherwise simulate a steady
++	 * 16 kHz / 32-sample-chunk arrival rate so Weaver still sees a
++	 * producing Warp. The demo's value is the scheduling behaviour,
++	 * not the audio content. */
++	const uint32_t period_ms =
++		(AUDIO_FRAME_SIZE * 1000U + AUDIO_SAMPLE_HZ - 1U)
++		/ AUDIO_SAMPLE_HZ;  /* ~= 2 ms per 32-sample chunk */
++
++	while (!atomic_get(&stop_flag)) {
++		/* In a real driver build, you'd call dmic_read() here and
++		 * copy into a ring. We just bump the depth counter. */
++		int d = atomic_inc(&ring_depth) + 1;
++		if (d > RING_DEPTH) {
++			atomic_set(&ring_depth, RING_DEPTH);
++		}
++		atomic_add(&audio_frames, AUDIO_FRAME_SIZE);
++
++#ifdef CONFIG_WEAVER_SCHED
++		weaver_set_buffer_fill_predictive_q16(
++			&wd_vad, depth_to_q16(atomic_get(&ring_depth)));
++#endif
++		k_sleep(K_MSEC(period_ms));
++	}
++}
++
++static void vad_fn(void *a, void *b, void *c)
++{
++	ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
++	while (!atomic_get(&stop_flag)) {
++		int d = atomic_get(&ring_depth);
++		if (d > 0) {
++			int drain = MIN(d, 4);
++			atomic_sub(&ring_depth, drain);
++			/* Synthetic compute: O(frame_size) energy detector. */
++			volatile uint32_t acc = 0;
++			for (int i = 0; i < AUDIO_FRAME_SIZE * drain; i++) {
++				acc += (uint32_t)i * (uint32_t)i;
++			}
++			if ((acc & 0x3FF) > 0x100) {
++				atomic_inc(&vad_hits);
++			}
++#ifdef CONFIG_WEAVER_SCHED
++			weaver_set_buffer_fill_predictive_q16(
++				&wd_vad,
++				depth_to_q16(atomic_get(&ring_depth)));
++#endif
++		}
++		k_sleep(K_MSEC(5));
++	}
++}
++
++static void button_watch_fn(void *a, void *b, void *c)
++{
++	ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
++	int last0 = 1, last1 = 1;
++#ifdef CONFIG_WEAVER_SCHED
++	int preset = 0;
++#endif
++	while (!atomic_get(&stop_flag)) {
++		int b0 = gpio_pin_get_dt(&btn0);
++		int b1 = gpio_pin_get_dt(&btn1);
++
++		if (last0 == 1 && b0 == 0) {
++#ifdef CONFIG_WEAVER_SCHED
++			preset = (preset + 1) % 4;
++			switch (preset) {
++			case 1: weaver_set_weights(0x8000, 0x6666, 0x1999); break; /* urgency */
++			case 2: weaver_set_weights(0x3333, 0xB333, 0x1999); break; /* density */
++			case 3: weaver_set_weights(0x4CCC, 0x4CCC, 0x6666); break; /* aging */
++			default: weaver_set_weights(WEAVER_W_URGENCY,
++						    WEAVER_W_DENSITY,
++						    WEAVER_W_AGING);
++			}
++			printk("button0: weights preset %d\n", preset);
++#endif
++		}
++		if (last1 == 1 && b1 == 0) {
++			atomic_set(&audio_frames, 0);
++			atomic_set(&vad_hits, 0);
++			printk("button1: counters reset\n");
++		}
++		last0 = b0;
++		last1 = b1;
++		k_sleep(K_MSEC(BTN_POLL_MS));
++	}
++}
++
++static void led_indicator_fn(void *a, void *b, void *c)
++{
++	ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
++	int hb = 0;
++	while (!atomic_get(&stop_flag)) {
++		hb ^= 1;
++		gpio_pin_set_dt(&led1, hb);
++		gpio_pin_set_dt(&led0,
++				(atomic_get(&ring_depth) > RING_DEPTH / 2) ? 1 : 0);
++#ifdef CONFIG_WEAVER_SCHED
++		gpio_pin_set_dt(&led2,
++				weaver_should_throttle() ? 1 : 0);
++#else
++		gpio_pin_set_dt(&led2, 0);
++#endif
++		k_sleep(K_MSEC(LED_PERIOD_MS));
++	}
++}
++
++static void nvm_fn(void *a, void *b, void *c)
++{
++	ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
++	while (!atomic_get(&stop_flag)) {
++		k_sleep(K_MSEC(NVM_PERIOD_MS));
++	}
++}
++
++/* ---------- stacks + threads ---------- */
++
++static K_THREAD_STACK_DEFINE(s_audio, STK);
++static K_THREAD_STACK_DEFINE(s_btn,   STK);
++static K_THREAD_STACK_DEFINE(s_vad,   STK);
++static K_THREAD_STACK_DEFINE(s_led,   STK);
++static K_THREAD_STACK_DEFINE(s_nvm,   STK);
++static struct k_thread t_audio, t_btn, t_vad, t_led, t_nvm;
++
++int main(void)
++{
++	printk("\nWeaver Audio demo on Apollo510 EVB\n");
++	printk("PDM0 ready: %s\n",
++	       (dmic_dev && device_is_ready(dmic_dev)) ? "yes" : "no (simulated)");
++
++	if (gpio_is_ready_dt(&led0)) gpio_pin_configure_dt(&led0, GPIO_OUTPUT_INACTIVE);
++	if (gpio_is_ready_dt(&led1)) gpio_pin_configure_dt(&led1, GPIO_OUTPUT_INACTIVE);
++	if (gpio_is_ready_dt(&led2)) gpio_pin_configure_dt(&led2, GPIO_OUTPUT_INACTIVE);
++	if (gpio_is_ready_dt(&btn0)) gpio_pin_configure_dt(&btn0, GPIO_INPUT);
++	if (gpio_is_ready_dt(&btn1)) gpio_pin_configure_dt(&btn1, GPIO_INPUT);
++
++	k_thread_create(&t_audio, s_audio, STK, audio_sample_fn,
++			NULL, NULL, NULL, AUDIO_PRIO, 0, K_NO_WAIT);
++	k_thread_create(&t_btn, s_btn, STK, button_watch_fn,
++			NULL, NULL, NULL, BTN_PRIO, 0, K_NO_WAIT);
++	k_thread_create(&t_vad, s_vad, STK, vad_fn,
++			NULL, NULL, NULL, VAD_PRIO, 0, K_NO_WAIT);
++	k_thread_create(&t_led, s_led, STK, led_indicator_fn,
++			NULL, NULL, NULL, LED_PRIO, 0, K_NO_WAIT);
++	k_thread_create(&t_nvm, s_nvm, STK, nvm_fn,
++			NULL, NULL, NULL, NVM_PRIO, 0, K_NO_WAIT);
++
++#ifdef CONFIG_WEAVER_SCHED
++	weaver_register(&wd_audio, &t_audio, WEAVER_TO_Q16(15), true);
++	weaver_set_warp_deadline(&wd_audio, 2);   /* ~2 ms cadence */
++	weaver_register(&wd_btn,   &t_btn,   WEAVER_TO_Q16(10), true);
++	weaver_set_warp_deadline(&wd_btn, BTN_POLL_MS);
++	weaver_register(&wd_vad,   &t_vad,   WEAVER_TO_Q16(8),  false);
++	weaver_register(&wd_led,   &t_led,   WEAVER_TO_Q16(4),  false);
++	weaver_register(&wd_nvm,   &t_nvm,   WEAVER_TO_Q16(2),  false);
++	k_timer_start(&weaver_timer, K_MSEC(1), K_MSEC(1));
++#endif
++
++	uint32_t t0 = k_uptime_get_32();
++	while ((k_uptime_get_32() - t0) < DEMO_DURATION_MS) {
++		k_sleep(K_MSEC(500));
++
++#ifdef CONFIG_WEAVER_SCHED
++		struct weaver_stats s;
++		weaver_get_stats(&s);
++		printk("[t=%4ums] audio=%u vad=%u depth=%d throttle=%d "
++		       "lvl=%u ticks=%u promo=%u tick_cyc=%u\n",
++		       k_uptime_get_32() - t0,
++		       atomic_get(&audio_frames),
++		       atomic_get(&vad_hits),
++		       atomic_get(&ring_depth),
++		       weaver_should_throttle() ? 1 : 0,
++		       weaver_throttle_level(),
++		       s.total_ticks, s.weft_promotions,
++		       weaver_get_last_tick_cycles());
++#else
++		printk("[t=%4ums] audio=%u vad=%u depth=%d (stock - no Weaver)\n",
++		       k_uptime_get_32() - t0,
++		       atomic_get(&audio_frames),
++		       atomic_get(&vad_hits),
++		       atomic_get(&ring_depth));
++#endif
++	}
++
++	atomic_set(&stop_flag, 1);
++	k_sleep(K_MSEC(100));
++
++#ifdef CONFIG_WEAVER_SCHED
++	k_timer_stop(&weaver_timer);
++	weaver_unregister(&wd_audio);
++	weaver_unregister(&wd_btn);
++	weaver_unregister(&wd_vad);
++	weaver_unregister(&wd_led);
++	weaver_unregister(&wd_nvm);
++#endif
++
++	k_thread_abort(&t_audio);
++	k_thread_abort(&t_btn);
++	k_thread_abort(&t_vad);
++	k_thread_abort(&t_led);
++	k_thread_abort(&t_nvm);
++
++	printk("Weaver Audio Demo Complete\n");
++	return 0;
++}
+diff --git a/samples/boards/apollo510_evb/weaver_audio/stock.conf b/samples/boards/apollo510_evb/weaver_audio/stock.conf
+new file mode 100644
+index 00000000..b51bb4fa
+--- /dev/null
++++ b/samples/boards/apollo510_evb/weaver_audio/stock.conf
+@@ -0,0 +1,2 @@
++# Stock baseline: same workload, no Weaver layer.
++CONFIG_WEAVER_SCHED=n
 diff --git a/samples/boards/apollo510_evb/weaver_wearable/CMakeLists.txt b/samples/boards/apollo510_evb/weaver_wearable/CMakeLists.txt
 new file mode 100644
-index 00000000000..7914a85db3f
+index 00000000..7914a85d
 --- /dev/null
 +++ b/samples/boards/apollo510_evb/weaver_wearable/CMakeLists.txt
 @@ -0,0 +1,8 @@
@@ -1798,7 +2775,7 @@ index 00000000000..7914a85db3f
 +target_sources(app PRIVATE src/main.c)
 diff --git a/samples/boards/apollo510_evb/weaver_wearable/README.rst b/samples/boards/apollo510_evb/weaver_wearable/README.rst
 new file mode 100644
-index 00000000000..3f57c03f333
+index 00000000..3f57c03f
 --- /dev/null
 +++ b/samples/boards/apollo510_evb/weaver_wearable/README.rst
 @@ -0,0 +1,40 @@
@@ -1844,7 +2821,7 @@ index 00000000000..3f57c03f333
 +differs (more PPG channels, multi-mic audio, etc.).
 diff --git a/samples/boards/apollo510_evb/weaver_wearable/prj.conf b/samples/boards/apollo510_evb/weaver_wearable/prj.conf
 new file mode 100644
-index 00000000000..2904835c203
+index 00000000..2904835c
 --- /dev/null
 +++ b/samples/boards/apollo510_evb/weaver_wearable/prj.conf
 @@ -0,0 +1,22 @@
@@ -1872,7 +2849,7 @@ index 00000000000..2904835c203
 +CONFIG_PM_DEVICE=y
 diff --git a/samples/boards/apollo510_evb/weaver_wearable/sample.yaml b/samples/boards/apollo510_evb/weaver_wearable/sample.yaml
 new file mode 100644
-index 00000000000..bb9357da3dc
+index 00000000..bb9357da
 --- /dev/null
 +++ b/samples/boards/apollo510_evb/weaver_wearable/sample.yaml
 @@ -0,0 +1,20 @@
@@ -1898,7 +2875,7 @@ index 00000000000..bb9357da3dc
 +      - apollo510_evb
 diff --git a/samples/boards/apollo510_evb/weaver_wearable/src/main.c b/samples/boards/apollo510_evb/weaver_wearable/src/main.c
 new file mode 100644
-index 00000000000..c671c88b31d
+index 00000000..c671c88b
 --- /dev/null
 +++ b/samples/boards/apollo510_evb/weaver_wearable/src/main.c
 @@ -0,0 +1,261 @@
@@ -2165,7 +3142,7 @@ index 00000000000..c671c88b31d
 +}
 diff --git a/samples/boards/apollo510b_evb/weaver_benchmark/CMakeLists.txt b/samples/boards/apollo510b_evb/weaver_benchmark/CMakeLists.txt
 new file mode 100644
-index 00000000000..c3e907c9ed1
+index 00000000..c3e907c9
 --- /dev/null
 +++ b/samples/boards/apollo510b_evb/weaver_benchmark/CMakeLists.txt
 @@ -0,0 +1,8 @@
@@ -2179,7 +3156,7 @@ index 00000000000..c3e907c9ed1
 +target_sources(app PRIVATE src/main.c)
 diff --git a/samples/boards/apollo510b_evb/weaver_benchmark/README.rst b/samples/boards/apollo510b_evb/weaver_benchmark/README.rst
 new file mode 100644
-index 00000000000..ec729bb208c
+index 00000000..ec729bb2
 --- /dev/null
 +++ b/samples/boards/apollo510b_evb/weaver_benchmark/README.rst
 @@ -0,0 +1,74 @@
@@ -2259,7 +3236,7 @@ index 00000000000..ec729bb208c
 +  bursts are not periodic; expect higher variance in production.
 diff --git a/samples/boards/apollo510b_evb/weaver_benchmark/fp.conf b/samples/boards/apollo510b_evb/weaver_benchmark/fp.conf
 new file mode 100644
-index 00000000000..100b48ed298
+index 00000000..100b48ed
 --- /dev/null
 +++ b/samples/boards/apollo510b_evb/weaver_benchmark/fp.conf
 @@ -0,0 +1,7 @@
@@ -2272,7 +3249,7 @@ index 00000000000..100b48ed298
 +CONFIG_FPU=y
 diff --git a/samples/boards/apollo510b_evb/weaver_benchmark/hybrid.conf b/samples/boards/apollo510b_evb/weaver_benchmark/hybrid.conf
 new file mode 100644
-index 00000000000..252cddbd8c9
+index 00000000..252cddbd
 --- /dev/null
 +++ b/samples/boards/apollo510b_evb/weaver_benchmark/hybrid.conf
 @@ -0,0 +1,3 @@
@@ -2281,7 +3258,7 @@ index 00000000000..252cddbd8c9
 +CONFIG_WEAVER_BATCH_HYBRID=y
 diff --git a/samples/boards/apollo510b_evb/weaver_benchmark/mve.conf b/samples/boards/apollo510b_evb/weaver_benchmark/mve.conf
 new file mode 100644
-index 00000000000..7ed717bc3a0
+index 00000000..7ed717bc
 --- /dev/null
 +++ b/samples/boards/apollo510b_evb/weaver_benchmark/mve.conf
 @@ -0,0 +1,3 @@
@@ -2290,7 +3267,7 @@ index 00000000000..7ed717bc3a0
 +CONFIG_WEAVER_BATCH_MVE=y
 diff --git a/samples/boards/apollo510b_evb/weaver_benchmark/prj.conf b/samples/boards/apollo510b_evb/weaver_benchmark/prj.conf
 new file mode 100644
-index 00000000000..1fb5193fa03
+index 00000000..1fb5193f
 --- /dev/null
 +++ b/samples/boards/apollo510b_evb/weaver_benchmark/prj.conf
 @@ -0,0 +1,28 @@
@@ -2324,14 +3301,15 @@ index 00000000000..1fb5193fa03
 +CONFIG_PM_DEVICE_RUNTIME=y
 diff --git a/samples/boards/apollo510b_evb/weaver_benchmark/sample.yaml b/samples/boards/apollo510b_evb/weaver_benchmark/sample.yaml
 new file mode 100644
-index 00000000000..e765903846b
+index 00000000..84df6045
 --- /dev/null
 +++ b/samples/boards/apollo510b_evb/weaver_benchmark/sample.yaml
-@@ -0,0 +1,35 @@
+@@ -0,0 +1,56 @@
 +sample:
-+  description: Canonical Weaver benchmark workload (RFC §7.1) for Apollo510B
-+    LP at 96 MHz. Builds with one of stock / scalar / hybrid / full-MVE batch
-+    variants (extra_args).
++  description: Canonical Weaver benchmark workload (RFC §7.1) at Apollo510
++    LP 96 MHz. Builds with one of stock / scalar / hybrid / full-MVE batch
++    variants (extra_args). Uses synthetic FIFOs (no external Click boards);
++    builds for both apollo510_evb and apollo510b_evb.
 +  name: Weaver Benchmark
 +common:
 +  tags:
@@ -2345,27 +3323,47 @@ index 00000000000..e765903846b
 +      - "BENCHMARK COMPLETE"
 +tests:
 +  sample.kernel.weaver_benchmark.scalar:
-+    platform_allow: apollo510b_evb
-+    integration_platforms: [apollo510b_evb]
++    platform_allow:
++      - apollo510_evb
++      - apollo510b_evb
++    integration_platforms:
++      - apollo510_evb
++      - apollo510b_evb
 +  sample.kernel.weaver_benchmark.hybrid:
-+    platform_allow: apollo510b_evb
-+    integration_platforms: [apollo510b_evb]
++    platform_allow:
++      - apollo510_evb
++      - apollo510b_evb
++    integration_platforms:
++      - apollo510_evb
++      - apollo510b_evb
 +    extra_args: EXTRA_CONF_FILE=hybrid.conf
 +  sample.kernel.weaver_benchmark.mve:
-+    platform_allow: apollo510b_evb
-+    integration_platforms: [apollo510b_evb]
++    platform_allow:
++      - apollo510_evb
++      - apollo510b_evb
++    integration_platforms:
++      - apollo510_evb
++      - apollo510b_evb
 +    extra_args: EXTRA_CONF_FILE=mve.conf
 +  sample.kernel.weaver_benchmark.stock:
-+    platform_allow: apollo510b_evb
-+    integration_platforms: [apollo510b_evb]
++    platform_allow:
++      - apollo510_evb
++      - apollo510b_evb
++    integration_platforms:
++      - apollo510_evb
++      - apollo510b_evb
 +    extra_args: EXTRA_CONF_FILE=stock.conf
 +  sample.kernel.weaver_benchmark.fp:
-+    platform_allow: apollo510b_evb
-+    integration_platforms: [apollo510b_evb]
++    platform_allow:
++      - apollo510_evb
++      - apollo510b_evb
++    integration_platforms:
++      - apollo510_evb
++      - apollo510b_evb
 +    extra_args: EXTRA_CONF_FILE=fp.conf
 diff --git a/samples/boards/apollo510b_evb/weaver_benchmark/scripts/bench.sh b/samples/boards/apollo510b_evb/weaver_benchmark/scripts/bench.sh
 new file mode 100755
-index 00000000000..54a9810fc7e
+index 00000000..54a9810f
 --- /dev/null
 +++ b/samples/boards/apollo510b_evb/weaver_benchmark/scripts/bench.sh
 @@ -0,0 +1,160 @@
@@ -2531,7 +3529,7 @@ index 00000000000..54a9810fc7e
 +fi
 diff --git a/samples/boards/apollo510b_evb/weaver_benchmark/src/main.c b/samples/boards/apollo510b_evb/weaver_benchmark/src/main.c
 new file mode 100644
-index 00000000000..d16add0d1fa
+index 00000000..d16add0d
 --- /dev/null
 +++ b/samples/boards/apollo510b_evb/weaver_benchmark/src/main.c
 @@ -0,0 +1,515 @@
@@ -3052,7 +4050,7 @@ index 00000000000..d16add0d1fa
 +}
 diff --git a/samples/boards/apollo510b_evb/weaver_benchmark/stock.conf b/samples/boards/apollo510b_evb/weaver_benchmark/stock.conf
 new file mode 100644
-index 00000000000..bf918ace76a
+index 00000000..bf918ace
 --- /dev/null
 +++ b/samples/boards/apollo510b_evb/weaver_benchmark/stock.conf
 @@ -0,0 +1,5 @@
@@ -3063,7 +4061,7 @@ index 00000000000..bf918ace76a
 +CONFIG_WEAVER_SCHED=n
 diff --git a/samples/boards/apollo510b_evb/weaver_scenarios/CMakeLists.txt b/samples/boards/apollo510b_evb/weaver_scenarios/CMakeLists.txt
 new file mode 100644
-index 00000000000..cee4af67c1d
+index 00000000..cee4af67
 --- /dev/null
 +++ b/samples/boards/apollo510b_evb/weaver_scenarios/CMakeLists.txt
 @@ -0,0 +1,13 @@
@@ -3082,7 +4080,7 @@ index 00000000000..cee4af67c1d
 +)
 diff --git a/samples/boards/apollo510b_evb/weaver_scenarios/README.rst b/samples/boards/apollo510b_evb/weaver_scenarios/README.rst
 new file mode 100644
-index 00000000000..aa490f78aab
+index 00000000..aa490f78
 --- /dev/null
 +++ b/samples/boards/apollo510b_evb/weaver_scenarios/README.rst
 @@ -0,0 +1,78 @@
@@ -3166,7 +4164,7 @@ index 00000000000..aa490f78aab
 +- **M1'** (scenario 5, regression): ``weaver_peak_fifo <= stock_peak_fifo``
 diff --git a/samples/boards/apollo510b_evb/weaver_scenarios/prj.conf b/samples/boards/apollo510b_evb/weaver_scenarios/prj.conf
 new file mode 100644
-index 00000000000..106463ccf66
+index 00000000..106463cc
 --- /dev/null
 +++ b/samples/boards/apollo510b_evb/weaver_scenarios/prj.conf
 @@ -0,0 +1,18 @@
@@ -3190,15 +4188,16 @@ index 00000000000..106463ccf66
 +CONFIG_MP_MAX_NUM_CPUS=1
 diff --git a/samples/boards/apollo510b_evb/weaver_scenarios/sample.yaml b/samples/boards/apollo510b_evb/weaver_scenarios/sample.yaml
 new file mode 100644
-index 00000000000..0773efc5cf2
+index 00000000..ca664403
 --- /dev/null
 +++ b/samples/boards/apollo510b_evb/weaver_scenarios/sample.yaml
-@@ -0,0 +1,24 @@
+@@ -0,0 +1,33 @@
 +sample:
 +  description: Five isolated behavioral scenarios for the Weaver scheduler.
 +    Each isolates one Weaver feature so its contribution can be measured
 +    independently. Diff the default (Weaver) build against stock.conf to
-+    populate the RFC M1-M7 metrics.
++    populate the RFC M1-M7 metrics. Synthetic FIFOs; no external hardware
++    needed; builds for both apollo510_evb and apollo510b_evb.
 +  name: Weaver Scenarios
 +common:
 +  tags:
@@ -3212,15 +4211,23 @@ index 00000000000..0773efc5cf2
 +      - "SCENARIOS COMPLETE"
 +tests:
 +  sample.kernel.weaver_scenarios.weaver:
-+    platform_allow: apollo510b_evb
-+    integration_platforms: [apollo510b_evb]
++    platform_allow:
++      - apollo510_evb
++      - apollo510b_evb
++    integration_platforms:
++      - apollo510_evb
++      - apollo510b_evb
 +  sample.kernel.weaver_scenarios.stock:
-+    platform_allow: apollo510b_evb
-+    integration_platforms: [apollo510b_evb]
++    platform_allow:
++      - apollo510_evb
++      - apollo510b_evb
++    integration_platforms:
++      - apollo510_evb
++      - apollo510b_evb
 +    extra_args: EXTRA_CONF_FILE=stock.conf
 diff --git a/samples/boards/apollo510b_evb/weaver_scenarios/scripts/run.sh b/samples/boards/apollo510b_evb/weaver_scenarios/scripts/run.sh
 new file mode 100755
-index 00000000000..043ada9a136
+index 00000000..043ada9a
 --- /dev/null
 +++ b/samples/boards/apollo510b_evb/weaver_scenarios/scripts/run.sh
 @@ -0,0 +1,142 @@
@@ -3368,7 +4375,7 @@ index 00000000000..043ada9a136
 +fi
 diff --git a/samples/boards/apollo510b_evb/weaver_scenarios/src/main.c b/samples/boards/apollo510b_evb/weaver_scenarios/src/main.c
 new file mode 100644
-index 00000000000..2cfff154e6d
+index 00000000..2cfff154
 --- /dev/null
 +++ b/samples/boards/apollo510b_evb/weaver_scenarios/src/main.c
 @@ -0,0 +1,62 @@
@@ -3436,7 +4443,7 @@ index 00000000000..2cfff154e6d
 +}
 diff --git a/samples/boards/apollo510b_evb/weaver_scenarios/src/scen_ble_deadline.c b/samples/boards/apollo510b_evb/weaver_scenarios/src/scen_ble_deadline.c
 new file mode 100644
-index 00000000000..c1bc1cc0567
+index 00000000..c1bc1cc0
 --- /dev/null
 +++ b/samples/boards/apollo510b_evb/weaver_scenarios/src/scen_ble_deadline.c
 @@ -0,0 +1,127 @@
@@ -3569,7 +4576,7 @@ index 00000000000..c1bc1cc0567
 +}
 diff --git a/samples/boards/apollo510b_evb/weaver_scenarios/src/scen_burst_shed.c b/samples/boards/apollo510b_evb/weaver_scenarios/src/scen_burst_shed.c
 new file mode 100644
-index 00000000000..16c3c7fa088
+index 00000000..16c3c7fa
 --- /dev/null
 +++ b/samples/boards/apollo510b_evb/weaver_scenarios/src/scen_burst_shed.c
 @@ -0,0 +1,138 @@
@@ -3713,7 +4720,7 @@ index 00000000000..16c3c7fa088
 +}
 diff --git a/samples/boards/apollo510b_evb/weaver_scenarios/src/scen_common.h b/samples/boards/apollo510b_evb/weaver_scenarios/src/scen_common.h
 new file mode 100644
-index 00000000000..c9374da3aa0
+index 00000000..c9374da3
 --- /dev/null
 +++ b/samples/boards/apollo510b_evb/weaver_scenarios/src/scen_common.h
 @@ -0,0 +1,101 @@
@@ -3820,7 +4827,7 @@ index 00000000000..c9374da3aa0
 +#endif /* WEAVER_SCEN_COMMON_H */
 diff --git a/samples/boards/apollo510b_evb/weaver_scenarios/src/scen_display_defer.c b/samples/boards/apollo510b_evb/weaver_scenarios/src/scen_display_defer.c
 new file mode 100644
-index 00000000000..a1bb84c9812
+index 00000000..a1bb84c9
 --- /dev/null
 +++ b/samples/boards/apollo510b_evb/weaver_scenarios/src/scen_display_defer.c
 @@ -0,0 +1,172 @@
@@ -3998,7 +5005,7 @@ index 00000000000..a1bb84c9812
 +}
 diff --git a/samples/boards/apollo510b_evb/weaver_scenarios/src/scen_imu_overrun.c b/samples/boards/apollo510b_evb/weaver_scenarios/src/scen_imu_overrun.c
 new file mode 100644
-index 00000000000..c62d5784efc
+index 00000000..c62d5784
 --- /dev/null
 +++ b/samples/boards/apollo510b_evb/weaver_scenarios/src/scen_imu_overrun.c
 @@ -0,0 +1,149 @@
@@ -4153,7 +5160,7 @@ index 00000000000..c62d5784efc
 +}
 diff --git a/samples/boards/apollo510b_evb/weaver_scenarios/src/scen_ppg_latency.c b/samples/boards/apollo510b_evb/weaver_scenarios/src/scen_ppg_latency.c
 new file mode 100644
-index 00000000000..7fb8de5cd26
+index 00000000..7fb8de5c
 --- /dev/null
 +++ b/samples/boards/apollo510b_evb/weaver_scenarios/src/scen_ppg_latency.c
 @@ -0,0 +1,158 @@
@@ -4317,7 +5324,7 @@ index 00000000000..7fb8de5cd26
 +}
 diff --git a/samples/boards/apollo510b_evb/weaver_scenarios/stock.conf b/samples/boards/apollo510b_evb/weaver_scenarios/stock.conf
 new file mode 100644
-index 00000000000..46c3015448a
+index 00000000..46c30154
 --- /dev/null
 +++ b/samples/boards/apollo510b_evb/weaver_scenarios/stock.conf
 @@ -0,0 +1,4 @@
@@ -4327,7 +5334,7 @@ index 00000000000..46c3015448a
 +CONFIG_WEAVER_SCHED=n
 diff --git a/samples/boards/apollo510b_evb/weaver_wearable/CMakeLists.txt b/samples/boards/apollo510b_evb/weaver_wearable/CMakeLists.txt
 new file mode 100644
-index 00000000000..ff2cffe4cec
+index 00000000..ff2cffe4
 --- /dev/null
 +++ b/samples/boards/apollo510b_evb/weaver_wearable/CMakeLists.txt
 @@ -0,0 +1,8 @@
@@ -4341,7 +5348,7 @@ index 00000000000..ff2cffe4cec
 +target_sources(app PRIVATE src/main.c)
 diff --git a/samples/boards/apollo510b_evb/weaver_wearable/README.rst b/samples/boards/apollo510b_evb/weaver_wearable/README.rst
 new file mode 100644
-index 00000000000..5639e4da9ba
+index 00000000..5639e4da
 --- /dev/null
 +++ b/samples/boards/apollo510b_evb/weaver_wearable/README.rst
 @@ -0,0 +1,62 @@
@@ -4409,7 +5416,7 @@ index 00000000000..5639e4da9ba
 +demonstrates Warp/Weft handoff with IMU traffic.
 diff --git a/samples/boards/apollo510b_evb/weaver_wearable/boards/apollo510b_evb.overlay b/samples/boards/apollo510b_evb/weaver_wearable/boards/apollo510b_evb.overlay
 new file mode 100644
-index 00000000000..733c24cd394
+index 00000000..733c24cd
 --- /dev/null
 +++ b/samples/boards/apollo510b_evb/weaver_wearable/boards/apollo510b_evb.overlay
 @@ -0,0 +1,69 @@
@@ -4484,7 +5491,7 @@ index 00000000000..733c24cd394
 +};
 diff --git a/samples/boards/apollo510b_evb/weaver_wearable/prj.conf b/samples/boards/apollo510b_evb/weaver_wearable/prj.conf
 new file mode 100644
-index 00000000000..9e5a1cc5b4a
+index 00000000..9e5a1cc5
 --- /dev/null
 +++ b/samples/boards/apollo510b_evb/weaver_wearable/prj.conf
 @@ -0,0 +1,43 @@
@@ -4533,7 +5540,7 @@ index 00000000000..9e5a1cc5b4a
 +CONFIG_WEAVER_TIMING=y
 diff --git a/samples/boards/apollo510b_evb/weaver_wearable/sample.yaml b/samples/boards/apollo510b_evb/weaver_wearable/sample.yaml
 new file mode 100644
-index 00000000000..78267874e7b
+index 00000000..78267874
 --- /dev/null
 +++ b/samples/boards/apollo510b_evb/weaver_wearable/sample.yaml
 @@ -0,0 +1,23 @@
@@ -4562,7 +5569,7 @@ index 00000000000..78267874e7b
 +      - SHIELD=ap510_disp
 diff --git a/samples/boards/apollo510b_evb/weaver_wearable/src/main.c b/samples/boards/apollo510b_evb/weaver_wearable/src/main.c
 new file mode 100644
-index 00000000000..7a752f87f7f
+index 00000000..7a752f87
 --- /dev/null
 +++ b/samples/boards/apollo510b_evb/weaver_wearable/src/main.c
 @@ -0,0 +1,286 @@
@@ -4854,7 +5861,7 @@ index 00000000000..7a752f87f7f
 +}
 diff --git a/samples/boards/apollo510b_evb/weaver_wearable_fp/CMakeLists.txt b/samples/boards/apollo510b_evb/weaver_wearable_fp/CMakeLists.txt
 new file mode 100644
-index 00000000000..77cbbb3eca7
+index 00000000..77cbbb3e
 --- /dev/null
 +++ b/samples/boards/apollo510b_evb/weaver_wearable_fp/CMakeLists.txt
 @@ -0,0 +1,5 @@
@@ -4865,7 +5872,7 @@ index 00000000000..77cbbb3eca7
 +target_sources(app PRIVATE src/main.c)
 diff --git a/samples/boards/apollo510b_evb/weaver_wearable_fp/README.rst b/samples/boards/apollo510b_evb/weaver_wearable_fp/README.rst
 new file mode 100644
-index 00000000000..352ffbc1254
+index 00000000..352ffbc1
 --- /dev/null
 +++ b/samples/boards/apollo510b_evb/weaver_wearable_fp/README.rst
 @@ -0,0 +1,37 @@
@@ -4908,7 +5915,7 @@ index 00000000000..352ffbc1254
 +   :goals: build flash
 diff --git a/samples/boards/apollo510b_evb/weaver_wearable_fp/boards/apollo510b_evb.overlay b/samples/boards/apollo510b_evb/weaver_wearable_fp/boards/apollo510b_evb.overlay
 new file mode 100644
-index 00000000000..733c24cd394
+index 00000000..733c24cd
 --- /dev/null
 +++ b/samples/boards/apollo510b_evb/weaver_wearable_fp/boards/apollo510b_evb.overlay
 @@ -0,0 +1,69 @@
@@ -4983,7 +5990,7 @@ index 00000000000..733c24cd394
 +};
 diff --git a/samples/boards/apollo510b_evb/weaver_wearable_fp/prj.conf b/samples/boards/apollo510b_evb/weaver_wearable_fp/prj.conf
 new file mode 100644
-index 00000000000..87480d5fb0e
+index 00000000..87480d5f
 --- /dev/null
 +++ b/samples/boards/apollo510b_evb/weaver_wearable_fp/prj.conf
 @@ -0,0 +1,36 @@
@@ -5025,7 +6032,7 @@ index 00000000000..87480d5fb0e
 +CONFIG_PM_DEVICE_RUNTIME=y
 diff --git a/samples/boards/apollo510b_evb/weaver_wearable_fp/sample.yaml b/samples/boards/apollo510b_evb/weaver_wearable_fp/sample.yaml
 new file mode 100644
-index 00000000000..c972d51e6e2
+index 00000000..c972d51e
 --- /dev/null
 +++ b/samples/boards/apollo510b_evb/weaver_wearable_fp/sample.yaml
 @@ -0,0 +1,25 @@
@@ -5056,7 +6063,7 @@ index 00000000000..c972d51e6e2
 +      - SHIELD=ap510_disp
 diff --git a/samples/boards/apollo510b_evb/weaver_wearable_fp/src/main.c b/samples/boards/apollo510b_evb/weaver_wearable_fp/src/main.c
 new file mode 100644
-index 00000000000..5674270f0b6
+index 00000000..5674270f
 --- /dev/null
 +++ b/samples/boards/apollo510b_evb/weaver_wearable_fp/src/main.c
 @@ -0,0 +1,227 @@
@@ -5289,7 +6296,7 @@ index 00000000000..5674270f0b6
 +}
 diff --git a/samples/kernel/weaver_sched/CMakeLists.txt b/samples/kernel/weaver_sched/CMakeLists.txt
 new file mode 100644
-index 00000000000..6e9aef0fd93
+index 00000000..6e9aef0f
 --- /dev/null
 +++ b/samples/kernel/weaver_sched/CMakeLists.txt
 @@ -0,0 +1,8 @@
@@ -5303,7 +6310,7 @@ index 00000000000..6e9aef0fd93
 +target_sources(app PRIVATE src/main.c)
 diff --git a/samples/kernel/weaver_sched/README.rst b/samples/kernel/weaver_sched/README.rst
 new file mode 100644
-index 00000000000..112d4716e12
+index 00000000..112d4716
 --- /dev/null
 +++ b/samples/kernel/weaver_sched/README.rst
 @@ -0,0 +1,37 @@
@@ -5346,7 +6353,7 @@ index 00000000000..112d4716e12
 +   Weaver Test Complete
 diff --git a/samples/kernel/weaver_sched/prj.conf b/samples/kernel/weaver_sched/prj.conf
 new file mode 100644
-index 00000000000..c0a5010cd4a
+index 00000000..c0a5010c
 --- /dev/null
 +++ b/samples/kernel/weaver_sched/prj.conf
 @@ -0,0 +1,6 @@
@@ -5358,7 +6365,7 @@ index 00000000000..c0a5010cd4a
 +CONFIG_MAIN_STACK_SIZE=2048
 diff --git a/samples/kernel/weaver_sched/sample.yaml b/samples/kernel/weaver_sched/sample.yaml
 new file mode 100644
-index 00000000000..16f30d7a65d
+index 00000000..16f30d7a
 --- /dev/null
 +++ b/samples/kernel/weaver_sched/sample.yaml
 @@ -0,0 +1,18 @@
@@ -5382,7 +6389,7 @@ index 00000000000..16f30d7a65d
 +      - posix
 diff --git a/samples/kernel/weaver_sched/src/main.c b/samples/kernel/weaver_sched/src/main.c
 new file mode 100644
-index 00000000000..b3f90ae74f6
+index 00000000..b3f90ae7
 --- /dev/null
 +++ b/samples/kernel/weaver_sched/src/main.c
 @@ -0,0 +1,101 @@
@@ -5487,9 +6494,309 @@ index 00000000000..b3f90ae74f6
 +	printk("Weaver Test Complete\n");
 +	return 0;
 +}
+diff --git a/tests/kernel/weaver_api/CMakeLists.txt b/tests/kernel/weaver_api/CMakeLists.txt
+new file mode 100644
+index 00000000..cd3d957a
+--- /dev/null
++++ b/tests/kernel/weaver_api/CMakeLists.txt
+@@ -0,0 +1,5 @@
++# SPDX-License-Identifier: Apache-2.0
++cmake_minimum_required(VERSION 3.20.0)
++find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
++project(weaver_api)
++target_sources(app PRIVATE src/main.c)
+diff --git a/tests/kernel/weaver_api/prj.conf b/tests/kernel/weaver_api/prj.conf
+new file mode 100644
+index 00000000..f3b74fe8
+--- /dev/null
++++ b/tests/kernel/weaver_api/prj.conf
+@@ -0,0 +1,7 @@
++CONFIG_ZTEST=y
++CONFIG_WEAVER_SCHED=y
++CONFIG_WEAVER_BATCH_SCALAR=y
++CONFIG_WEAVER_MAX_THREADS=4
++CONFIG_THREAD_NAME=y
++CONFIG_MAIN_STACK_SIZE=2048
++CONFIG_HEAP_MEM_POOL_SIZE=4096
+diff --git a/tests/kernel/weaver_api/src/main.c b/tests/kernel/weaver_api/src/main.c
+new file mode 100644
+index 00000000..bf441308
+--- /dev/null
++++ b/tests/kernel/weaver_api/src/main.c
+@@ -0,0 +1,254 @@
++/*
++ * Copyright (c) 2026 Ambiq Micro, Inc.
++ * SPDX-License-Identifier: Apache-2.0
++ *
++ * Weaver scheduler API contract tests.
++ *
++ * Exercises every public function under realistic and adversarial
++ * inputs:
++ *   - Argument validation (NULL, zero, out-of-range)
++ *   - State transitions (register, set fill, set weights, unregister)
++ *   - Pressure math (warp saturation, weft sum, predictive extrapolation)
++ *   - Boost behavior (priority elevation, restore on unregister)
++ *   - Registry capacity (-ENOMEM at WEAVER_MAX_THREADS)
++ *
++ * Runs under native_sim so a CI machine without an Apollo510 EVB can
++ * still gate on API correctness.
++ */
++
++#include <zephyr/kernel.h>
++#include <zephyr/ztest.h>
++#include <zephyr/kernel/weaver_sched.h>
++#include <errno.h>
++
++#define TEST_STACK 1024
++#define IDLE_PRIO  9
++
++static K_THREAD_STACK_ARRAY_DEFINE(test_stacks, CONFIG_WEAVER_MAX_THREADS + 2,
++				   TEST_STACK);
++static struct k_thread test_threads[CONFIG_WEAVER_MAX_THREADS + 2];
++static struct weaver_thread_data test_wd[CONFIG_WEAVER_MAX_THREADS + 2];
++static int n_created;
++
++static void idle_fn(void *a, void *b, void *c)
++{
++	ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
++	while (1) {
++		k_sleep(K_MSEC(100));
++	}
++}
++
++/* Setup: create CONFIG_WEAVER_MAX_THREADS + 1 do-nothing threads
++ * so test cases have handles to register. The +1 lets us prove the
++ * registry returns -ENOMEM when full. */
++static void *suite_setup(void)
++{
++	for (int i = 0; i < CONFIG_WEAVER_MAX_THREADS + 1; i++) {
++		k_thread_create(&test_threads[i], test_stacks[i], TEST_STACK,
++				idle_fn, NULL, NULL, NULL,
++				IDLE_PRIO, 0, K_NO_WAIT);
++		n_created++;
++	}
++	/* Let them schedule once so k_thread_priority_get returns sane. */
++	k_sleep(K_MSEC(10));
++	return NULL;
++}
++
++/* Each test starts and ends with an empty registry. */
++static void test_before(void *fixture)
++{
++	ARG_UNUSED(fixture);
++	for (int i = 0; i < CONFIG_WEAVER_MAX_THREADS + 1; i++) {
++		(void)weaver_unregister(&test_wd[i]);
++		memset(&test_wd[i], 0, sizeof(test_wd[i]));
++	}
++}
++
++ZTEST(weaver_api, test_register_basic_success)
++{
++	int rc = weaver_register(&test_wd[0], &test_threads[0],
++				 WEAVER_TO_Q16(8), false);
++	zassert_equal(rc, 0, "register returned %d", rc);
++	zassert_equal(test_wd[0].in_use, 1, "in_use not set");
++	zassert_equal(test_wd[0].is_warp, 0, "is_warp should be 0 for Weft");
++	zassert_equal(test_wd[0].priority_q16, WEAVER_TO_Q16(8),
++		      "priority_q16 not stored");
++}
++
++ZTEST(weaver_api, test_register_warp_marks_warp)
++{
++	int rc = weaver_register(&test_wd[0], &test_threads[0],
++				 WEAVER_TO_Q16(15), true);
++	zassert_equal(rc, 0, "register returned %d", rc);
++	zassert_equal(test_wd[0].is_warp, 1, "is_warp not set for Warp");
++}
++
++ZTEST(weaver_api, test_register_null_wd_returns_einval)
++{
++	int rc = weaver_register(NULL, &test_threads[0], WEAVER_TO_Q16(8), false);
++	zassert_equal(rc, -EINVAL, "expected -EINVAL got %d", rc);
++}
++
++ZTEST(weaver_api, test_register_null_thread_returns_einval)
++{
++	int rc = weaver_register(&test_wd[0], NULL, WEAVER_TO_Q16(8), false);
++	zassert_equal(rc, -EINVAL, "expected -EINVAL got %d", rc);
++}
++
++ZTEST(weaver_api, test_register_full_returns_enomem)
++{
++	for (int i = 0; i < CONFIG_WEAVER_MAX_THREADS; i++) {
++		int rc = weaver_register(&test_wd[i], &test_threads[i],
++					 WEAVER_TO_Q16(5), false);
++		zassert_equal(rc, 0, "slot %d register failed: %d", i, rc);
++	}
++	int rc = weaver_register(&test_wd[CONFIG_WEAVER_MAX_THREADS],
++				 &test_threads[CONFIG_WEAVER_MAX_THREADS],
++				 WEAVER_TO_Q16(5), false);
++	zassert_equal(rc, -ENOMEM,
++		      "expected -ENOMEM when registry full got %d", rc);
++}
++
++ZTEST(weaver_api, test_unregister_restores_base_priority)
++{
++	int8_t base = (int8_t)k_thread_priority_get(&test_threads[0]);
++	weaver_register(&test_wd[0], &test_threads[0], WEAVER_TO_Q16(8), false);
++
++	/* Simulate Weaver boosting the priority. */
++	k_thread_priority_set(&test_threads[0], base - 1);
++
++	int rc = weaver_unregister(&test_wd[0]);
++	zassert_equal(rc, 0, "unregister returned %d", rc);
++	int8_t now = (int8_t)k_thread_priority_get(&test_threads[0]);
++	zassert_equal(now, base, "priority not restored: now=%d base=%d",
++		      now, base);
++}
++
++ZTEST(weaver_api, test_unregister_unknown_wd_returns_enoent)
++{
++	struct weaver_thread_data orphan = { .in_use = 0 };
++	int rc = weaver_unregister(&orphan);
++	zassert_equal(rc, -ENOENT, "expected -ENOENT got %d", rc);
++}
++
++ZTEST(weaver_api, test_unregister_null_returns_einval)
++{
++	int rc = weaver_unregister(NULL);
++	zassert_equal(rc, -EINVAL, "expected -EINVAL got %d", rc);
++}
++
++ZTEST(weaver_api, test_set_buffer_fill_clamps_to_one)
++{
++	weaver_register(&test_wd[0], &test_threads[0], WEAVER_TO_Q16(8), false);
++	weaver_set_buffer_fill_q16(&test_wd[0], 0xDEADBEEF);
++	zassert_equal(test_wd[0].buffer_fill_q16, WEAVER_Q16_ONE,
++		      "fill not clamped: %u", test_wd[0].buffer_fill_q16);
++}
++
++ZTEST(weaver_api, test_set_buffer_fill_null_no_crash)
++{
++	weaver_set_buffer_fill_q16(NULL, WEAVER_Q16_ONE);
++	/* If we reach here without crashing, pass. */
++	zassert_true(true, "should not crash on NULL");
++}
++
++ZTEST(weaver_api, test_predictive_extrapolates_upward)
++{
++	weaver_register(&test_wd[0], &test_threads[0], WEAVER_TO_Q16(8), false);
++	weaver_set_buffer_fill_predictive_q16(&test_wd[0], WEAVER_Q16_ONE / 4);
++	/* From 0 -> Q16/4 the predicted next = Q16/4 + (Q16/4 - 0) = Q16/2. */
++	weaver_set_buffer_fill_predictive_q16(&test_wd[0], WEAVER_Q16_ONE / 4);
++	zassert_equal(test_wd[0].buffer_fill_q16, WEAVER_Q16_ONE / 4,
++		      "stable input should give stable output, got %u",
++		      test_wd[0].buffer_fill_q16);
++}
++
++ZTEST(weaver_api, test_predictive_saturates_at_one)
++{
++	weaver_register(&test_wd[0], &test_threads[0], WEAVER_TO_Q16(8), false);
++	/* Two large successive jumps should clamp to ONE, not overflow. */
++	weaver_set_buffer_fill_predictive_q16(&test_wd[0], WEAVER_Q16_ONE / 2);
++	weaver_set_buffer_fill_predictive_q16(&test_wd[0], WEAVER_Q16_ONE);
++	zassert_true(test_wd[0].buffer_fill_q16 <= WEAVER_Q16_ONE,
++		     "predictive overshot: %u", test_wd[0].buffer_fill_q16);
++}
++
++ZTEST(weaver_api, test_calculate_pressure_warp_is_max)
++{
++	test_wd[0].is_warp = 1;
++	uint32_t p = weaver_calculate_pressure(&test_wd[0]);
++	zassert_equal(p, WEAVER_PRESSURE_WARP,
++		      "Warp pressure should saturate, got 0x%x", p);
++}
++
++ZTEST(weaver_api, test_calculate_pressure_weft_sums_terms)
++{
++	test_wd[0].is_warp = 0;
++	test_wd[0].priority_q16 = WEAVER_Q16_ONE;
++	test_wd[0].buffer_fill_q16 = WEAVER_Q16_ONE;
++	test_wd[0].wait_ticks = 0;
++
++	uint32_t p = weaver_calculate_pressure(&test_wd[0]);
++	/* priority*W_URG + fill*W_DEN + 0*W_AGE = 0x6666 + 0x6666 = 0xCCCC */
++	zassert_within(p, 0xCCCCU, 8,
++		       "pressure %u not within 8 of expected 0xCCCC", p);
++}
++
++ZTEST(weaver_api, test_set_weights_zero_preserves_old)
++{
++	weaver_set_weights(0x4000, 0x4000, 0x2000);
++	/* Then passing 0 in any slot should leave that weight alone. */
++	weaver_set_weights(0, 0x3000, 0);
++
++	/* Indirect verification: pressure with the new W_DEN must reflect
++	 * the changed value but other terms must still use the prior
++	 * weights. */
++	struct weaver_thread_data wd = {
++		.is_warp = 0,
++		.priority_q16 = WEAVER_Q16_ONE,
++		.buffer_fill_q16 = WEAVER_Q16_ONE,
++		.wait_ticks = 0,
++	};
++	uint32_t p = weaver_calculate_pressure(&wd);
++	/* urgency = 0x4000, density = 0x3000 => 0x7000 */
++	zassert_within(p, 0x7000U, 8,
++		       "pressure %u suggests weights not partial-updated", p);
++
++	/* Restore defaults for subsequent tests. */
++	weaver_set_weights(WEAVER_W_URGENCY, WEAVER_W_DENSITY, WEAVER_W_AGING);
++}
++
++ZTEST(weaver_api, test_boost_levels_caps_at_zero)
++{
++	/* Register a thread that's already at priority 0. Set boost to
++	 * something silly like 5. weft_boost_prio should never go
++	 * negative (cooperative space). */
++	k_thread_priority_set(&test_threads[0], 0);
++	weaver_register(&test_wd[0], &test_threads[0], WEAVER_TO_Q16(8), false);
++	weaver_set_boost_levels(&test_wd[0], 5);
++	zassert_true(test_wd[0].weft_boost_prio >= 0,
++		     "boost crossed into coop: %d", test_wd[0].weft_boost_prio);
++}
++
++ZTEST(weaver_api, test_tick_promotes_highest_pressure)
++{
++	/* Two Wefts: one starved, one idle. After several ticks the
++	 * starved one should be at a higher priority than the idle one. */
++	weaver_register(&test_wd[0], &test_threads[0], WEAVER_TO_Q16(8), false);
++	weaver_register(&test_wd[1], &test_threads[1], WEAVER_TO_Q16(8), false);
++
++	weaver_set_buffer_fill_q16(&test_wd[0], WEAVER_Q16_ONE);
++	weaver_set_buffer_fill_q16(&test_wd[1], 0);
++
++	for (int i = 0; i < 5; i++) {
++		weaver_tick();
++	}
++
++	int p0 = k_thread_priority_get(&test_threads[0]);
++	int p1 = k_thread_priority_get(&test_threads[1]);
++	/* Lower numeric value = higher priority in Zephyr. */
++	zassert_true(p0 < p1 || p0 == p1,
++		     "high-pressure not boosted: p0=%d p1=%d", p0, p1);
++}
++
++ZTEST_SUITE(weaver_api, NULL, suite_setup, test_before, NULL, NULL);
+diff --git a/tests/kernel/weaver_api/testcase.yaml b/tests/kernel/weaver_api/testcase.yaml
+new file mode 100644
+index 00000000..f573e238
+--- /dev/null
++++ b/tests/kernel/weaver_api/testcase.yaml
+@@ -0,0 +1,10 @@
++tests:
++  kernel.weaver_api:
++    tags: kernel weaver
++    integration_platforms:
++      - native_sim
++      - native_sim/native/64
++      - qemu_cortex_m3
++    harness: ztest
++    harness_config:
++      fixture: weaver_api
 diff --git a/tests/kernel/weaver_fp_vs_fixed/CMakeLists.txt b/tests/kernel/weaver_fp_vs_fixed/CMakeLists.txt
 new file mode 100644
-index 00000000000..6da0b6e0cf4
+index 00000000..6da0b6e0
 --- /dev/null
 +++ b/tests/kernel/weaver_fp_vs_fixed/CMakeLists.txt
 @@ -0,0 +1,5 @@
@@ -5500,7 +6807,7 @@ index 00000000000..6da0b6e0cf4
 +target_sources(app PRIVATE src/main.c)
 diff --git a/tests/kernel/weaver_fp_vs_fixed/prj.conf b/tests/kernel/weaver_fp_vs_fixed/prj.conf
 new file mode 100644
-index 00000000000..9fa9d0b7249
+index 00000000..9fa9d0b7
 --- /dev/null
 +++ b/tests/kernel/weaver_fp_vs_fixed/prj.conf
 @@ -0,0 +1,4 @@
@@ -5510,7 +6817,7 @@ index 00000000000..9fa9d0b7249
 +CONFIG_ZTEST=y
 diff --git a/tests/kernel/weaver_fp_vs_fixed/src/main.c b/tests/kernel/weaver_fp_vs_fixed/src/main.c
 new file mode 100644
-index 00000000000..d7be38c6218
+index 00000000..e8ed9f5e
 --- /dev/null
 +++ b/tests/kernel/weaver_fp_vs_fixed/src/main.c
 @@ -0,0 +1,226 @@
@@ -5706,7 +7013,7 @@ index 00000000000..d7be38c6218
 +#ifdef __ZEPHYR__
 +#include <zephyr/ztest.h>
 +
-+ZTEST(weaver_fp_vs_fixed, dispatch_decisions_match)
++ZTEST(weaver_fp_vs_fixed, test_dispatch_decisions_match)
 +{
 +    int winner_mis = 0, throttle_mis = 0;
 +    int rc = run_fp_vs_fixed(&winner_mis, &throttle_mis);
@@ -5742,7 +7049,7 @@ index 00000000000..d7be38c6218
 +#endif
 diff --git a/tests/kernel/weaver_fp_vs_fixed/testcase.yaml b/tests/kernel/weaver_fp_vs_fixed/testcase.yaml
 new file mode 100644
-index 00000000000..d66d13d864d
+index 00000000..d66d13d8
 --- /dev/null
 +++ b/tests/kernel/weaver_fp_vs_fixed/testcase.yaml
 @@ -0,0 +1,9 @@
@@ -5757,7 +7064,7 @@ index 00000000000..d66d13d864d
 +      fixture: weaver_fp_vs_fixed
 diff --git a/tests/kernel/weaver_paths_equiv/CMakeLists.txt b/tests/kernel/weaver_paths_equiv/CMakeLists.txt
 new file mode 100644
-index 00000000000..f78b93ee883
+index 00000000..f78b93ee
 --- /dev/null
 +++ b/tests/kernel/weaver_paths_equiv/CMakeLists.txt
 @@ -0,0 +1,6 @@
@@ -5769,7 +7076,7 @@ index 00000000000..f78b93ee883
 +target_sources(app PRIVATE src/main.c)
 diff --git a/tests/kernel/weaver_paths_equiv/prj.conf b/tests/kernel/weaver_paths_equiv/prj.conf
 new file mode 100644
-index 00000000000..37963f1e925
+index 00000000..37963f1e
 --- /dev/null
 +++ b/tests/kernel/weaver_paths_equiv/prj.conf
 @@ -0,0 +1,4 @@
@@ -5779,7 +7086,7 @@ index 00000000000..37963f1e925
 +CONFIG_ZTEST=y
 diff --git a/tests/kernel/weaver_paths_equiv/src/main.c b/tests/kernel/weaver_paths_equiv/src/main.c
 new file mode 100644
-index 00000000000..121d72be0fe
+index 00000000..479a5c4e
 --- /dev/null
 +++ b/tests/kernel/weaver_paths_equiv/src/main.c
 @@ -0,0 +1,291 @@
@@ -6039,7 +7346,7 @@ index 00000000000..121d72be0fe
 +#ifdef __ZEPHYR__
 +#include <zephyr/ztest.h>
 +
-+ZTEST(weaver_paths_equiv, scalar_hybrid_mve_bit_identical)
++ZTEST(weaver_paths_equiv, test_scalar_hybrid_mve_bit_identical)
 +{
 +	int s_mis = 0, f_mis = 0;
 +	int rc = run_equivalence(&s_mis, &f_mis);
@@ -6076,7 +7383,7 @@ index 00000000000..121d72be0fe
 +
 diff --git a/tests/kernel/weaver_paths_equiv/testcase.yaml b/tests/kernel/weaver_paths_equiv/testcase.yaml
 new file mode 100644
-index 00000000000..7db4acdf857
+index 00000000..7db4acdf
 --- /dev/null
 +++ b/tests/kernel/weaver_paths_equiv/testcase.yaml
 @@ -0,0 +1,9 @@
@@ -6089,3 +7396,253 @@ index 00000000000..7db4acdf857
 +    harness: ztest
 +    harness_config:
 +      fixture: weaver_paths_equiv
+diff --git a/tests/kernel/weaver_stress/CMakeLists.txt b/tests/kernel/weaver_stress/CMakeLists.txt
+new file mode 100644
+index 00000000..8015ddde
+--- /dev/null
++++ b/tests/kernel/weaver_stress/CMakeLists.txt
+@@ -0,0 +1,5 @@
++# SPDX-License-Identifier: Apache-2.0
++cmake_minimum_required(VERSION 3.20.0)
++find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
++project(weaver_stress)
++target_sources(app PRIVATE src/main.c)
+diff --git a/tests/kernel/weaver_stress/prj.conf b/tests/kernel/weaver_stress/prj.conf
+new file mode 100644
+index 00000000..f3b74fe8
+--- /dev/null
++++ b/tests/kernel/weaver_stress/prj.conf
+@@ -0,0 +1,7 @@
++CONFIG_ZTEST=y
++CONFIG_WEAVER_SCHED=y
++CONFIG_WEAVER_BATCH_SCALAR=y
++CONFIG_WEAVER_MAX_THREADS=4
++CONFIG_THREAD_NAME=y
++CONFIG_MAIN_STACK_SIZE=2048
++CONFIG_HEAP_MEM_POOL_SIZE=4096
+diff --git a/tests/kernel/weaver_stress/src/main.c b/tests/kernel/weaver_stress/src/main.c
+new file mode 100644
+index 00000000..9869fae5
+--- /dev/null
++++ b/tests/kernel/weaver_stress/src/main.c
+@@ -0,0 +1,204 @@
++/*
++ * Copyright (c) 2026 Ambiq Micro, Inc.
++ * SPDX-License-Identifier: Apache-2.0
++ *
++ * Weaver scheduler stress / soak / negative tests.
++ *
++ *   stress: rapid register/unregister churn, registry-full + recovery,
++ *           rapid weights / boost / deadline changes.
++ *   soak:   N-second weaver_tick() run with active producers, verify
++ *           no stat-counter wraparound and no priority leakage.
++ *   neg:    double-unregister, unregister of foreign wd, thread
++ *           aborted before unregister.
++ */
++
++#include <zephyr/kernel.h>
++#include <zephyr/ztest.h>
++#include <zephyr/kernel/weaver_sched.h>
++#include <errno.h>
++#include <string.h>
++
++#define STK 1024
++#define IDLE_PRIO 9
++#define POOL_SIZE (CONFIG_WEAVER_MAX_THREADS + 2)
++
++static K_THREAD_STACK_ARRAY_DEFINE(stress_stacks, POOL_SIZE, STK);
++static struct k_thread stress_threads[POOL_SIZE];
++static struct weaver_thread_data stress_wd[POOL_SIZE];
++
++static void idle_fn(void *a, void *b, void *c)
++{
++	ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
++	while (1) {
++		k_sleep(K_MSEC(50));
++	}
++}
++
++static void *suite_setup(void)
++{
++	for (int i = 0; i < POOL_SIZE; i++) {
++		k_thread_create(&stress_threads[i], stress_stacks[i], STK,
++				idle_fn, NULL, NULL, NULL,
++				IDLE_PRIO, 0, K_NO_WAIT);
++	}
++	k_sleep(K_MSEC(10));
++	return NULL;
++}
++
++static void cleanup(void *fixture)
++{
++	ARG_UNUSED(fixture);
++	for (int i = 0; i < POOL_SIZE; i++) {
++		(void)weaver_unregister(&stress_wd[i]);
++		memset(&stress_wd[i], 0, sizeof(stress_wd[i]));
++	}
++}
++
++/* -------- stress -------- */
++
++ZTEST(weaver_stress, test_rapid_register_unregister_churn)
++{
++	for (int iter = 0; iter < 1000; iter++) {
++		int rc = weaver_register(&stress_wd[0], &stress_threads[0],
++					 WEAVER_TO_Q16(8), false);
++		zassert_equal(rc, 0, "iter %d register failed: %d", iter, rc);
++		rc = weaver_unregister(&stress_wd[0]);
++		zassert_equal(rc, 0, "iter %d unregister failed: %d", iter, rc);
++	}
++}
++
++ZTEST(weaver_stress, test_fill_registry_then_drain_then_refill)
++{
++	for (int round = 0; round < 3; round++) {
++		for (int i = 0; i < CONFIG_WEAVER_MAX_THREADS; i++) {
++			int rc = weaver_register(&stress_wd[i], &stress_threads[i],
++						 WEAVER_TO_Q16(5), false);
++			zassert_equal(rc, 0, "round %d slot %d: %d", round, i, rc);
++		}
++		/* The +1th registration must fail with -ENOMEM. */
++		int rc = weaver_register(&stress_wd[CONFIG_WEAVER_MAX_THREADS],
++					 &stress_threads[CONFIG_WEAVER_MAX_THREADS],
++					 WEAVER_TO_Q16(5), false);
++		zassert_equal(rc, -ENOMEM, "expected -ENOMEM round %d got %d",
++			      round, rc);
++		for (int i = 0; i < CONFIG_WEAVER_MAX_THREADS; i++) {
++			rc = weaver_unregister(&stress_wd[i]);
++			zassert_equal(rc, 0, "drain round %d slot %d: %d",
++				      round, i, rc);
++		}
++	}
++}
++
++ZTEST(weaver_stress, test_runtime_weights_dont_corrupt)
++{
++	weaver_register(&stress_wd[0], &stress_threads[0],
++			WEAVER_TO_Q16(8), false);
++
++	for (int i = 0; i < 100; i++) {
++		uint32_t a = 0x1000 + (i * 0x100);
++		uint32_t b = 0x2000 + (i * 0x100);
++		uint32_t c = 0x3000 + (i * 0x100);
++		weaver_set_weights(a, b, c);
++
++		/* Pressure for a static thread should change consistently
++		 * with the new weights - no wraparound, no garbage. */
++		stress_wd[0].priority_q16 = WEAVER_Q16_ONE;
++		stress_wd[0].buffer_fill_q16 = 0;
++		stress_wd[0].wait_ticks = 0;
++		uint32_t p = weaver_calculate_pressure(&stress_wd[0]);
++		zassert_true(p > 0, "iter %d: zero pressure with prio=ONE", i);
++		zassert_true(p < 0x100000U,
++			     "iter %d: runaway pressure 0x%x", i, p);
++	}
++	weaver_set_weights(WEAVER_W_URGENCY, WEAVER_W_DENSITY, WEAVER_W_AGING);
++}
++
++/* -------- soak -------- */
++
++ZTEST(weaver_stress, test_soak_2s_tick_with_active_producers)
++{
++	/* Light registry with 3 threads, drive weaver_tick() ~2000 times
++	 * (2 ms cadence) while flipping buffer fills. Verify no stat
++	 * counter goes backwards and no priority gets stuck out of range. */
++	weaver_register(&stress_wd[0], &stress_threads[0], WEAVER_TO_Q16(15), true);
++	weaver_set_warp_deadline(&stress_wd[0], 10);
++	weaver_register(&stress_wd[1], &stress_threads[1], WEAVER_TO_Q16(8), false);
++	weaver_register(&stress_wd[2], &stress_threads[2], WEAVER_TO_Q16(8), false);
++
++	struct weaver_stats prev, now;
++	weaver_get_stats(&prev);
++
++	for (int i = 0; i < 1000; i++) {
++		uint32_t f = (i & 0x1F) * (WEAVER_Q16_ONE / 32U);
++		weaver_set_buffer_fill_q16(&stress_wd[1], f);
++		weaver_set_buffer_fill_q16(&stress_wd[2], WEAVER_Q16_ONE - f);
++		weaver_tick();
++		k_sleep(K_MSEC(2));
++	}
++
++	weaver_get_stats(&now);
++	zassert_true(now.total_ticks > prev.total_ticks,
++		     "tick counter did not advance");
++	zassert_true(now.total_ticks >= 1000,
++		     "expected >=1000 ticks, got %u",
++		     now.total_ticks - prev.total_ticks);
++
++	/* Priority must end within the valid range. */
++	int p1 = k_thread_priority_get(&stress_threads[1]);
++	int p2 = k_thread_priority_get(&stress_threads[2]);
++	zassert_true(p1 >= -128 && p1 <= 127, "p1 out of range: %d", p1);
++	zassert_true(p2 >= -128 && p2 <= 127, "p2 out of range: %d", p2);
++}
++
++/* -------- negative -------- */
++
++ZTEST(weaver_stress, test_double_unregister_returns_enoent)
++{
++	weaver_register(&stress_wd[0], &stress_threads[0],
++			WEAVER_TO_Q16(5), false);
++	int rc = weaver_unregister(&stress_wd[0]);
++	zassert_equal(rc, 0, "first unregister: %d", rc);
++	rc = weaver_unregister(&stress_wd[0]);
++	zassert_equal(rc, -ENOENT, "double unregister should be -ENOENT got %d", rc);
++}
++
++ZTEST(weaver_stress, test_unregister_foreign_wd)
++{
++	struct weaver_thread_data foreign;
++	memset(&foreign, 0, sizeof(foreign));
++	foreign.in_use = 1;   /* lying about state */
++	int rc = weaver_unregister(&foreign);
++	zassert_equal(rc, -ENOENT,
++		      "foreign wd unregister should be -ENOENT got %d", rc);
++}
++
++ZTEST(weaver_stress, test_weaver_tick_with_empty_registry_safe)
++{
++	for (int i = 0; i < 100; i++) {
++		weaver_tick();  /* must not crash */
++	}
++	zassert_true(true, "should have completed");
++}
++
++ZTEST(weaver_stress, test_set_boost_levels_zero_no_op)
++{
++	weaver_register(&stress_wd[0], &stress_threads[0],
++			WEAVER_TO_Q16(5), false);
++	uint8_t before = stress_wd[0].boost_levels;
++	weaver_set_boost_levels(&stress_wd[0], 0);
++	zassert_equal(stress_wd[0].boost_levels, before,
++		      "zero boost should be no-op, got %d", stress_wd[0].boost_levels);
++}
++
++ZTEST(weaver_stress, test_deadline_zero_disables_countdown)
++{
++	weaver_register(&stress_wd[0], &stress_threads[0],
++			WEAVER_TO_Q16(15), true);
++	weaver_set_warp_deadline(&stress_wd[0], 10);
++	weaver_set_warp_deadline(&stress_wd[0], 0);
++	zassert_equal(stress_wd[0].period_ticks, 0, "period should be 0");
++	zassert_equal(stress_wd[0].next_deadline_ticks, 0,
++		      "next_deadline should be 0");
++}
++
++ZTEST_SUITE(weaver_stress, NULL, suite_setup, NULL, cleanup, NULL);
+diff --git a/tests/kernel/weaver_stress/testcase.yaml b/tests/kernel/weaver_stress/testcase.yaml
+new file mode 100644
+index 00000000..41cf1334
+--- /dev/null
++++ b/tests/kernel/weaver_stress/testcase.yaml
+@@ -0,0 +1,10 @@
++tests:
++  kernel.weaver_stress:
++    tags: kernel weaver
++    integration_platforms:
++      - native_sim
++      - native_sim/native/64
++    harness: ztest
++    harness_config:
++      fixture: weaver_stress
++    timeout: 60

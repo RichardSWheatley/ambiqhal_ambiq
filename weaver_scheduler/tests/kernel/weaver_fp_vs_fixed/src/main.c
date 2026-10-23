@@ -190,7 +190,7 @@ static int run_fp_vs_fixed(int *winner_mis, int *throttle_mis)
 #ifdef __ZEPHYR__
 #include <zephyr/ztest.h>
 
-ZTEST(weaver_fp_vs_fixed, dispatch_decisions_match)
+ZTEST(weaver_fp_vs_fixed, test_dispatch_decisions_match)
 {
     int winner_mis = 0, throttle_mis = 0;
     int rc = run_fp_vs_fixed(&winner_mis, &throttle_mis);

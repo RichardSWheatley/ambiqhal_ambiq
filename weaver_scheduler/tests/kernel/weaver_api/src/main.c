@@ -64,7 +64,7 @@ static void test_before(void *fixture)
 	}
 }
 
-ZTEST(weaver_api, register_basic_success)
+ZTEST(weaver_api, test_register_basic_success)
 {
 	int rc = weaver_register(&test_wd[0], &test_threads[0],
 				 WEAVER_TO_Q16(8), false);
@@ -75,7 +75,7 @@ ZTEST(weaver_api, register_basic_success)
 		      "priority_q16 not stored");
 }
 
-ZTEST(weaver_api, register_warp_marks_warp)
+ZTEST(weaver_api, test_register_warp_marks_warp)
 {
 	int rc = weaver_register(&test_wd[0], &test_threads[0],
 				 WEAVER_TO_Q16(15), true);
@@ -83,19 +83,19 @@ ZTEST(weaver_api, register_warp_marks_warp)
 	zassert_equal(test_wd[0].is_warp, 1, "is_warp not set for Warp");
 }
 
-ZTEST(weaver_api, register_null_wd_returns_einval)
+ZTEST(weaver_api, test_register_null_wd_returns_einval)
 {
 	int rc = weaver_register(NULL, &test_threads[0], WEAVER_TO_Q16(8), false);
 	zassert_equal(rc, -EINVAL, "expected -EINVAL got %d", rc);
 }
 
-ZTEST(weaver_api, register_null_thread_returns_einval)
+ZTEST(weaver_api, test_register_null_thread_returns_einval)
 {
 	int rc = weaver_register(&test_wd[0], NULL, WEAVER_TO_Q16(8), false);
 	zassert_equal(rc, -EINVAL, "expected -EINVAL got %d", rc);
 }
 
-ZTEST(weaver_api, register_full_returns_enomem)
+ZTEST(weaver_api, test_register_full_returns_enomem)
 {
 	for (int i = 0; i < CONFIG_WEAVER_MAX_THREADS; i++) {
 		int rc = weaver_register(&test_wd[i], &test_threads[i],
@@ -109,7 +109,7 @@ ZTEST(weaver_api, register_full_returns_enomem)
 		      "expected -ENOMEM when registry full got %d", rc);
 }
 
-ZTEST(weaver_api, unregister_restores_base_priority)
+ZTEST(weaver_api, test_unregister_restores_base_priority)
 {
 	int8_t base = (int8_t)k_thread_priority_get(&test_threads[0]);
 	weaver_register(&test_wd[0], &test_threads[0], WEAVER_TO_Q16(8), false);
@@ -124,20 +124,20 @@ ZTEST(weaver_api, unregister_restores_base_priority)
 		      now, base);
 }
 
-ZTEST(weaver_api, unregister_unknown_wd_returns_enoent)
+ZTEST(weaver_api, test_unregister_unknown_wd_returns_enoent)
 {
 	struct weaver_thread_data orphan = { .in_use = 0 };
 	int rc = weaver_unregister(&orphan);
 	zassert_equal(rc, -ENOENT, "expected -ENOENT got %d", rc);
 }
 
-ZTEST(weaver_api, unregister_null_returns_einval)
+ZTEST(weaver_api, test_unregister_null_returns_einval)
 {
 	int rc = weaver_unregister(NULL);
 	zassert_equal(rc, -EINVAL, "expected -EINVAL got %d", rc);
 }
 
-ZTEST(weaver_api, set_buffer_fill_clamps_to_one)
+ZTEST(weaver_api, test_set_buffer_fill_clamps_to_one)
 {
 	weaver_register(&test_wd[0], &test_threads[0], WEAVER_TO_Q16(8), false);
 	weaver_set_buffer_fill_q16(&test_wd[0], 0xDEADBEEF);
@@ -145,14 +145,14 @@ ZTEST(weaver_api, set_buffer_fill_clamps_to_one)
 		      "fill not clamped: %u", test_wd[0].buffer_fill_q16);
 }
 
-ZTEST(weaver_api, set_buffer_fill_null_no_crash)
+ZTEST(weaver_api, test_set_buffer_fill_null_no_crash)
 {
 	weaver_set_buffer_fill_q16(NULL, WEAVER_Q16_ONE);
 	/* If we reach here without crashing, pass. */
 	zassert_true(true, "should not crash on NULL");
 }
 
-ZTEST(weaver_api, predictive_extrapolates_upward)
+ZTEST(weaver_api, test_predictive_extrapolates_upward)
 {
 	weaver_register(&test_wd[0], &test_threads[0], WEAVER_TO_Q16(8), false);
 	weaver_set_buffer_fill_predictive_q16(&test_wd[0], WEAVER_Q16_ONE / 4);
@@ -163,7 +163,7 @@ ZTEST(weaver_api, predictive_extrapolates_upward)
 		      test_wd[0].buffer_fill_q16);
 }
 
-ZTEST(weaver_api, predictive_saturates_at_one)
+ZTEST(weaver_api, test_predictive_saturates_at_one)
 {
 	weaver_register(&test_wd[0], &test_threads[0], WEAVER_TO_Q16(8), false);
 	/* Two large successive jumps should clamp to ONE, not overflow. */
@@ -173,7 +173,7 @@ ZTEST(weaver_api, predictive_saturates_at_one)
 		     "predictive overshot: %u", test_wd[0].buffer_fill_q16);
 }
 
-ZTEST(weaver_api, calculate_pressure_warp_is_max)
+ZTEST(weaver_api, test_calculate_pressure_warp_is_max)
 {
 	test_wd[0].is_warp = 1;
 	uint32_t p = weaver_calculate_pressure(&test_wd[0]);
@@ -181,7 +181,7 @@ ZTEST(weaver_api, calculate_pressure_warp_is_max)
 		      "Warp pressure should saturate, got 0x%x", p);
 }
 
-ZTEST(weaver_api, calculate_pressure_weft_sums_terms)
+ZTEST(weaver_api, test_calculate_pressure_weft_sums_terms)
 {
 	test_wd[0].is_warp = 0;
 	test_wd[0].priority_q16 = WEAVER_Q16_ONE;
@@ -194,7 +194,7 @@ ZTEST(weaver_api, calculate_pressure_weft_sums_terms)
 		       "pressure %u not within 8 of expected 0xCCCC", p);
 }
 
-ZTEST(weaver_api, set_weights_zero_preserves_old)
+ZTEST(weaver_api, test_set_weights_zero_preserves_old)
 {
 	weaver_set_weights(0x4000, 0x4000, 0x2000);
 	/* Then passing 0 in any slot should leave that weight alone. */
@@ -218,7 +218,7 @@ ZTEST(weaver_api, set_weights_zero_preserves_old)
 	weaver_set_weights(WEAVER_W_URGENCY, WEAVER_W_DENSITY, WEAVER_W_AGING);
 }
 
-ZTEST(weaver_api, boost_levels_caps_at_zero)
+ZTEST(weaver_api, test_boost_levels_caps_at_zero)
 {
 	/* Register a thread that's already at priority 0. Set boost to
 	 * something silly like 5. weft_boost_prio should never go
@@ -230,7 +230,7 @@ ZTEST(weaver_api, boost_levels_caps_at_zero)
 		     "boost crossed into coop: %d", test_wd[0].weft_boost_prio);
 }
 
-ZTEST(weaver_api, tick_promotes_highest_pressure)
+ZTEST(weaver_api, test_tick_promotes_highest_pressure)
 {
 	/* Two Wefts: one starved, one idle. After several ticks the
 	 * starved one should be at a higher priority than the idle one. */

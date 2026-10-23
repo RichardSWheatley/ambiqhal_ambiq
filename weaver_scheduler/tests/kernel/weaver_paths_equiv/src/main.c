@@ -254,7 +254,7 @@ static int run_equivalence(int *static_mismatches, int *fuzz_mismatches)
 #ifdef __ZEPHYR__
 #include <zephyr/ztest.h>
 
-ZTEST(weaver_paths_equiv, scalar_hybrid_mve_bit_identical)
+ZTEST(weaver_paths_equiv, test_scalar_hybrid_mve_bit_identical)
 {
 	int s_mis = 0, f_mis = 0;
 	int rc = run_equivalence(&s_mis, &f_mis);

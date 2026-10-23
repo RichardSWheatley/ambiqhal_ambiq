@@ -188,7 +188,7 @@ void weaver_fp_set_buffer_fill(struct weaver_fp_thread_data *wd, float fill)
 	}
 	if (fill < 0.0f) fill = 0.0f;
 	if (fill > 1.0f) fill = 1.0f;
-	wd->last_fill = wd->buffer_fill;
+	wd->last_fill = fill;
 	wd->buffer_fill = fill;
 }
 
@@ -201,8 +201,9 @@ void weaver_fp_set_buffer_fill_predictive(struct weaver_fp_thread_data *wd,
 	if (fill < 0.0f) fill = 0.0f;
 	if (fill > 1.0f) fill = 1.0f;
 
-	float prev = wd->buffer_fill;
-	wd->last_fill = prev;
+	/* Extrapolate from the last raw sample, not the last projection. */
+	float prev = wd->last_fill;
+	wd->last_fill = fill;
 
 	float projected = fill + (fill - prev);
 	if (projected < 0.0f) projected = 0.0f;
